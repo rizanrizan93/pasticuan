@@ -323,75 +323,320 @@ def rate_of_change(close: pd.Series, period: int = 12) -> pd.Series:
     return close.pct_change(periods=period) * 100
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_yf_info(symbol: str) -> dict:
-    """Cached Yahoo Finance info fetch.
 
-    yfinance .info is slow and sometimes flaky; this wrapper centralizes the request
-    and keeps the rest of the code from issuing duplicate calls.
+
+def _ticker_candidates(symbol: str) -> list[str]:
+    base = str(symbol).strip().upper()
+    if not base or base == "NAN":
+        return []
+
+    candidates: list[str] = []
+
+    def add(candidate: str) -> None:
+        candidate = str(candidate).strip().upper()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add(base)
+    if base.startswith("^"):
+        return candidates
+
+    if base.endswith(".JK"):
+        add(base[:-3])
+    else:
+        add(f"{base}.JK")
+
+    return candidates
+
+
+def _coerce_float(value, default=np.nan):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str) and not value.strip():
+            return default
+        out = float(value)
+        return out if np.isfinite(out) else default
+    except Exception:
+        return default
+
+
+def _pick_info_value(info: dict, *keys):
+    if not isinstance(info, dict) or not info:
+        return np.nan
+    for key in keys:
+        value = info.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+    return np.nan
+
+
+def _statement_frame(ticker: yf.Ticker, attr_names: list[str]) -> pd.DataFrame:
+    for attr in attr_names:
+        try:
+            obj = getattr(ticker, attr, None)
+            if obj is None:
+                continue
+            if callable(obj):
+                obj = obj()
+            if isinstance(obj, pd.DataFrame) and not obj.empty:
+                return obj.copy()
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def _statement_row_series(frame: pd.DataFrame, row_names: list[str]) -> pd.Series | None:
+    if frame is None or frame.empty:
+        return None
+
+    wanted = [str(name).strip().lower() for name in row_names if str(name).strip()]
+    if not wanted:
+        return None
+
+    for idx in frame.index:
+        label = str(idx).strip().lower()
+        if any(name in label for name in wanted):
+            try:
+                row = pd.to_numeric(frame.loc[idx], errors="coerce")
+            except Exception:
+                continue
+            if isinstance(row, pd.Series):
+                row = row.dropna()
+                if not row.empty:
+                    return row
+    return None
+
+
+def _statement_scalar(frame: pd.DataFrame, row_names: list[str], position: int = 0) -> float:
+    row = _statement_row_series(frame, row_names)
+    if row is None or row.empty:
+        return np.nan
+    vals = row.dropna().to_list()
+    if len(vals) <= position:
+        return np.nan
+    return _coerce_float(vals[position])
+
+
+def _statement_growth(frame: pd.DataFrame, row_names: list[str]) -> float:
+    row = _statement_row_series(frame, row_names)
+    if row is None or row.empty:
+        return np.nan
+    vals = [v for v in row.dropna().to_list() if np.isfinite(_coerce_float(v))]
+    if len(vals) < 2:
+        return np.nan
+    latest = _coerce_float(vals[0])
+    prev = _coerce_float(vals[1])
+    if not np.isfinite(latest) or not np.isfinite(prev) or abs(prev) < 1e-12:
+        return np.nan
+    return (latest / prev) - 1.0
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_yf_info(symbol: str) -> dict:
+    """Cached Yahoo Finance info fetch with candidate symbol retries.
+
+    Some environments respond better to NCKL than NCKL.JK, while others need
+    the reverse. This function tries both and also merges fast_info when
+    available so we can still recover basic fields even if .info is partial.
     """
     base = str(symbol).strip()
     if not base:
         return {}
-    try:
-        info = yf.Ticker(base).info or {}
-    except Exception:
-        info = {}
-    return info
+
+    for candidate in _ticker_candidates(base):
+        try:
+            ticker = yf.Ticker(candidate)
+            info = {}
+            try:
+                info = ticker.get_info() or {}
+            except Exception:
+                try:
+                    info = ticker.info or {}
+                except Exception:
+                    info = {}
+
+            merged: dict = {}
+            if isinstance(info, dict):
+                merged.update(info)
+
+            try:
+                fast_info = getattr(ticker, "fast_info", None)
+                if fast_info is not None:
+                    fast_dict = dict(fast_info)
+                    for key, value in fast_dict.items():
+                        if key not in merged or merged.get(key) in (None, ""):
+                            merged[key] = value
+            except Exception:
+                pass
+
+            if merged:
+                merged["_resolved_symbol"] = candidate
+                return merged
+        except Exception:
+            continue
+
+    return {}
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_fundamental_snapshot(symbol: str) -> dict:
     out = {
+        "market_cap": np.nan,
+        "current_ratio": np.nan,
+        "debt_to_equity": np.nan,
+        "return_on_equity": np.nan,
+        "return_on_assets": np.nan,
+        "operating_margin": np.nan,
+        "gross_margin": np.nan,
+        "free_cashflow": np.nan,
+        "operating_cashflow": np.nan,
         "peg_ratio": np.nan,
         "trailing_pe": np.nan,
         "forward_pe": np.nan,
         "revenue_growth": np.nan,
         "earnings_growth": np.nan,
         "profit_margins": np.nan,
+        "fundamental_data_source": "missing",
+        "_resolved_symbol": "",
     }
     base = str(symbol).strip()
     if not base:
         return out
 
-    info = load_yf_info(base)
+    info = {}
+    resolved_symbol = base
+    for candidate in _ticker_candidates(base):
+        info = load_yf_info(candidate)
+        if info:
+            resolved_symbol = str(info.get("_resolved_symbol", candidate))
+            break
 
-    def pick(*keys):
-        for key in keys:
-            val = info.get(key)
-            if val is not None and val != "":
-                try:
-                    return float(val)
-                except Exception:
-                    continue
-        return np.nan
+    out["_resolved_symbol"] = resolved_symbol
 
-    out["peg_ratio"] = pick("pegRatio", "peg_ratio")
-    out["trailing_pe"] = pick("trailingPE", "trailing_pe")
-    out["forward_pe"] = pick("forwardPE", "forward_pe")
-    out["revenue_growth"] = pick("revenueGrowth")
-    out["earnings_growth"] = pick("earningsGrowth", "earningsQuarterlyGrowth")
-    out["profit_margins"] = pick("profitMargins")
+    # First pass: direct quote / info fields.
+    out["market_cap"] = _pick_info_value(info, "marketCap", "market_cap", "marketcap")
+    out["current_ratio"] = _pick_info_value(info, "currentRatio", "current_ratio")
+    out["debt_to_equity"] = _pick_info_value(info, "debtToEquity", "debt_to_equity")
+    out["return_on_equity"] = _pick_info_value(info, "returnOnEquity", "return_on_equity")
+    out["return_on_assets"] = _pick_info_value(info, "returnOnAssets", "return_on_assets")
+    out["operating_margin"] = _pick_info_value(info, "operatingMargins", "operating_margin")
+    out["gross_margin"] = _pick_info_value(info, "grossMargins", "gross_margin")
+    out["free_cashflow"] = _pick_info_value(info, "freeCashflow", "free_cashflow")
+    out["operating_cashflow"] = _pick_info_value(info, "operatingCashflow", "operating_cashflow")
+    out["peg_ratio"] = _pick_info_value(info, "pegRatio", "peg_ratio")
+    out["trailing_pe"] = _pick_info_value(info, "trailingPE", "trailing_pe")
+    out["forward_pe"] = _pick_info_value(info, "forwardPE", "forward_pe")
+    out["revenue_growth"] = _pick_info_value(info, "revenueGrowth", "revenue_growth")
+    out["earnings_growth"] = _pick_info_value(info, "earningsGrowth", "earningsQuarterlyGrowth", "earnings_growth")
+    out["profit_margins"] = _pick_info_value(info, "profitMargins", "profit_margin", "profit_margins")
+
+    # Second pass: statement-derived fallback if direct info is sparse.
+    try:
+        ticker = yf.Ticker(resolved_symbol)
+    except Exception:
+        ticker = None
+
+    if ticker is not None:
+        income_annual = _statement_frame(ticker, ["income_stmt", "financials"])
+        income_quarterly = _statement_frame(ticker, ["quarterly_income_stmt", "quarterly_financials"])
+        balance_annual = _statement_frame(ticker, ["balance_sheet"])
+        balance_quarterly = _statement_frame(ticker, ["quarterly_balance_sheet"])
+        cash_annual = _statement_frame(ticker, ["cashflow"])
+        cash_quarterly = _statement_frame(ticker, ["quarterly_cashflow"])
+
+        income_frames = [income_annual, income_quarterly]
+        balance_frames = [balance_annual, balance_quarterly]
+        cash_frames = [cash_annual, cash_quarterly]
+
+        def first_scalar(frames, row_names):
+            for frame in frames:
+                val = _statement_scalar(frame, row_names)
+                if np.isfinite(val):
+                    return val
+            return np.nan
+
+        def first_growth(frames, row_names):
+            for frame in frames:
+                val = _statement_growth(frame, row_names)
+                if np.isfinite(val):
+                    return val
+            return np.nan
+
+        revenue = first_scalar(income_frames, ["Total Revenue", "Operating Revenue", "Revenue"])
+        prev_revenue_growth = first_growth(income_frames, ["Total Revenue", "Operating Revenue", "Revenue"])
+        net_income = first_scalar(income_frames, ["Net Income", "Net Income Common Stockholders", "Net Income Applicable To Common Shares"])
+        prev_net_income_growth = first_growth(income_frames, ["Net Income", "Net Income Common Stockholders", "Net Income Applicable To Common Shares"])
+        operating_income = first_scalar(income_frames, ["Operating Income", "EBIT"])
+        gross_profit = first_scalar(income_frames, ["Gross Profit"])
+        total_assets = first_scalar(balance_frames, ["Total Assets"])
+        current_assets = first_scalar(balance_frames, ["Current Assets"])
+        current_liabilities = first_scalar(balance_frames, ["Current Liabilities"])
+        total_equity = first_scalar(balance_frames, ["Total Stockholder Equity", "Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"])
+        total_debt = first_scalar(balance_frames, ["Total Debt", "Short Long Term Debt", "Long Term Debt", "Short Term Debt", "Long Term Debt And Capital Lease Obligation"])
+        if not np.isfinite(total_debt):
+            total_debt = first_scalar(balance_frames, ["Total Liabilities Net Minority Interest", "Total Liabilities"])
+        operating_cashflow = first_scalar(cash_frames, ["Operating Cash Flow", "Total Cash From Operating Activities"])
+        capex = first_scalar(cash_frames, ["Capital Expenditure", "Capital Expenditures"])
+
+        if np.isfinite(revenue):
+            out["revenue_growth"] = prev_revenue_growth if not np.isfinite(out["revenue_growth"]) else out["revenue_growth"]
+        if np.isfinite(net_income):
+            out["earnings_growth"] = prev_net_income_growth if not np.isfinite(out["earnings_growth"]) else out["earnings_growth"]
+
+        if np.isfinite(revenue) and np.isfinite(net_income) and abs(revenue) > 1e-12:
+            out["profit_margins"] = out["profit_margins"] if np.isfinite(out["profit_margins"]) else (net_income / revenue)
+
+        if np.isfinite(current_assets) and np.isfinite(current_liabilities) and abs(current_liabilities) > 1e-12:
+            out["current_ratio"] = out["current_ratio"] if np.isfinite(out["current_ratio"]) else (current_assets / current_liabilities)
+
+        if np.isfinite(total_equity) and abs(total_equity) > 1e-12:
+            if np.isfinite(total_debt):
+                out["debt_to_equity"] = out["debt_to_equity"] if np.isfinite(out["debt_to_equity"]) else (total_debt / total_equity)
+            if np.isfinite(net_income):
+                out["return_on_equity"] = out["return_on_equity"] if np.isfinite(out["return_on_equity"]) else (net_income / total_equity)
+
+        if np.isfinite(total_assets) and abs(total_assets) > 1e-12 and np.isfinite(net_income):
+            out["return_on_assets"] = out["return_on_assets"] if np.isfinite(out["return_on_assets"]) else (net_income / total_assets)
+
+        if np.isfinite(revenue) and abs(revenue) > 1e-12 and np.isfinite(operating_income):
+            out["operating_margin"] = out["operating_margin"] if np.isfinite(out["operating_margin"]) else (operating_income / revenue)
+        if np.isfinite(revenue) and abs(revenue) > 1e-12 and np.isfinite(gross_profit):
+            out["gross_margin"] = out["gross_margin"] if np.isfinite(out["gross_margin"]) else (gross_profit / revenue)
+
+        if np.isfinite(operating_cashflow):
+            out["operating_cashflow"] = out["operating_cashflow"] if np.isfinite(out["operating_cashflow"]) else operating_cashflow
+        if np.isfinite(operating_cashflow) and np.isfinite(capex):
+            if capex <= 0:
+                fcf = operating_cashflow + capex
+            else:
+                fcf = operating_cashflow - capex
+            out["free_cashflow"] = out["free_cashflow"] if np.isfinite(out["free_cashflow"]) else fcf
+
+        if any(np.isfinite(v) for v in [
+            out["current_ratio"], out["debt_to_equity"], out["return_on_equity"], out["return_on_assets"],
+            out["operating_margin"], out["gross_margin"], out["free_cashflow"], out["operating_cashflow"],
+            out["revenue_growth"], out["earnings_growth"], out["profit_margins"]
+        ]):
+            out["fundamental_data_source"] = "mixed" if info else "statement-fallback"
+
+    if out["fundamental_data_source"] == "missing" and info:
+        out["fundamental_data_source"] = "yahoo-info"
+
     return out
 
 
-
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def compute_fundamental_grade(symbol: str) -> dict:
     snap = load_fundamental_snapshot(symbol).copy()
     base = str(symbol).strip()
     if not base:
         snap.update(
             {
-                "market_cap": np.nan,
-                "current_ratio": np.nan,
-                "debt_to_equity": np.nan,
-                "return_on_equity": np.nan,
-                "return_on_assets": np.nan,
-                "operating_margin": np.nan,
-                "gross_margin": np.nan,
-                "free_cashflow": np.nan,
-                "operating_cashflow": np.nan,
                 "fundamental_score": np.nan,
                 "growth_score": np.nan,
                 "quality_score": np.nan,
@@ -401,18 +646,6 @@ def compute_fundamental_grade(symbol: str) -> dict:
             }
         )
         return snap
-
-    info = load_yf_info(base)
-
-    def pick(*keys):
-        for key in keys:
-            val = info.get(key)
-            if val is not None and val != "":
-                try:
-                    return float(val)
-                except Exception:
-                    continue
-        return np.nan
 
     def pct_like(v):
         if v is None or pd.isna(v):
@@ -429,16 +662,6 @@ def compute_fundamental_grade(symbol: str) -> dict:
         x = float(np.clip(x, 0.0, 1.0))
         return 1.0 - x if invert else x
 
-    snap["market_cap"] = pick("marketCap")
-    snap["current_ratio"] = pick("currentRatio")
-    snap["debt_to_equity"] = pick("debtToEquity")
-    snap["return_on_equity"] = pick("returnOnEquity")
-    snap["return_on_assets"] = pick("returnOnAssets")
-    snap["operating_margin"] = pick("operatingMargins")
-    snap["gross_margin"] = pick("grossMargins")
-    snap["free_cashflow"] = pick("freeCashflow")
-    snap["operating_cashflow"] = pick("operatingCashflow")
-
     rev_g = pct_like(snap.get("revenue_growth"))
     earn_g = pct_like(snap.get("earnings_growth"))
     profit_m = pct_like(snap.get("profit_margins"))
@@ -446,14 +669,14 @@ def compute_fundamental_grade(symbol: str) -> dict:
     roa = pct_like(snap.get("return_on_assets"))
     op_m = pct_like(snap.get("operating_margin"))
     gross_m = pct_like(snap.get("gross_margin"))
-    cr = snap.get("current_ratio")
-    dte = snap.get("debt_to_equity")
-    fcf = snap.get("free_cashflow")
-    ocf = snap.get("operating_cashflow")
+    cr = _coerce_float(snap.get("current_ratio"), np.nan)
+    dte = _coerce_float(snap.get("debt_to_equity"), np.nan)
+    fcf = _coerce_float(snap.get("free_cashflow"), np.nan)
+    ocf = _coerce_float(snap.get("operating_cashflow"), np.nan)
 
-    peg = snap.get("peg_ratio")
-    trailing_pe = snap.get("trailing_pe")
-    forward_pe = snap.get("forward_pe")
+    peg = _coerce_float(snap.get("peg_ratio"), np.nan)
+    trailing_pe = _coerce_float(snap.get("trailing_pe"), np.nan)
+    forward_pe = _coerce_float(snap.get("forward_pe"), np.nan)
     if (pd.isna(peg) or not np.isfinite(float(peg))) and np.isfinite(forward_pe) and np.isfinite(earn_g):
         if float(earn_g) > 0:
             peg = float(forward_pe) / (float(earn_g) * 100.0 if abs(float(earn_g)) <= 1.5 else float(earn_g))
@@ -498,7 +721,16 @@ def compute_fundamental_grade(symbol: str) -> dict:
         valuation_score += norm(pe, 8.0, 25.0, invert=True) * 25.0
     valuation_score = float(np.clip(valuation_score, 0.0, 100.0))
 
-    fundamental_score = float(np.clip((growth_score * 0.35) + (quality_score * 0.30) + (health_score * 0.20) + (valuation_score * 0.15), 0.0, 100.0))
+    fundamental_score = float(
+        np.clip(
+            (growth_score * 0.35)
+            + (quality_score * 0.30)
+            + (health_score * 0.20)
+            + (valuation_score * 0.15),
+            0.0,
+            100.0,
+        )
+    )
 
     if fundamental_score >= 80:
         grade = "A"
@@ -524,8 +756,8 @@ def compute_fundamental_grade(symbol: str) -> dict:
     return snap
 
 
-
 def _safe_float(v, default=np.nan):
+
     try:
         if v is None:
             return default
