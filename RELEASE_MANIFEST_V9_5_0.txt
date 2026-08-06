@@ -1,0 +1,9 @@
+IDX Super Scanner v9.5.0 — Persistent Database-First
+Application: 9.5.0-persistent-database-first
+Resumable engine: 9.5.0
+Database bridge: 14.0-persistent-ohlcv
+Schema: scanner_schema_v13
+Macro: 9.5.0-macro-breadth-guard
+Decision model: 9.5.0-database-first-ranking
+Required migration: database/migration_v13_persistent_ohlcv.sql
+Verification: database/verify_v13_persistent_ohlcv.sql
