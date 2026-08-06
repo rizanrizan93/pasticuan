@@ -8,6 +8,7 @@ from datetime import timedelta
 import hashlib
 import json
 import logging
+import os
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -34,7 +35,7 @@ from incremental_store import (
     fingerprint_value,
 )
 
-CORE_PIPELINE_CACHE_VERSION = '8.0.2-entry-integrity-source-lineage-cache'
+CORE_PIPELINE_CACHE_VERSION = '9.4.0-resumable-chunked-scan'
 
 @dataclass
 class MarketContext:
@@ -4743,7 +4744,9 @@ def fetch_one_fundamental(ticker: str) -> dict[str, Any]:
     if _yahoo_quote_summary_enabled():
         try:
             from free_data_providers import yahoo_quote_summary_direct
-            info, _ = yahoo_quote_summary_direct(ticker, timeout=12)
+            info, _ = yahoo_quote_summary_direct(
+                ticker, timeout=max(3, int(os.environ.get('IDX_SCANNER_FUNDAMENTAL_TIMEOUT_SECONDS', '5')))
+            )
             provider = 'Yahoo quoteSummary direct'
         except Exception as exc:
             errors.append(f'quoteSummary direct {type(exc).__name__}: {str(exc)[:100]}')
@@ -4751,7 +4754,7 @@ def fetch_one_fundamental(ticker: str) -> dict[str, Any]:
         try:
             from free_data_providers import yahoo_fundamental_timeseries_direct
             history, _ = yahoo_fundamental_timeseries_direct(
-                ticker, years_back=6, timeout=15,
+                ticker, years_back=4, timeout=max(3, int(os.environ.get('IDX_SCANNER_FUNDAMENTAL_TIMEOUT_SECONDS', '5'))),
             )
             normalized = normalize_fundamental_history(history)
             _write_recent_direct_fundamental_history(ticker, normalized)
@@ -5250,7 +5253,7 @@ def _yahoo_statement_rows(ticker: str, allow_wrapper_fallback: bool | None=None)
     try:
         from free_data_providers import yahoo_fundamental_timeseries_direct
         direct, direct_report = yahoo_fundamental_timeseries_direct(
-            ticker, years_back=6, timeout=15,
+            ticker, years_back=4, timeout=max(3, int(os.environ.get('IDX_SCANNER_FUNDAMENTAL_TIMEOUT_SECONDS', '5'))),
         )
         if direct is not None and not direct.empty:
             normalized = normalize_fundamental_history(direct)
