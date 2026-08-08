@@ -21,7 +21,7 @@ from free_data_providers import yahoo_chart_direct
 from issuer_classification import canonical_sector, normalize_fundamental_classification
 
 
-MACRO_ENGINE_VERSION = "9.6.0-sector-integrity"
+MACRO_ENGINE_VERSION = "9.8.0-blended-ihsg-breadth"
 
 MACRO_SYMBOLS: dict[str, str] = {
     "USDIDR": "USDIDR=X",
@@ -178,6 +178,68 @@ def _mean_available(values: Sequence[float]) -> float:
     observed = [float(value) for value in values if np.isfinite(value)]
     return float(np.mean(observed)) if observed else np.nan
 
+
+
+def _blended_market_context(features: Mapping[str, float]) -> dict[str, Any]:
+    """Blend direct IHSG structure (60%) with universe breadth (40%).
+
+    The benchmark remains primary. Breadth acts as a cross-sectional check so a
+    handful of index heavyweights cannot fully mask broad participation or broad
+    deterioration. Missing one side never invents a neutral score.
+    """
+    ihsg_parts = [
+        (_factor_score(features.get("ihsg_return_20d", np.nan), positive_is_good=True, scale=0.08), 0.35),
+        (_clip(features.get("ihsg_trend_score", np.nan)), 0.45),
+    ]
+    vol = _finite(features.get("ihsg_volatility_20d"), np.nan)
+    if np.isfinite(vol):
+        ihsg_parts.append((float(np.clip(100.0 - 250.0 * max(0.0, vol - 0.18), 0.0, 100.0)), 0.20))
+    observed = [(v,w) for v,w in ihsg_parts if np.isfinite(v)]
+    ihsg_score = sum(v*w for v,w in observed)/sum(w for _,w in observed) if observed else np.nan
+    ihsg_cov = 100.0 * sum(w for _,w in observed) / sum(w for _,w in ihsg_parts) if ihsg_parts else 0.0
+
+    breadth_parts = [
+        (_clip(features.get("breadth_above_ema50_pct", np.nan)), 0.45),
+        (_clip(features.get("breadth_above_ema200_pct", np.nan)), 0.25),
+        (_clip(features.get("breadth_positive_20d_pct", np.nan)), 0.30),
+    ]
+    bobs = [(v,w) for v,w in breadth_parts if np.isfinite(v)]
+    breadth_score = sum(v*w for v,w in bobs)/sum(w for _,w in bobs) if bobs else np.nan
+    breadth_cov = 100.0 * sum(w for _,w in bobs) / sum(w for _,w in breadth_parts) if breadth_parts else 0.0
+
+    if np.isfinite(ihsg_score) and np.isfinite(breadth_score):
+        score = 0.60 * ihsg_score + 0.40 * breadth_score
+        coverage = 0.60 * ihsg_cov + 0.40 * breadth_cov
+        provenance = "BLENDED_IHSG_AND_UNIVERSE_BREADTH"
+    elif np.isfinite(ihsg_score):
+        score, coverage, provenance = ihsg_score, 0.60 * ihsg_cov, "DIRECT_IHSG_ONLY"
+    elif np.isfinite(breadth_score):
+        score, coverage, provenance = breadth_score, 0.40 * breadth_cov, "UNIVERSE_BREADTH_ONLY"
+    else:
+        score, coverage, provenance = np.nan, 0.0, "MARKET_CONTEXT_UNAVAILABLE"
+
+    breadth50 = _finite(features.get("breadth_above_ema50_pct"), np.nan)
+    if not np.isfinite(score):
+        regime = "DATA_PENDING"
+    elif score >= 67 and (not np.isfinite(breadth50) or breadth50 >= 55):
+        regime = "RISK_ON_EXPANSION"
+    elif score >= 56:
+        regime = "SELECTIVE_RISK_ON"
+    elif score <= 33 or (np.isfinite(breadth50) and breadth50 < 25):
+        regime = "RISK_OFF_CONTRACTION"
+    elif score < 44:
+        regime = "SELECTIVE_RISK_OFF"
+    else:
+        regime = "NEUTRAL_SELECTIVE"
+    return {
+        "market_context_score": float(score) if np.isfinite(score) else np.nan,
+        "market_context_coverage_pct": round(float(coverage), 1),
+        "market_context_provenance_state": provenance,
+        "market_benchmark_score": round(float(ihsg_score), 1) if np.isfinite(ihsg_score) else np.nan,
+        "market_breadth_score": round(float(breadth_score), 1) if np.isfinite(breadth_score) else np.nan,
+        "market_regime": regime,
+    }
+
 def _factor_score(change: float, *, positive_is_good: bool, scale: float) -> float:
     if not np.isfinite(change):
         return np.nan
@@ -200,13 +262,9 @@ def _build_factor_state(
     oil_change = _series_change(series.get("OIL"), 20)
     gold_change = _series_change(series.get("GOLD"), 20)
 
+    market_context = _blended_market_context(features)
     factor_scores = {
-        "risk_appetite": _mean_available([
-            _factor_score(features.get("ihsg_return_20d", np.nan), positive_is_good=True, scale=0.08),
-            _clip(features.get("ihsg_trend_score", np.nan)),
-            _clip(features.get("breadth_above_ema50_pct", np.nan)),
-            _clip(features.get("breadth_positive_20d_pct", np.nan)),
-        ]),
+        "risk_appetite": _finite(market_context.get("market_context_score"), np.nan),
         "currency_stability": _mean_available([
             _factor_score(usd_change, positive_is_good=False, scale=0.05),
             _factor_score(dxy_change, positive_is_good=False, scale=0.05),
@@ -218,21 +276,13 @@ def _build_factor_state(
     observed = [v for v in factor_scores.values() if np.isfinite(v)]
     coverage = 100.0 * len(observed) / len(factor_scores)
     regime_score = float(np.nanmean(observed)) if observed else np.nan
-    if not np.isfinite(regime_score):
-        regime = "DATA_PENDING"
-    elif regime_score >= 67:
-        regime = "RISK_ON_EXPANSION"
-    elif regime_score >= 56:
-        regime = "SELECTIVE_RISK_ON"
-    elif regime_score >= 44:
-        regime = "NEUTRAL_SELECTIVE"
-    elif regime_score >= 33:
-        regime = "SELECTIVE_RISK_OFF"
-    else:
-        regime = "RISK_OFF_CONTRACTION"
+    # Market authorization uses the explicit 60/40 IHSG+breadth state. The
+    # broader macro regime score remains an independent multi-factor diagnostic.
+    regime = str(market_context.get("market_regime") or "DATA_PENDING")
 
     raw = {
         **features,
+        **market_context,
         "usd_idr_change_20d": usd_change,
         "dxy_change_20d": dxy_change,
         "us10y_change_20d": yield_change,
@@ -377,6 +427,13 @@ def build_macro_regime(
     factors, raw = _build_factor_state(benchmark, prepared, macro_series, breadth_features=breadth_features)
     sector_map = build_sector_map(factors)
     issuer_map = build_issuer_map(fundamentals, sector_map)
+    if not issuer_map.empty:
+        for column in (
+            "market_regime", "market_context_score", "market_context_coverage_pct",
+            "market_context_provenance_state", "market_benchmark_score", "market_breadth_score",
+            "breadth_above_ema50_pct", "breadth_above_ema200_pct", "breadth_positive_20d_pct",
+        ):
+            issuer_map[column] = raw.get(column, np.nan)
     snapshot = pd.DataFrame([{
         **raw,
         **{f"factor_{name}_score": round(value, 1) if np.isfinite(value) else np.nan for name, value in factors.items()},
