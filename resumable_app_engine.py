@@ -144,6 +144,33 @@ def _coalesce_primary_evidence(primary: pd.DataFrame | None, fallback: pd.DataFr
                 continue
             blank_mask = local[column].map(lambda value: isinstance(value, str) and not value.strip())
             local[column] = local[column].mask(blank_mask, pd.NA)
+
+    # ``normalize_fundamental_classification`` represents unavailable sector
+    # evidence with the literal value UNKNOWN. That sentinel must not mask an
+    # explicit IDX-IC sector supplied by the uploaded universe. Hotfix 6 kept
+    # the upload columns, but the generic ``combine_first`` below still kept
+    # UNKNOWN plus its 0%-confidence classification bundle.
+    if "sector" in first.columns and "sector" in second.columns:
+        first_indexed = first.set_index("ticker")
+        second_indexed = second.set_index("ticker")
+        common = first_indexed.index.intersection(second_indexed.index)
+        missing_tokens = {"", "UNKNOWN", "MISSING", "UNCLASSIFIED", "NAN", "NONE", "NULL"}
+        primary_sector = first_indexed.loc[common, "sector"].astype("string").str.strip().str.upper()
+        fallback_sector = second_indexed.loc[common, "sector"].astype("string").str.strip().str.upper()
+        replace_index = common[
+            primary_sector.fillna("").isin(missing_tokens)
+            & ~fallback_sector.fillna("").isin(missing_tokens)
+        ]
+        classification_columns = (
+            "sector", "sector_raw", "sector_source", "sector_confidence_pct",
+            "sector_classification_version", "idx_sector", "sector_idx_ic",
+        )
+        for column in classification_columns:
+            if column in second_indexed.columns:
+                if column not in first_indexed.columns:
+                    first_indexed[column] = pd.NA
+                first_indexed.loc[replace_index, column] = second_indexed.loc[replace_index, column]
+        first = first_indexed.reset_index()
     merged = first.set_index("ticker").combine_first(second.set_index("ticker"))
     return merged.reset_index()
 

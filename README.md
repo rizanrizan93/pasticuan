@@ -1,4 +1,4 @@
-> Production runtime audit: v9.8.2 Hotfix 8 (fundamental period integrity).
+> Production runtime audit: v9.8.2 Hotfix 9 (universe sector integrity).
 
 # IDX Super Scanner v9.8.2 — ALL_ELIGIBLE_LITE / Database Acceleration
 
@@ -69,6 +69,14 @@ same-period proxy fact, and replaces fixed four-row growth lags with explicit
 same-calendar-quarter comparisons. This repairs false annual fallbacks and
 wrong-period YoY values when quarterly histories contain gaps. The fundamental
 feature model lineage is advanced to `7.6.0`; scoring weights are unchanged.
+
+## v9.8.2 Hotfix 9 — Universe Sector Integrity
+
+An explicit IDX-IC sector from an uploaded universe now replaces the
+missing-evidence sentinel `UNKNOWN` in a cached fundamental row. The complete
+classification bundle is replaced atomically, so macro-sector coverage cannot
+remain at 0% while the upload contains valid sector evidence. Scoring weights
+remain unchanged.
 
 ## v9.8.2 Hotfix 7 — Persistence Integrity
 Hotfix 7 separates the generic `updated_at` trigger from the `refresh_state`
