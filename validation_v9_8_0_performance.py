@@ -287,7 +287,7 @@ def check_version_contract() -> None:
     import resumable_app_engine as eng
     assert str(eng.ENGINE_VERSION).startswith('9.8.2')
     app_source = (ROOT / 'app.py').read_text(encoding='utf-8')
-    assert 'APP_VERSION = "9.8.2-hotfix8-fundamental-period-integrity"' in app_source
+    assert 'APP_VERSION = "9.8.2-hotfix9-universe-sector-integrity"' in app_source
     fast_source = (ROOT / 'fast_scan_engine.py').read_text(encoding='utf-8')
     # Feature-cache contract intentionally remains stable across calibration/runtime hotfixes.
     assert 'FAST_SCAN_VERSION = "9.8.2-all-eligible-lite"' in fast_source
