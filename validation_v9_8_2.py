@@ -60,13 +60,13 @@ def check_maintenance_reserve() -> None:
     source = Path('resumable_app_engine.py').read_text(encoding='utf-8')
     assert 'maintenance_reserve' in source
     assert 'evidence_cap - maintenance_reserve' in source
-    assert 'ENGINE_VERSION = "9.8.2"' in source
+    assert 'ENGINE_VERSION = "9.8.3"' in source
 
 
 def check_ui_contract() -> None:
     source = Path('app.py').read_text(encoding='utf-8')
-    assert 'APP_VERSION = "9.8.2-hotfix' in source
-    assert 'IDX Super Scanner v9.8.2 Hotfix' in source
+    assert 'APP_VERSION = "9.8.3-evidence-integrity"' in source
+    assert 'IDX Super Scanner v9.8.3' in source
     assert 'feature-cache hit' in source
     assert 'st.button("SCAN"' in source
     assert 'Isi Database' not in source

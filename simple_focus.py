@@ -28,7 +28,7 @@ from real_money_guard import apply_real_money_authorization, fundamental_convict
 from fundamental_calibration import reporting_refresh_profile, latest_growth_profile, classify_thesis_archetype
 
 
-SIMPLE_FOCUS_VERSION = "9.8.2-hotfix3-calibrated-freshness"
+SIMPLE_FOCUS_VERSION = "9.8.3-evidence-integrity"
 
 
 @dataclass(frozen=True)
@@ -245,16 +245,47 @@ def _business_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
 
 
 def _future_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
-    score, coverage, evidence = _metric_score(row, (
-        (("fund_future_fundamental_impact_score", "fund_future_impact_score"), 0.28, lambda v: v),
-        (("fund_project_pipeline_score",), 0.22, lambda v: v),
-        (("fund_reinvestment_runway_pillar",), 0.18, lambda v: v),
-        (("fund_fundamental_inflection_score",), 0.12, lambda v: v),
-        (("fund_history_revenue_growth_acceleration",), 0.08, lambda v: _ratio_score(v, -0.10, 0.10)),
-        (("fund_history_earnings_growth_acceleration",), 0.07, lambda v: _ratio_score(v, -0.20, 0.20)),
-        (("fund_revenue_growth",), 0.03, _growth_score),
-        (("fund_earnings_growth",), 0.02, _growth_score),
+    # A normal compounder does not need a disclosed construction project to
+    # have measurable future-fundamental capacity.  Score the auditable
+    # financial-capacity lane first; direct project/guidance evidence is an
+    # optional overlay and remains mandatory for project-led classifications.
+    base_specs = (
+        (("fund_forward_financial_capacity_score",), 0.30, lambda v: v),
+        (("fund_reinvestment_runway_pillar",), 0.22, lambda v: v),
+        (("fund_forward_growth_persistence_score",), 0.18, lambda v: v),
+        (("fund_fundamental_inflection_score",), 0.10, lambda v: v),
+        (("fund_revenue_growth", "fund_history_revenue_growth"), 0.10, _growth_score),
+        (("fund_earnings_growth", "fund_history_earnings_growth"), 0.10, _growth_score),
+    )
+    score, _, evidence = _metric_score(row, base_specs)
+    coverage = 0.0
+    for names, weight, _ in base_specs:
+        value = _first_num(row, names)
+        if not np.isfinite(value):
+            continue
+        coverage_name = {
+            "fund_forward_financial_capacity_score": "fund_forward_financial_capacity_coverage_pct",
+            "fund_reinvestment_runway_pillar": "fund_reinvestment_runway_coverage_pct",
+            "fund_forward_growth_persistence_score": "fund_forward_growth_persistence_coverage_pct",
+            "fund_fundamental_inflection_score": "fund_fundamental_inflection_coverage_pct",
+        }.get(names[0])
+        evidence_coverage = _first_num(row, (coverage_name,)) if coverage_name else 100.0
+        coverage += 100.0 * weight * (
+            np.clip(evidence_coverage, 0.0, 100.0) / 100.0
+            if np.isfinite(evidence_coverage) else 0.0
+        )
+    direct_score, direct_coverage, direct_evidence = _metric_score(row, (
+        (("fund_future_fundamental_impact_score", "fund_future_impact_score"), 0.55, lambda v: v),
+        (("fund_project_pipeline_score",), 0.45, lambda v: v),
     ))
+    if np.isfinite(direct_score):
+        if np.isfinite(score):
+            score = 0.75 * score + 0.25 * direct_score
+            coverage = min(100.0, coverage + 0.15 * direct_coverage)
+        else:
+            score = direct_score
+            coverage = 0.75 * direct_coverage
+        evidence.extend(direct_evidence)
     # Sparse forward evidence may be directionally useful, but it should never
     # appear as a 90-100 production pillar from one optimistic field.
     if np.isfinite(score):
@@ -273,14 +304,30 @@ def _future_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
 
 
 def _valuation_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
-    # valuation_score in the legacy engine is 0..8; other fields are raw ratios.
-    score, coverage, evidence = _metric_score(row, (
-        (("fund_valuation_score",), 0.30, lambda v: 12.5 * v if v <= 10 else v),
-        (("fund_peg_ratio",), 0.20, lambda v: _inverse_ratio_score(v, 0.50, 2.50)),
-        (("fund_fcf_yield",), 0.22, lambda v: _ratio_score(_fraction(v), 0.00, 0.10)),
-        (("fund_trailing_pe",), 0.16, lambda v: _inverse_ratio_score(v, 6.0, 35.0)),
-        (("fund_price_to_book",), 0.12, lambda v: _inverse_ratio_score(v, 0.70, 5.00)),
-    ))
+    local = dict(row)
+    price_to_book = _first_num(local, ("fund_price_to_book",))
+    roe = _fraction(_first_num(local, ("fund_history_roe", "fund_roe")))
+    if np.isfinite(price_to_book) and np.isfinite(roe) and roe > 0:
+        local["fund_pb_to_roe_ratio"] = price_to_book / (100.0 * roe)
+    sector = canonical_sector(_first(local, ("fund_sector", "mac_sector"), "UNKNOWN"))
+    financial_model = str(local.get("fund_fundamental_model", "")).upper() == "FINANCIAL" or sector == "FINANCIALS"
+    if financial_model:
+        specs = (
+            (("fund_trailing_pe",), 0.30, lambda v: _inverse_ratio_score(v, 6.0, 28.0)),
+            (("fund_earnings_yield",), 0.25, lambda v: _ratio_score(_fraction(v), 0.02, 0.12)),
+            (("fund_price_to_book",), 0.25, lambda v: _inverse_ratio_score(v, 0.70, 4.00)),
+            (("fund_pb_to_roe_ratio",), 0.20, lambda v: _inverse_ratio_score(v, 0.05, 0.35)),
+        )
+    else:
+        specs = (
+            (("fund_trailing_pe",), 0.20, lambda v: _inverse_ratio_score(v, 6.0, 35.0)),
+            (("fund_earnings_yield",), 0.15, lambda v: _ratio_score(_fraction(v), 0.00, 0.12)),
+            (("fund_fcf_yield",), 0.25, lambda v: _ratio_score(_fraction(v), 0.00, 0.10)),
+            (("fund_ev_ebitda",), 0.20, lambda v: _inverse_ratio_score(v, 3.0, 20.0)),
+            (("fund_peg_ratio",), 0.10, lambda v: _inverse_ratio_score(v, 0.50, 2.50)),
+            (("fund_price_to_book",), 0.10, lambda v: _inverse_ratio_score(v, 0.70, 5.00)),
+        )
+    score, coverage, evidence = _metric_score(local, specs)
     if np.isfinite(score):
         if coverage < 50.0:
             score = min(score, 80.0)
@@ -290,14 +337,31 @@ def _valuation_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
 
 
 def _management_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
-    score, coverage, evidence = _metric_score(row, (
-        (("fund_management_quality_score",), 0.25, lambda v: v),
-        (("fund_capital_allocation_score",), 0.25, lambda v: v),
-        (("fund_history_roic_proxy", "fund_roic_proxy"), 0.20, lambda v: _ratio_score(_fraction(v), 0.04, 0.20)),
-        (("fund_history_share_dilution_yoy", "fund_share_dilution_yoy"), 0.15,
+    specs = (
+        (("fund_management_quality_score", "fund_management_execution_proxy_score"), 0.32, lambda v: v),
+        (("fund_capital_allocation_score", "fund_capital_allocation_proxy_score"), 0.32, lambda v: v),
+        (("fund_history_roic_proxy", "fund_roic_proxy"), 0.16, lambda v: _ratio_score(_fraction(v), 0.04, 0.20)),
+        (("fund_history_share_dilution_yoy", "fund_share_dilution_yoy"), 0.12,
          lambda v: _inverse_ratio_score(_fraction(v), 0.00, 0.15)),
-        (("nar_issuer_action_alignment_effective_score",), 0.15, lambda v: v),
-    ))
+        (("nar_issuer_action_alignment_effective_score",), 0.08, lambda v: v),
+    )
+    score, _, evidence = _metric_score(row, specs)
+    coverage = 0.0
+    for names, weight, _ in specs:
+        value = _first_num(row, names)
+        if not np.isfinite(value):
+            continue
+        selected = next((name for name in names if np.isfinite(_finite(row.get(name), np.nan))), names[0])
+        coverage_name = {
+            "fund_management_execution_proxy_score": "fund_management_execution_proxy_coverage_pct",
+            "fund_capital_allocation_proxy_score": "fund_capital_allocation_proxy_coverage_pct",
+            "nar_issuer_action_alignment_effective_score": "nar_issuer_action_alignment_coverage_pct",
+        }.get(selected)
+        evidence_coverage = _first_num(row, (coverage_name,)) if coverage_name else 100.0
+        coverage += 100.0 * weight * (
+            np.clip(evidence_coverage, 0.0, 100.0) / 100.0
+            if np.isfinite(evidence_coverage) else 0.0
+        )
     return score, coverage, " | ".join(evidence)
 
 
@@ -439,8 +503,10 @@ def _candidate_type(row: Mapping[str, Any], future_score: float, business_score:
         return "TRUE_COMPOUNDER"
     if np.isfinite(revenue_growth) and revenue_growth >= 0.12 and np.isfinite(business_score) and business_score >= 50:
         return "EMERGING_GROWTH"
-    if np.isfinite(future_score) and future_score >= 65:
+    if np.isfinite(project) and np.isfinite(future_score) and future_score >= 65:
         return "EVENT_DRIVEN_RERATING"
+    if np.isfinite(future_score) and future_score >= 65:
+        return "FINANCIAL_CAPACITY"
     return "GROWTH_VALUE_CANDIDATE"
 
 
@@ -491,6 +557,9 @@ def _leader_production_gate(
     business_score = business[0]
     future_score = future[0]
     recovery_lane = candidate_type in {"TURNAROUND", "CYCLICAL_RECOVERY", "CAPACITY_EXPANSION"}
+    project_score = _first_num(row, ("fund_project_pipeline_score", "fund_future_fundamental_impact_score"))
+    if candidate_type in {"CAPACITY_EXPANSION", "EVENT_DRIVEN_RERATING"} and not np.isfinite(project_score):
+        reasons.append("DIRECT_PROJECT_EVIDENCE_REQUIRED")
     if recovery_lane:
         if not (np.isfinite(business_score) and business_score >= 32.0 and np.isfinite(future_score) and future_score >= 55.0):
             reasons.append("RECOVERY_QUALITY_FLOOR")

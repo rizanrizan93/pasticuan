@@ -311,7 +311,7 @@ _FINANCIAL_BRIDGE_TERMS = (
     "PRODUCTION VOLUME", "COST SAVING", "EFISIENSI",
 )
 _OFFICIAL_DOMAINS = (
-    "idx.co.id", "ojk.go.id", "ksei.co.id", "bi.go.id",
+    "idx.id", "idx.co.id", "ojk.go.id", "ksei.co.id", "bi.go.id",
 )
 _GENERIC_NEWS_DOMAINS = (
     "google.com", "google.co.id", "finance.yahoo.com", "yahoo.com",
@@ -510,9 +510,10 @@ def _source_quality(
         and registered_domain
         and _host_matches(host, registered_domain)
     )
-    verified = bool(
-        _truthy(official) and (domain_official or issuer_domain_match)
-    )
+    # An HTTPS URL on a known regulator/exchange host verifies its own source
+    # provenance.  Issuer-domain evidence still requires both a registered
+    # domain match and an explicit official claim.
+    verified = bool(domain_official or (_truthy(official) and issuer_domain_match))
     if domain_official:
         return (95.0 if verified else 88.0, verified)
     if issuer_domain_plausible:

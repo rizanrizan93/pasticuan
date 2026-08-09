@@ -6551,6 +6551,25 @@ def _history_features_for_ticker(ticker: str, history: pd.DataFrame, now: Any | 
     ebit_ttm = _ttm_sum(quarterly, 'ebit')
     ebitda_ttm = _ttm_sum(quarterly, 'ebitda')
     interest_ttm = _ttm_sum(quarterly, 'interest_expense')
+    # Keep the latest audited/full-year values as a separately labelled
+    # valuation fallback.  A missing standalone quarter must not erase an
+    # otherwise usable annual earnings/cash-flow denominator, but annual facts
+    # are never relabelled as TTM.
+    latest_fy = annual.iloc[-1] if not annual.empty else pd.Series(dtype=float)
+    latest_fy_period = latest_fy.get('period_end', pd.NaT)
+    revenue_latest_fy = _num(latest_fy.get('revenue'))
+    net_income_latest_fy = _num(latest_fy.get('net_income'))
+    ocf_latest_fy = _num(latest_fy.get('operating_cash_flow'))
+    capex_latest_fy = _num(latest_fy.get('capex'))
+    ebit_latest_fy = _num(latest_fy.get('ebit'))
+    ebitda_latest_fy = _num(latest_fy.get('ebitda'))
+    if np.isfinite(ocf_latest_fy) and np.isfinite(capex_latest_fy):
+        fcf_latest_fy = (
+            ocf_latest_fy + capex_latest_fy
+            if capex_latest_fy < 0 else ocf_latest_fy - capex_latest_fy
+        )
+    else:
+        fcf_latest_fy = np.nan
     _, _, gross_margin_change_yoy = _window_ratio_change(
         quarterly, 'gross_profit', 'revenue',
     )
@@ -6642,6 +6661,14 @@ def _history_features_for_ticker(ticker: str, history: pd.DataFrame, now: Any | 
         'history_capex_ttm': capex_ttm,
         'history_ebit_ttm': ebit_ttm,
         'history_ebitda_ttm': ebitda_ttm,
+        'history_latest_fy_period': latest_fy_period,
+        'history_revenue_latest_fy': revenue_latest_fy,
+        'history_net_income_latest_fy': net_income_latest_fy,
+        'history_ocf_latest_fy': ocf_latest_fy,
+        'history_capex_latest_fy': capex_latest_fy,
+        'history_fcf_latest_fy': fcf_latest_fy,
+        'history_ebit_latest_fy': ebit_latest_fy,
+        'history_ebitda_latest_fy': ebitda_latest_fy,
         'history_equity_latest': equity_latest,
         'history_assets_latest': assets_latest,
         'history_total_debt_latest': debt_latest,
@@ -7183,14 +7210,37 @@ def enrich_fundamentals_with_valuation(
             int((current.normalize() - statement_date.normalize()).days)
             if pd.notna(current) and pd.notna(statement_date) else np.nan
         )
-        shares_reported = _num(row.get('history_shares_outstanding_latest'))
-        split_factor, split_state, split_events = _valuation_split_adjustment(
-            frame, statement_date, price_date,
+        statement_shares = _num(row.get('history_shares_outstanding_latest'))
+        ksei_shares = _num(row.get('ksei_total_shares'))
+        ksei_shares_verified = _truthy(row.get('ksei_shares_verified', False))
+        ksei_shares_asof = _as_jakarta_naive_timestamp(
+            row.get('ksei_shares_observed_at') or row.get('ksei_shares_checked_at')
         )
-        shares_adjusted = (
-            shares_reported * split_factor
-            if shares_reported > 0 and np.isfinite(split_factor) else np.nan
+        ksei_shares_age = (
+            int((current.normalize() - ksei_shares_asof.normalize()).days)
+            if pd.notna(current) and pd.notna(ksei_shares_asof) else np.nan
         )
+        ksei_shares_current = bool(
+            ksei_shares_verified and ksei_shares > 0
+            and (not np.isfinite(ksei_shares_age) or 0 <= ksei_shares_age <= 180)
+        )
+        if ksei_shares_current:
+            shares_reported = ksei_shares
+            shares_adjusted = ksei_shares
+            split_factor = 1.0
+            split_state = 'CURRENT_KSEI_TOTAL_SHARES_NO_SPLIT_ADJUSTMENT'
+            split_events: list[dict[str, Any]] = []
+            shares_basis = 'KSEI_CURRENT_TOTAL_SHARES'
+        else:
+            shares_reported = statement_shares
+            split_factor, split_state, split_events = _valuation_split_adjustment(
+                frame, statement_date, price_date,
+            )
+            shares_adjusted = (
+                shares_reported * split_factor
+                if shares_reported > 0 and np.isfinite(split_factor) else np.nan
+            )
+            shares_basis = 'SPLIT_ADJUSTED_STATEMENT_SHARES'
         derived_market_cap = (
             price * shares_adjusted
             if price > 0 and shares_adjusted > 0 else np.nan
@@ -7237,7 +7287,11 @@ def enrich_fundamentals_with_valuation(
                 market_cap_mode = 'CURRENT_REFERENCE_RECONCILES_SHARE_CHANGE'
         elif np.isfinite(derived_market_cap):
             market_cap = derived_market_cap
-            market_cap_mode = 'PRICE_TIMES_SPLIT_ADJUSTED_STATEMENT_SHARES'
+            market_cap_mode = (
+                'PRICE_TIMES_CURRENT_KSEI_TOTAL_SHARES'
+                if ksei_shares_current
+                else 'PRICE_TIMES_SPLIT_ADJUSTED_STATEMENT_SHARES'
+            )
         else:
             market_cap = np.nan
             market_cap_mode = 'MARKET_CAP_NOT_DERIVABLE'
@@ -7254,12 +7308,51 @@ def enrich_fundamentals_with_valuation(
         if currency and currency != 'IDR' and not fx.get('current', False):
             flags.append('CURRENT_FX_RATE_MISSING')
             fx_rate = np.nan
-        net_income = _num(row.get('history_net_income_ttm'))
-        fcf = _num(row.get('history_fcf_ttm'))
+        latest_fy_date = _as_jakarta_naive_timestamp(row.get('history_latest_fy_period'))
+        latest_fy_age = (
+            int((current.normalize() - latest_fy_date.normalize()).days)
+            if pd.notna(current) and pd.notna(latest_fy_date) else np.nan
+        )
+        annual_fallback_usable = bool(
+            pd.notna(latest_fy_date)
+            and (not np.isfinite(latest_fy_age) or 0 <= latest_fy_age <= 550)
+        )
+        net_income_ttm = _num(row.get('history_net_income_ttm'))
+        fcf_ttm = _num(row.get('history_fcf_ttm'))
+        ebitda_ttm = _num(row.get('history_ebitda_ttm'))
+        net_income = (
+            net_income_ttm if np.isfinite(net_income_ttm)
+            else _num(row.get('history_net_income_latest_fy')) if annual_fallback_usable
+            else np.nan
+        )
+        fcf = (
+            fcf_ttm if np.isfinite(fcf_ttm)
+            else _num(row.get('history_fcf_latest_fy')) if annual_fallback_usable
+            else np.nan
+        )
         equity = _num(row.get('history_equity_latest'))
         debt = _num(row.get('history_total_debt_latest'))
         cash = _num(row.get('history_cash_latest'))
-        ebitda = _num(row.get('history_ebitda_ttm'))
+        ebitda = (
+            ebitda_ttm if np.isfinite(ebitda_ttm)
+            else _num(row.get('history_ebitda_latest_fy')) if annual_fallback_usable
+            else np.nan
+        )
+        earnings_basis = (
+            'PERIOD_ALIGNED_TTM' if np.isfinite(net_income_ttm)
+            else 'LATEST_FULL_YEAR_NOT_TTM' if np.isfinite(net_income)
+            else 'UNAVAILABLE'
+        )
+        fcf_basis = (
+            'PERIOD_ALIGNED_TTM' if np.isfinite(fcf_ttm)
+            else 'LATEST_FULL_YEAR_NOT_TTM' if np.isfinite(fcf)
+            else 'UNAVAILABLE'
+        )
+        ebitda_basis = (
+            'PERIOD_ALIGNED_TTM' if np.isfinite(ebitda_ttm)
+            else 'LATEST_FULL_YEAR_NOT_TTM' if np.isfinite(ebitda)
+            else 'UNAVAILABLE'
+        )
         growth = _num(row.get('history_earnings_growth'))
         positive_earnings_ratio = _num(row.get('history_positive_earnings_ratio'))
 
@@ -7325,7 +7418,13 @@ def enrich_fundamentals_with_valuation(
             'ev_ebitda': ev_ebitda_derived,
             'earnings_yield': earnings_yield_derived,
         }
-        metric_lineage: list[str] = [f'MARKET_CAP:{market_cap_mode}']
+        metric_lineage: list[str] = [
+            f'MARKET_CAP:{market_cap_mode}',
+            f'SHARES:{shares_basis}',
+            f'EARNINGS:{earnings_basis}',
+            f'FCF:{fcf_basis}',
+            f'EBITDA:{ebitda_basis}',
+        ]
         for name, derived in derived_values.items():
             row[f'{name}_snapshot'] = snapshot_values[name]
             if np.isfinite(derived):
@@ -7368,6 +7467,7 @@ def enrich_fundamentals_with_valuation(
             and (
                 market_cap_mode in {
                     'PRICE_TIMES_SPLIT_ADJUSTED_STATEMENT_SHARES',
+                    'PRICE_TIMES_CURRENT_KSEI_TOTAL_SHARES',
                     'CURRENT_REFERENCE_CROSSCHECK_PASS',
                 }
                 or reference_verified
@@ -7405,6 +7505,12 @@ def enrich_fundamentals_with_valuation(
             'valuation_statement_currency': currency,
             'valuation_statement_age_days': statement_age,
             'valuation_shares_reported': shares_reported,
+            'valuation_statement_shares_reported': statement_shares,
+            'valuation_ksei_shares': ksei_shares,
+            'valuation_ksei_shares_verified': ksei_shares_verified,
+            'valuation_ksei_shares_asof': ksei_shares_asof,
+            'valuation_ksei_shares_age_days': ksei_shares_age,
+            'valuation_shares_basis': shares_basis,
             'valuation_split_factor': split_factor,
             'valuation_split_state': split_state,
             'valuation_split_events': split_events,
@@ -7422,6 +7528,11 @@ def enrich_fundamentals_with_valuation(
             'valuation_fx_verified': bool(fx.get('source_verified', False)),
             'valuation_fx_current': bool(fx.get('current', False)),
             'valuation_peg_growth_pct_used': peg_growth_pct_used,
+            'valuation_earnings_basis': earnings_basis,
+            'valuation_fcf_basis': fcf_basis,
+            'valuation_ebitda_basis': ebitda_basis,
+            'valuation_latest_fy_asof': latest_fy_date,
+            'valuation_latest_fy_age_days': latest_fy_age,
             'valuation_data_coverage_pct': round(float(coverage), 1),
             'valuation_score_eligible': score_eligible,
             'valuation_production_eligible': production_eligible,

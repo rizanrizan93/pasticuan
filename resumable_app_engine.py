@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from database_first import _coerce_bool_series, build_database_coverage, readiness_summary
+from evidence_enrichment import enrich_fundamental_evidence
 from ihsg_direction import IHSGDirectionConfig, analyze_ihsg_direction
 from macro_engine import build_macro_regime, fetch_macro_series
 from issuer_classification import normalize_fundamental_classification
@@ -36,6 +37,7 @@ from scanner import (
     clean_ohlcv,
     download_benchmark,
     download_ohlcv,
+    enrich_fundamentals_with_valuation,
     enrich_fundamentals_with_history,
     fetch_automatic_independent_prices,
     fetch_execution_snapshots,
@@ -60,7 +62,7 @@ from simple_focus import build_simple_focus, build_silent_profiles
 from two_stage_pipeline import ShortlistConfig, build_enrichment_shortlist
 from fundamental_calibration import maintenance_refresh_priority, reporting_refresh_profile
 
-ENGINE_VERSION = "9.8.2"
+ENGINE_VERSION = "9.8.3"
 
 
 def _finite(value: Any, default: float = np.nan) -> float:
@@ -536,6 +538,7 @@ _JOB_BENCHMARK_CACHE: dict[tuple[str, str, str], tuple[pd.DataFrame, pd.DataFram
 # issuing 6+ Supabase reads for every 20 tickers. A host recycle simply rebuilds
 # this cache from the durable database.
 _JOB_EVIDENCE_CACHE: dict[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
+_JOB_FORWARD_CACHE: dict[str, pd.DataFrame] = {}
 
 
 def _subset_tickers(frame: pd.DataFrame | None, tickers: Sequence[str]) -> pd.DataFrame:
@@ -637,11 +640,35 @@ def _job_evidence(
         fundamentals = _mark_history_eligible(
             _coalesce_primary_evidence(fundamentals, metadata)
         )
+    fundamentals = enrich_fundamental_evidence(fundamentals)
     value = (fundamentals, history, report, market, news, events, outcomes)
     _JOB_EVIDENCE_CACHE[key] = tuple(frame.copy() for frame in value)  # type: ignore[assignment]
     while len(_JOB_EVIDENCE_CACHE) > 4:
         _JOB_EVIDENCE_CACHE.pop(next(iter(_JOB_EVIDENCE_CACHE)))
     return tuple(frame.copy() for frame in value)  # type: ignore[return-value]
+
+
+def _job_forward_quality(
+    job_id: str,
+    bridge: ScannerDatabaseBridge,
+    universe: Sequence[str],
+) -> pd.DataFrame:
+    """Load durable project/management evidence once per resumable job."""
+    key = str(job_id or "")
+    cached = _JOB_FORWARD_CACHE.get(key)
+    if cached is not None:
+        return cached.copy()
+    frame = pd.DataFrame()
+    if hasattr(bridge, "read_forward_quality_cache"):
+        try:
+            value, _ = bridge.read_forward_quality_cache(universe)
+            frame = value if isinstance(value, pd.DataFrame) else pd.DataFrame()
+        except Exception:
+            frame = pd.DataFrame()
+    _JOB_FORWARD_CACHE[key] = frame.copy()
+    while len(_JOB_FORWARD_CACHE) > 4:
+        _JOB_FORWARD_CACHE.pop(next(iter(_JOB_FORWARD_CACHE)))
+    return frame.copy()
 
 
 def _job_benchmark(
@@ -866,6 +893,9 @@ def process_daily_scan_chunk(
         include_narrative_history=not bool(config.get("lean_skip_narrative_history", False)),
         universe_records=config.get("universe_records") if isinstance(config.get("universe_records"), list) else None,
     )
+    full_forward = _job_forward_quality(
+        str(job.get("job_id") or ""), bridge, universe or tickers,
+    )
     fundamentals = _subset_tickers(full_fundamentals, tickers)
     chunk_history = _subset_tickers(full_history, tickers)
     chunk_fundamental_report = _subset_tickers(full_report, tickers) if "ticker" in full_report.columns else full_report.copy()
@@ -873,6 +903,7 @@ def process_daily_scan_chunk(
     news = _subset_tickers(full_news, tickers)
     existing_events = _subset_tickers(full_events, tickers)
     existing_outcomes = _subset_tickers(full_outcomes, tickers)
+    project_management = _subset_tickers(full_forward, tickers)
 
     histories, download_report, ohlcv_report = _database_first_ohlcv(
         bridge, tickers, period=period,
@@ -882,6 +913,10 @@ def process_daily_scan_chunk(
     benchmark, benchmark_report = _job_benchmark(str(job.get("job_id") or ""), bridge, period=period)
     bounded = {ticker: frame.tail(800).copy() for ticker, frame in histories.items() if isinstance(frame, pd.DataFrame) and not frame.empty}
     core = ScanEngine(cfg).scan(bounded, benchmark.tail(800).copy() if isinstance(benchmark, pd.DataFrame) else benchmark)
+    fundamentals = enrich_fundamentals_with_valuation(
+        enrich_fundamental_evidence(fundamentals),
+        core.get("prepared", {}),
+    )
     base = _merge_primary(core.get("signals", pd.DataFrame()), core.get("universe", pd.DataFrame()))
     lineage_tiers: dict[str, str] = {}
     if isinstance(ohlcv_report, pd.DataFrame) and not ohlcv_report.empty and {"ticker", "source_tier"}.issubset(ohlcv_report.columns):
@@ -909,6 +944,7 @@ def process_daily_scan_chunk(
         prepared=core.get("prepared", {}),
         fundamentals=fundamentals,
         news_review=news,
+        project_management=project_management,
         market_status=market,
         existing_events=existing_events,
         existing_outcomes=existing_outcomes,
@@ -981,6 +1017,12 @@ def process_daily_scan_chunk(
             "narrative_profile": json_safe({"ticker": ticker, **profile_map.get(ticker, {})}),
             "narrative_events": json_safe(ticker_events),
             "narrative_outcomes": json_safe(ticker_outcomes),
+            "fundamental_snapshot": json_safe({"ticker": ticker, **(
+                fundamentals.loc[fundamentals["ticker"].map(_ticker).eq(ticker)].drop_duplicates("ticker", keep="last").iloc[-1].to_dict()
+                if isinstance(fundamentals, pd.DataFrame) and not fundamentals.empty and "ticker" in fundamentals.columns
+                and fundamentals["ticker"].map(_ticker).eq(ticker).any()
+                else {}
+            )}),
             "breadth": json_safe(_breadth_row(frame)),
             "ohlcv_state": str(ohlcv_meta.get(ticker, {}).get("status") or "READY"),
             "ohlcv_bars": int(len(frame)),
@@ -1006,6 +1048,7 @@ def _unpack_job_items(
     profile_rows: list[dict[str, Any]] = []
     event_rows: list[dict[str, Any]] = []
     outcome_rows: list[dict[str, Any]] = []
+    fundamental_rows: list[dict[str, Any]] = []
     technical_tickers: list[str] = []
     processed_tickers: list[str] = []
     unavailable_tickers: list[str] = []
@@ -1052,6 +1095,11 @@ def _unpack_job_items(
             event_rows.extend([dict(v) for v in payload["narrative_events"] if isinstance(v, Mapping)])
         if isinstance(payload.get("narrative_outcomes"), list):
             outcome_rows.extend([dict(v) for v in payload["narrative_outcomes"] if isinstance(v, Mapping)])
+        fundamental = payload.get("fundamental_snapshot")
+        if isinstance(fundamental, Mapping):
+            fundamental_row = dict(fundamental)
+            fundamental_row["ticker"] = ticker
+            fundamental_rows.append(fundamental_row)
         breadth = payload.get("breadth")
         if isinstance(breadth, Mapping) and breadth.get("valid"):
             breadth_rows.append(dict(breadth))
@@ -1072,6 +1120,7 @@ def _unpack_job_items(
             "technical_ready_count": len(set(technical_tickers)),
             "technical_unavailable_count": len(set(unavailable_tickers)),
         }]),
+        "fundamentals": pd.DataFrame(fundamental_rows).drop_duplicates("ticker", keep="last") if fundamental_rows else pd.DataFrame(),
     }
     item_audit = {
         "processed_tickers": list(dict.fromkeys(processed_tickers)),
@@ -1176,6 +1225,11 @@ def finalize_daily_scan_job(
         include_narrative_history=not bool(config.get("lean_skip_narrative_history", False)),
         universe_records=config.get("universe_records") if isinstance(config.get("universe_records"), list) else None,
     )
+    chunk_fundamentals = narrative.pop("fundamentals", pd.DataFrame())
+    if isinstance(chunk_fundamentals, pd.DataFrame) and not chunk_fundamentals.empty:
+        fundamentals = _coalesce_primary_evidence(chunk_fundamentals, fundamentals)
+    fundamentals = enrich_fundamental_evidence(fundamentals)
+    project_management = _job_forward_quality(job_id, bridge, universe)
     # Canonical evidence maps are initialized immediately after the evidence load.
     # Hotfix 3 referenced ``fundamental_map`` while building the refresh-priority
     # lane before the map was assigned later in the function, which produced an
@@ -1391,6 +1445,7 @@ def finalize_daily_scan_job(
             fundamentals, history, market, news, enrichment_report = _refresh_missing_daily_evidence(
                 bridge, evidence_targets, fundamentals, history, market, news, cfg, enrichment_config,
             )
+            fundamentals = enrich_fundamental_evidence(fundamentals)
         except Exception as exc:
             # Enrichment is bounded improvement, not a prerequisite for the
             # research ranking. Preserve cached evidence and surface the error.
@@ -1624,6 +1679,7 @@ def finalize_daily_scan_job(
         "narrative_events": narrative.get("events", pd.DataFrame()),
         "narrative_event_outcomes": narrative.get("outcomes", pd.DataFrame()),
         "narrative_profiles": narrative.get("profiles", pd.DataFrame()),
+        "project_management_review": project_management,
     }
     try:
         _update_job(
@@ -1640,12 +1696,15 @@ def finalize_daily_scan_job(
 
     if hasattr(bridge, "persist_scan_result"):
         try:
-            # Cache/evidence deltas were already persisted by the bounded
-            # enrichment stage. Finalization writes decision/memory tables only.
+            # Bounded provider deltas may already be durable, but finalization
+            # must also persist valuation and derived-evidence fields computed
+            # from the complete chunk set.
             final_tables = (
+                "fundamental_cache",
                 "multibagger_snapshots", "technical_snapshots",
                 "ihsg_direction_snapshots", "narrative_snapshots", "scan_runs",
             ) if bool(config.get("lean_persistence", False)) else (
+                "fundamental_cache",
                 "multibagger_snapshots", "technical_snapshots",
                 "ihsg_direction_snapshots", "provider_health",
                 "scan_runs", "scan_checkpoints",
@@ -1744,6 +1803,7 @@ def finalize_daily_scan_job(
     result["ranking_quality_state"] = ranking_state
     result["scan_id"] = job_id
     _JOB_EVIDENCE_CACHE.pop(job_id, None)
+    _JOB_FORWARD_CACHE.pop(job_id, None)
     summary = {
         "requested_tickers": len(universe),
         "processed_tickers": len(item_audit.get("processed_tickers", [])),

@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import struct
 import time
 import zlib
 
@@ -911,7 +912,54 @@ def _semantic_payload(payload: Any) -> Any:
 
 
 def _semantic_hash(payload: Any) -> str:
-    return _stable_hash(_semantic_payload(payload))
+    """Hash semantic payloads without JSONB int/float round-trip drift.
+
+    PostgreSQL ``jsonb`` preserves numeric value but not the Python ``int`` vs
+    ``float`` container type.  The previous JSON-dump hash therefore changed
+    after a valid write/read cycle (``1`` versus ``1.0``).  V2 feeds every
+    finite number as the same IEEE-754 binary64 token and otherwise retains
+    deterministic mapping/list/string boundaries.
+    """
+    digest = hashlib.sha256()
+
+    def feed(item: Any) -> None:
+        if isinstance(item, Mapping):
+            digest.update(b"{")
+            for key in sorted(item, key=lambda candidate: str(candidate)):
+                feed(str(key))
+                feed(item[key])
+            digest.update(b"}")
+            return
+        if isinstance(item, (list, tuple)):
+            digest.update(b"[")
+            for child in item:
+                feed(child)
+            digest.update(b"]")
+            return
+        if isinstance(item, (bool, np.bool_)):
+            digest.update(b"T" if bool(item) else b"F")
+            return
+        if isinstance(item, (int, float, np.integer, np.floating)):
+            number = float(item)
+            if not math.isfinite(number):
+                digest.update(b"Z")
+                return
+            digest.update(b"N")
+            digest.update(struct.pack(">d", number).hex().encode("ascii"))
+            digest.update(b";")
+            return
+        if item is None:
+            digest.update(b"Z")
+            return
+        text = item if isinstance(item, str) else str(item)
+        encoded = text.encode("utf-8")
+        digest.update(b"S")
+        digest.update(str(len(encoded)).encode("ascii"))
+        digest.update(b":")
+        digest.update(encoded)
+
+    feed(_semantic_payload(payload))
+    return digest.hexdigest()
 
 
 def _snapshot_id(table: str, record: Mapping[str, Any], as_of: str) -> str:

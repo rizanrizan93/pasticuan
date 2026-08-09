@@ -29,7 +29,7 @@ def check_compile_imports() -> None:
 
 def check_ui_has_no_durable_repository_dependency() -> None:
     source = (ROOT / 'app.py').read_text(encoding='utf-8')
-    assert 'APP_VERSION = "9.8.2-hotfix9-universe-sector-integrity"' in source
+    assert 'APP_VERSION = "9.8.3-evidence-integrity"' in source
     assert 'run_fast_single_scan' in source
     assert 'create_or_resume_scan_job' not in source
     assert 'read_latest_scan_job' not in source
