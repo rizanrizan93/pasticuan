@@ -1,4 +1,4 @@
-> Production runtime audit: v9.8.2 Hotfix 7 (persistence and database integrity).
+> Production runtime audit: v9.8.2 Hotfix 8 (fundamental period integrity).
 
 # IDX Super Scanner v9.8.2 — ALL_ELIGIBLE_LITE / Database Acceleration
 
@@ -61,6 +61,14 @@ Hotfix 5 keeps explicit provider budgets exact and rejects malformed feature-cac
 
 ## v9.8.2 Hotfix 6 — Data Contract Integrity
 Hotfix 6 preserves uploaded IDX-IC sector/rank/role metadata, prevents metadata-only fundamental rows from crashing a cold scan, and separates OHLCV acquisition state from database cache/write state. All analytical weights remain frozen and migration v15 remains current.
+
+## v9.8.2 Hotfix 8 — Fundamental Period Integrity
+
+Hotfix 8 prevents a missing official XBRL fact from masking a valid
+same-period proxy fact, and replaces fixed four-row growth lags with explicit
+same-calendar-quarter comparisons. This repairs false annual fallbacks and
+wrong-period YoY values when quarterly histories contain gaps. The fundamental
+feature model lineage is advanced to `7.6.0`; scoring weights are unchanged.
 
 ## v9.8.2 Hotfix 7 — Persistence Integrity
 Hotfix 7 separates the generic `updated_at` trigger from the `refresh_state`

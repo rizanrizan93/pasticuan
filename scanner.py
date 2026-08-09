@@ -6223,8 +6223,8 @@ def _median_statement_periods(frame: pd.DataFrame, annual: bool=False) -> pd.Dat
     v9.7.x used the median across all provider families. That is useful for
     consensus diagnostics, but it can dilute an official IDX filing with a
     stale proxy. v9.8 keeps consensus calculation separate and uses a strict
-    period preference for analytical features: verified IDX XBRL -> any
-    verified source -> provider median.
+    fact-level period preference for analytical features: verified IDX XBRL
+    fact -> any verified fact -> provider median.
     """
     if frame.empty:
         return frame.copy()
@@ -6242,35 +6242,83 @@ def _median_statement_periods(frame: pd.DataFrame, annual: bool=False) -> pd.Dat
             & group['source_verified'].fillna(False).astype(bool)
         ]
         verified = group.loc[group['source_verified'].fillna(False).astype(bool)]
-        preferred = official if not official.empty else verified if not verified.empty else group
         record: dict[str, object] = {'period_end': period_end}
         for column in numeric_columns:
-            values = pd.to_numeric(preferred[column], errors='coerce').dropna()
+            # Preference is fact-specific, not row-specific. An official filing
+            # can legitimately omit a fact (for example when an XBRL YTD value
+            # cannot be converted into a standalone quarter). In that case the
+            # old implementation selected the empty official row and discarded
+            # a valid same-period proxy fact. That could make a current quarter
+            # look missing and silently fall back to annual growth.
+            values = pd.Series(dtype=float)
+            for candidates in (official, verified, group):
+                if candidates.empty:
+                    continue
+                values = pd.to_numeric(candidates[column], errors='coerce').dropna()
+                if not values.empty:
+                    break
             record[column] = float(values.median()) if not values.empty else np.nan
         rows.append(record)
     return pd.DataFrame(rows).sort_values('period_end').reset_index(drop=True)
 
 
-def _period_change(frame: pd.DataFrame, column: str, lag: int) -> float:
-    if len(frame) <= lag:
-        return np.nan
-    latest = _num(frame[column].iloc[-1])
-    prior = _num(frame[column].iloc[-1 - lag])
-    return latest / prior - 1.0 if np.isfinite(latest) and np.isfinite(prior) and prior > 0 else np.nan
+def _same_calendar_period_row(
+    frame: pd.DataFrame,
+    reference_period: object,
+    years_back: int = 1,
+) -> pd.Series:
+    """Return the matching calendar quarter/year row, never a positional row.
+
+    Statement histories can have missing quarters and provider-specific gaps.
+    A fixed four-row lag therefore does not necessarily mean the same quarter
+    one year earlier. Matching on calendar year and quarter keeps the growth
+    basis explicit and fails closed when the comparable period is absent.
+    """
+    if frame.empty or 'period_end' not in frame:
+        return pd.Series(dtype=float)
+    reference = pd.to_datetime(reference_period, errors='coerce')
+    if pd.isna(reference):
+        return pd.Series(dtype=float)
+    periods = pd.to_datetime(frame['period_end'], errors='coerce')
+    target_year = int(reference.year) - max(0, int(years_back))
+    target_quarter = int(reference.quarter)
+    matches = frame.loc[
+        periods.dt.year.eq(target_year)
+        & periods.dt.quarter.eq(target_quarter)
+    ].copy()
+    if matches.empty:
+        return pd.Series(dtype=float)
+    match_periods = pd.to_datetime(matches['period_end'], errors='coerce')
+    target = reference - pd.DateOffset(years=max(0, int(years_back)))
+    distance = (match_periods - target).abs()
+    return matches.loc[distance.sort_values(kind='stable').index[0]]
 
 
-def _period_change_at(
+def _same_calendar_period_change(
     frame: pd.DataFrame,
     column: str,
-    lag: int,
-    end_offset: int,
+    end_years_ago: int = 0,
 ) -> float:
-    end = len(frame) - 1 - max(0, int(end_offset))
-    prior = end - int(lag)
-    if prior < 0 or end < 0:
+    """Compare a quarter with the same calendar quarter one year earlier."""
+    if frame.empty or column not in frame or 'period_end' not in frame:
         return np.nan
-    latest_value = _num(frame[column].iloc[end])
-    prior_value = _num(frame[column].iloc[prior])
+    local = frame[['period_end', column]].copy()
+    local['period_end'] = pd.to_datetime(local['period_end'], errors='coerce')
+    local[column] = pd.to_numeric(local[column], errors='coerce')
+    valid = local.dropna(subset=['period_end', column]).sort_values('period_end')
+    if valid.empty:
+        return np.nan
+    anchor = valid.iloc[-1]
+    current = _same_calendar_period_row(
+        valid, anchor['period_end'], years_back=max(0, int(end_years_ago)),
+    )
+    if current.empty:
+        return np.nan
+    prior = _same_calendar_period_row(
+        valid, current['period_end'], years_back=1,
+    )
+    latest_value = _num(current.get(column))
+    prior_value = _num(prior.get(column)) if not prior.empty else np.nan
     return (
         latest_value / prior_value - 1.0
         if np.isfinite(latest_value)
@@ -6448,22 +6496,36 @@ def _history_features_for_ticker(ticker: str, history: pd.DataFrame, now: Any | 
     consensus, consensus_conflicts, overlap_facts = _fundamental_consensus(local)
     if official_verified and consensus_conflicts:
         reconciliation_state = 'OFFICIAL_PRIORITY_PROXY_MISMATCH'
+    elif (
+        official_verified
+        and official_critical_coverage < 100.0
+        and any(source != 'IDX_OFFICIAL_XBRL' for source in sources)
+    ):
+        reconciliation_state = 'OFFICIAL_PARTIAL_PROXY_FILL'
     elif official_verified:
         reconciliation_state = 'OFFICIAL_PRIORITY_CONFIRMED'
     elif len(sources) >= 2 and np.isfinite(consensus):
         reconciliation_state = 'PROXY_CROSSCHECKED'
     else:
         reconciliation_state = 'SINGLE_SOURCE_OR_UNVERIFIED_PROXY'
-    revenue_yoy = _period_change(quarterly, 'revenue', 4)
-    earnings_yoy = _period_change(quarterly, 'net_income', 4)
-    prior_revenue_yoy = _period_change_at(quarterly, 'revenue', 4, 4)
-    prior_earnings_yoy = _period_change_at(quarterly, 'net_income', 4, 4)
+    revenue_yoy = _same_calendar_period_change(quarterly, 'revenue')
+    earnings_yoy = _same_calendar_period_change(quarterly, 'net_income')
+    prior_revenue_yoy = _same_calendar_period_change(
+        quarterly, 'revenue', end_years_ago=1,
+    )
+    prior_earnings_yoy = _same_calendar_period_change(
+        quarterly, 'net_income', end_years_ago=1,
+    )
     if not np.isfinite(revenue_yoy):
-        revenue_yoy = _period_change(annual, 'revenue', 1)
-        prior_revenue_yoy = _period_change_at(annual, 'revenue', 1, 1)
+        revenue_yoy = _same_calendar_period_change(annual, 'revenue')
+        prior_revenue_yoy = _same_calendar_period_change(
+            annual, 'revenue', end_years_ago=1,
+        )
     if not np.isfinite(earnings_yoy):
-        earnings_yoy = _period_change(annual, 'net_income', 1)
-        prior_earnings_yoy = _period_change_at(annual, 'net_income', 1, 1)
+        earnings_yoy = _same_calendar_period_change(annual, 'net_income')
+        prior_earnings_yoy = _same_calendar_period_change(
+            annual, 'net_income', end_years_ago=1,
+        )
     revenue_growth_acceleration = (
         revenue_yoy - prior_revenue_yoy
         if np.isfinite(revenue_yoy) and np.isfinite(prior_revenue_yoy)
@@ -6500,7 +6562,16 @@ def _history_features_for_ticker(ticker: str, history: pd.DataFrame, now: Any | 
     else:
         fcf_ttm = np.nan
     latest = quarterly.iloc[-1] if not quarterly.empty else annual.iloc[-1] if not annual.empty else pd.Series(dtype=float)
-    prior_year = quarterly.iloc[-5] if len(quarterly) >= 5 else annual.iloc[-2] if len(annual) >= 2 else pd.Series(dtype=float)
+    if not quarterly.empty:
+        prior_year = _same_calendar_period_row(
+            quarterly, latest.get('period_end'), years_back=1,
+        )
+    elif not annual.empty:
+        prior_year = _same_calendar_period_row(
+            annual, latest.get('period_end'), years_back=1,
+        )
+    else:
+        prior_year = pd.Series(dtype=float)
     equity_latest = _num(latest.get('equity'))
     equity_prior = _num(prior_year.get('equity'))
     assets_latest = _num(latest.get('total_assets'))
@@ -6517,9 +6588,13 @@ def _history_features_for_ticker(ticker: str, history: pd.DataFrame, now: Any | 
     margin_stability = float(np.clip(1.0 - quarterly_margins.tail(8).std() / max(abs(float(quarterly_margins.tail(8).mean())), 0.02), 0.0, 1.0)) if quarterly_margins.tail(8).notna().sum() >= 4 else np.nan
     invested_capital = equity_latest + debt_latest - cash_latest if all(np.isfinite(value) for value in (equity_latest, debt_latest, cash_latest)) else np.nan
     roic_proxy = _safe_ratio(0.78 * ebit_ttm, invested_capital) if np.isfinite(ebit_ttm) else np.nan
-    gross_profit_growth = _period_change(quarterly, 'gross_profit', 4)
+    gross_profit_growth = _same_calendar_period_change(
+        quarterly, 'gross_profit',
+    )
     if not np.isfinite(gross_profit_growth):
-        gross_profit_growth = _period_change(annual, 'gross_profit', 1)
+        gross_profit_growth = _same_calendar_period_change(
+            annual, 'gross_profit',
+        )
     accruals_to_assets = (
         _safe_ratio(net_income_ttm - ocf_ttm, average_assets)
         if np.isfinite(net_income_ttm) and np.isfinite(ocf_ttm) else np.nan
