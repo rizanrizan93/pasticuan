@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 import os
+import re
 import time
 
 import numpy as np
@@ -68,6 +69,21 @@ def _finite(value: Any, default: float = np.nan) -> float:
     except (TypeError, ValueError, OverflowError):
         return float(default)
     return number if np.isfinite(number) else float(default)
+
+
+def _int_config(config: Mapping[str, Any], key: str, default: int) -> int:
+    """Read an integer setting without turning an explicit zero into default.
+
+    ``int(config.get(key) or default)`` made 0 impossible, so a supposedly
+    disabled provider lane silently reverted to its default request budget.
+    """
+    raw = config.get(key, default)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = default
+    try:
+        return int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
 
 
 def _ticker(value: Any) -> str:
@@ -399,8 +415,40 @@ def _database_first_ohlcv(
                 "provider": "SUPABASE_OHLCV", "status": "WRITE_FAIL_SOFT",
                 "error": f"{type(exc).__name__}: {str(exc)[:240]}",
             }])
-    frames = [frame for frame in (cache_audit, pd.DataFrame(audit_rows), write_audit) if isinstance(frame, pd.DataFrame) and not frame.empty]
-    return histories, report, pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    # Acquisition, cache-read and persistence are different facts. Older code
+    # concatenated them as competing ``status`` rows; downstream
+    # ``drop_duplicates(..., keep='last')`` then selected WRITE_FAILED as the
+    # market-data state and erased source tier/session lag.
+    combined_audit = pd.DataFrame(audit_rows)
+    if not combined_audit.empty:
+        combined_audit["acquisition_status"] = combined_audit["status"]
+        combined_audit["audit_scope"] = "TICKER"
+    global_rows: list[dict[str, Any]] = []
+    for extra, prefix in ((cache_audit, "database_cache_"), (write_audit, "database_write_")):
+        if not isinstance(extra, pd.DataFrame) or extra.empty:
+            continue
+        local = extra.copy()
+        if "ticker" in local.columns:
+            ticker_mask = local["ticker"].notna() & local["ticker"].astype(str).str.strip().ne("")
+            ticker_rows = local.loc[ticker_mask].copy()
+            if not ticker_rows.empty:
+                ticker_rows["ticker"] = ticker_rows["ticker"].map(_ticker)
+                ticker_rows = ticker_rows.drop_duplicates("ticker", keep="last")
+                ticker_rows = ticker_rows.rename(columns={
+                    column: f"{prefix}{column}" for column in ticker_rows.columns if column != "ticker"
+                })
+                combined_audit = combined_audit.merge(ticker_rows, on="ticker", how="left")
+            local = local.loc[~ticker_mask].copy()
+        if not local.empty:
+            for source in local.to_dict("records"):
+                global_rows.append({
+                    "ticker": pd.NA,
+                    "audit_scope": "GLOBAL",
+                    **{f"{prefix}{key}": value for key, value in source.items() if key != "ticker"},
+                })
+    if global_rows:
+        combined_audit = pd.concat([combined_audit, pd.DataFrame(global_rows)], ignore_index=True, sort=False)
+    return histories, report, combined_audit
 
 
 def _database_first_benchmark(
@@ -473,6 +521,56 @@ def _subset_tickers(frame: pd.DataFrame | None, tickers: Sequence[str]) -> pd.Da
     return frame.loc[normalized.isin(names)].copy().reset_index(drop=True)
 
 
+def _universe_metadata(
+    records: Sequence[Mapping[str, Any]] | None,
+    universe: Sequence[str],
+) -> pd.DataFrame:
+    """Return conservative metadata-only issuer evidence from the upload."""
+    names = set(_ticker(value) for value in universe if _ticker(value))
+    rows: list[dict[str, Any]] = []
+    for raw in records or []:
+        if not isinstance(raw, Mapping):
+            continue
+        normalized = {
+            re.sub(r"[^a-z0-9]+", "_", str(key or "").strip().lower()).strip("_"): value
+            for key, value in raw.items()
+        }
+
+        def first(*keys: str) -> Any:
+            for key in keys:
+                value = normalized.get(key)
+                if value is None:
+                    continue
+                try:
+                    if bool(pd.isna(value)):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                if str(value).strip():
+                    return value
+            return ""
+
+        ticker = _ticker(first("ticker", "yahoo_ticker", "symbol", "kode"))
+        if not ticker or ticker not in names:
+            continue
+        sector = first("idx_sector", "sector_idx_ic", "idx_ic_sector", "sector")
+        rows.append({
+            "ticker": ticker,
+            "idx_sector": sector,
+            "sector_idx_ic": sector,
+            "universe_rank": first("rank_universe", "universe_rank"),
+            "universe_role": first("universe_role", "role"),
+            "universe_priority": first("priority", "universe_priority"),
+            "universe_active_scan": first("active_scan", "scan_active"),
+            "universe_metadata_source": "UPLOADED_UNIVERSE",
+        })
+    if not rows:
+        return pd.DataFrame()
+    return normalize_fundamental_classification(
+        pd.DataFrame(rows).drop_duplicates("ticker", keep="first")
+    )
+
+
 def _job_evidence(
     job_id: str,
     bridge: ScannerDatabaseBridge,
@@ -480,6 +578,7 @@ def _job_evidence(
     cfg: ScanConfig,
     *,
     include_narrative_history: bool = True,
+    universe_records: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     key = str(job_id or "")
     cached = _JOB_EVIDENCE_CACHE.get(key)
@@ -506,6 +605,11 @@ def _job_evidence(
         market, news = aux_future.result()
         events = event_future.result() if event_future is not None else pd.DataFrame()
         outcomes = outcome_future.result() if outcome_future is not None else pd.DataFrame()
+    metadata = _universe_metadata(universe_records, universe)
+    if not metadata.empty:
+        fundamentals = _mark_history_eligible(
+            _coalesce_primary_evidence(fundamentals, metadata)
+        )
     value = (fundamentals, history, report, market, news, events, outcomes)
     _JOB_EVIDENCE_CACHE[key] = tuple(frame.copy() for frame in value)  # type: ignore[assignment]
     while len(_JOB_EVIDENCE_CACHE) > 4:
@@ -566,16 +670,21 @@ def _refresh_missing_daily_evidence(
         sector_missing = str(row.get("sector") or "UNKNOWN").upper() == "UNKNOWN"
         age = _finite(row.get("statement_age_days"), np.nan)
         history_missing = counts.get(ticker, 0) < 2
-        # Lower tuple sorts first. Sector/identity gaps are cheap to repair via
-        # snapshot and materially affect macro transmission, so prioritize them.
-        if sector_missing:
+        calendar_due = bool(reporting_refresh_profile(row).get("fundamental_refresh_due", False))
+        # Lower tuple sorts first. A quarterly reporting window that has opened
+        # is a real refresh condition even when the old statement is <210 days
+        # old. Hotfix 3 promoted those names in the shortlist but this inner
+        # filter still discarded them, making the calibration ineffective.
+        if calendar_due:
             bucket = 0
-        elif not eligible:
+        elif sector_missing:
             bucket = 1
-        elif history_missing:
+        elif not eligible:
             bucket = 2
-        elif not np.isfinite(age) or age > 210:
+        elif history_missing:
             bucket = 3
+        elif not np.isfinite(age) or age > 210:
+            bucket = 4
         else:
             bucket = 9
         age_rank = -age if np.isfinite(age) else -9999.0
@@ -583,14 +692,14 @@ def _refresh_missing_daily_evidence(
 
     refresh_candidates = [ticker for ticker in names if refresh_priority(ticker)[0] < 9]
     refresh_candidates.sort(key=refresh_priority)
-    fundamental_limit = max(0, int(config.get("daily_fundamental_refresh_limit", 6) or 6))
+    fundamental_limit = max(0, _int_config(config, "daily_fundamental_refresh_limit", 6))
     targets = refresh_candidates[:fundamental_limit]
     if targets:
         # One-button database maintenance is official-first.  The normal scan
         # repairs missing/stale statement history itself instead of requiring a
         # separate backfill mode. Yahoo is used only when IDX history remains
         # insufficient, preserving both source quality and warm-scan speed.
-        official_limit = max(0, int(config.get("daily_official_fundamental_refresh_limit", fundamental_limit) or fundamental_limit))
+        official_limit = max(0, _int_config(config, "daily_official_fundamental_refresh_limit", fundamental_limit))
         official_targets = targets[:official_limit]
         idx_history = pd.DataFrame()
         idx_report = pd.DataFrame()
@@ -624,7 +733,7 @@ def _refresh_missing_daily_evidence(
         ) if yahoo_targets else (pd.DataFrame(), pd.DataFrame())
         history = combine_fundamental_history(history_after_idx, yahoo_history)
 
-        snapshot_limit = max(1, int(config.get("daily_snapshot_refresh_limit", 4) or 4))
+        snapshot_limit = max(0, _int_config(config, "daily_snapshot_refresh_limit", 4))
         # Snapshot fetch repairs sector/company identity and valuation fields;
         # prioritize UNKNOWN sectors, then the remaining stale targets.
         sector_targets = [t for t in targets if str(fundamental_map.get(t, {}).get("sector") or "UNKNOWN").upper() == "UNKNOWN"]
@@ -640,14 +749,14 @@ def _refresh_missing_daily_evidence(
                 reports.append(report)
 
     market_present = set(market.get("ticker", pd.Series(dtype=str)).map(_ticker)) if not market.empty else set()
-    market_limit = max(0, int(config.get("daily_market_refresh_limit", 6) or 6))
+    market_limit = max(0, _int_config(config, "daily_market_refresh_limit", 6))
     market_targets = [ticker for ticker in names if ticker not in market_present][:market_limit]
     if market_targets:
         market_live = fetch_resilient_market_status(market_targets, cfg)
         market = _merge_primary(market_live, market)
 
     news_present = set(news.get("ticker", pd.Series(dtype=str)).map(_ticker)) if not news.empty else set()
-    news_limit = max(0, int(config.get("daily_news_refresh_limit", 5) or 5))
+    news_limit = max(0, _int_config(config, "daily_news_refresh_limit", 5))
     news_targets = [ticker for ticker in names if ticker not in news_present][:news_limit]
     if news_targets:
         news_live = fetch_resilient_news_review(news_targets, lookback_days=7, config=cfg)
@@ -728,6 +837,7 @@ def process_daily_scan_chunk(
     full_fundamentals, full_history, full_report, full_market, full_news, full_events, full_outcomes = _job_evidence(
         str(job.get("job_id") or ""), bridge, universe or tickers, cfg,
         include_narrative_history=not bool(config.get("lean_skip_narrative_history", False)),
+        universe_records=config.get("universe_records") if isinstance(config.get("universe_records"), list) else None,
     )
     fundamentals = _subset_tickers(full_fundamentals, tickers)
     chunk_history = _subset_tickers(full_history, tickers)
@@ -813,6 +923,10 @@ def process_daily_scan_chunk(
                 "ohlcv_last_bar_date": ohlcv_meta.get(ticker, {}).get("last_bar_date"),
                 "ohlcv_session_lag": ohlcv_meta.get(ticker, {}).get("session_lag"),
                 "ohlcv_source_tier": str(ohlcv_meta.get(ticker, {}).get("source_tier") or "UNAVAILABLE"),
+                "ohlcv_database_cache_status": ohlcv_meta.get(ticker, {}).get("database_cache_status"),
+                "ohlcv_database_write_status": ohlcv_meta.get(ticker, {}).get("database_write_status"),
+                "ohlcv_database_rows_written": ohlcv_meta.get(ticker, {}).get("database_write_rows_written"),
+                "ohlcv_database_write_error": ohlcv_meta.get(ticker, {}).get("database_write_error"),
                 "worker_id": worker_id,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -846,6 +960,10 @@ def process_daily_scan_chunk(
             "ohlcv_last_bar_date": json_safe(frame.index[-1]),
             "ohlcv_session_lag": ohlcv_meta.get(ticker, {}).get("session_lag"),
             "ohlcv_source_tier": str(ohlcv_meta.get(ticker, {}).get("source_tier") or "DATABASE_OR_PUBLIC"),
+            "ohlcv_database_cache_status": ohlcv_meta.get(ticker, {}).get("database_cache_status"),
+            "ohlcv_database_write_status": ohlcv_meta.get(ticker, {}).get("database_write_status"),
+            "ohlcv_database_rows_written": ohlcv_meta.get(ticker, {}).get("database_write_rows_written"),
+            "ohlcv_database_write_error": ohlcv_meta.get(ticker, {}).get("database_write_error"),
             "worker_id": worker_id,
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -965,6 +1083,10 @@ def _ohlcv_item_audit(items: pd.DataFrame) -> pd.DataFrame:
             "ohlcv_session_lag": payload.get("ohlcv_session_lag"),
             "ohlcv_source_tier": payload.get("ohlcv_source_tier"),
             "acquisition_error": payload.get("acquisition_error"),
+            "database_cache_status": payload.get("ohlcv_database_cache_status"),
+            "database_write_status": payload.get("ohlcv_database_write_status"),
+            "database_rows_written": payload.get("ohlcv_database_rows_written"),
+            "database_write_error": payload.get("ohlcv_database_write_error"),
             "attempt_count": int(row.get("attempt_count") or 0),
         })
     return pd.DataFrame(rows)
@@ -1025,7 +1147,19 @@ def finalize_daily_scan_job(
     fundamentals, history, fundamental_report, market, news, cached_events, cached_outcomes = _job_evidence(
         job_id, bridge, universe, cfg,
         include_narrative_history=not bool(config.get("lean_skip_narrative_history", False)),
+        universe_records=config.get("universe_records") if isinstance(config.get("universe_records"), list) else None,
     )
+    # Canonical evidence maps are initialized immediately after the evidence load.
+    # Hotfix 3 referenced ``fundamental_map`` while building the refresh-priority
+    # lane before the map was assigned later in the function, which produced an
+    # UnboundLocalError on the exact cold/partial-cache path used by production.
+    # Keep all state needed by ranking/enrichment initialized before any branch.
+    fundamental_map = (
+        fundamentals.drop_duplicates("ticker", keep="last").set_index("ticker").to_dict("index")
+        if isinstance(fundamentals, pd.DataFrame) and not fundamentals.empty and "ticker" in fundamentals.columns
+        else {}
+    )
+    history_counts = _history_counts(history)
     # Chunk payloads hold the narrative produced against the same cached evidence;
     # cached_events/outcomes remain available for a resumed job but are not needed
     # to rebuild every chunk during finalization.
@@ -1033,7 +1167,18 @@ def finalize_daily_scan_job(
     period = str(config.get("period", "5y") or "5y")
     benchmark, benchmark_report = _job_benchmark(str(job.get("job_id") or ""), bridge, period=period)
     if bool(config.get('macro_external_enabled', True)):
-        macro_series, macro_report = fetch_macro_series(period="6mo", timeout=max(3, int(config.get('macro_timeout_seconds', 5) or 5)))
+        try:
+            macro_series, macro_report = fetch_macro_series(
+                period="6mo", timeout=max(3, int(config.get('macro_timeout_seconds', 5) or 5))
+            )
+        except Exception as exc:
+            # External macro factors are context, never a reason to lose the
+            # entire 400-name ranking. IHSG + universe breadth remains usable.
+            macro_series = {}
+            macro_report = pd.DataFrame([{
+                'factor':'EXTERNAL_MACRO','status':'FAIL_SOFT','source':'IHSG_BREADTH_FALLBACK',
+                'error':f'{type(exc).__name__}: {str(exc)[:240]}',
+            }])
     else:
         macro_series, macro_report = {}, pd.DataFrame([{'factor':'EXTERNAL_MACRO','status':'SKIPPED_LEAN_MODE','source':'IHSG_BREADTH_ONLY'}])
     breadth_sample = int(_finite(breadth_features.get("breadth_sample"), 0.0))
@@ -1142,9 +1287,10 @@ def finalize_daily_scan_job(
             return []
         return list(dict.fromkeys(frame["ticker"].map(_ticker).dropna().tolist()))
 
-    evidence_cap = min(20, max(8, int(config.get("evidence_refresh_cap", 16) or 16)), len(completed_tickers)) if completed_tickers else 0
+    requested_evidence_cap = max(0, _int_config(config, "evidence_refresh_cap", 16))
+    evidence_cap = min(20, requested_evidence_cap, len(completed_tickers)) if completed_tickers else 0
     maintenance_reserve = min(2, max(0, evidence_cap // 4)) if evidence_cap else 0
-    requested_decision_cap = max(4, int(config.get("decision_evidence_cap", 12) or 12))
+    requested_decision_cap = max(0, _int_config(config, "decision_evidence_cap", 12))
     decision_refresh_cap = min(max(0, evidence_cap - maintenance_reserve), requested_decision_cap) if evidence_cap else 0
     fallback_evidence, _ = build_enrichment_shortlist(
         completed_tickers,
@@ -1180,17 +1326,10 @@ def finalize_daily_scan_job(
     # Reserve a small maintenance lane so database coverage keeps expanding even
     # when the same leaders remain at the top for many sessions. Once a ticker is
     # current it naturally drops behind the next missing/stale issuer.
-    counts = _history_counts(history)
-    fundamental_map = (
-        fundamentals.drop_duplicates("ticker", keep="last").set_index("ticker").to_dict("index")
-        if isinstance(fundamentals, pd.DataFrame) and not fundamentals.empty and "ticker" in fundamentals.columns
-        else {}
-    )
-
     def _maintenance_priority(ticker: str) -> tuple[int, float, str]:
         row = fundamental_map.get(ticker, {})
         bucket, age_priority = maintenance_refresh_priority(
-            row, history_count=counts.get(ticker, 0),
+            row, history_count=history_counts.get(ticker, 0),
         )
         return bucket, age_priority, ticker
 
@@ -1215,15 +1354,24 @@ def finalize_daily_scan_job(
             pass
         enrichment_config = dict(config)
         enrichment_config.update({
-            "daily_fundamental_refresh_limit": min(len(evidence_targets), int(config.get("evidence_fundamental_cap", 12) or 12)),
-            "daily_official_fundamental_refresh_limit": min(len(evidence_targets), int(config.get("evidence_official_cap", 8) or 8)),
-            "daily_snapshot_refresh_limit": min(len(evidence_targets), int(config.get("evidence_snapshot_cap", 12) or 12)),
-            "daily_market_refresh_limit": min(len(evidence_targets), int(config.get("evidence_market_cap", 6) or 6)),
-            "daily_news_refresh_limit": min(len(evidence_targets), int(config.get("evidence_news_cap", 12) or 12)),
+            "daily_fundamental_refresh_limit": min(len(evidence_targets), max(0, _int_config(config, "evidence_fundamental_cap", 12))),
+            "daily_official_fundamental_refresh_limit": min(len(evidence_targets), max(0, _int_config(config, "evidence_official_cap", 8))),
+            "daily_snapshot_refresh_limit": min(len(evidence_targets), max(0, _int_config(config, "evidence_snapshot_cap", 12))),
+            "daily_market_refresh_limit": min(len(evidence_targets), max(0, _int_config(config, "evidence_market_cap", 6))),
+            "daily_news_refresh_limit": min(len(evidence_targets), max(0, _int_config(config, "evidence_news_cap", 12))),
         })
-        fundamentals, history, market, news, enrichment_report = _refresh_missing_daily_evidence(
-            bridge, evidence_targets, fundamentals, history, market, news, cfg, enrichment_config,
-        )
+        try:
+            fundamentals, history, market, news, enrichment_report = _refresh_missing_daily_evidence(
+                bridge, evidence_targets, fundamentals, history, market, news, cfg, enrichment_config,
+            )
+        except Exception as exc:
+            # Enrichment is bounded improvement, not a prerequisite for the
+            # research ranking. Preserve cached evidence and surface the error.
+            enrichment_report = pd.DataFrame([{
+                "provider": "BOUNDED_EVIDENCE_REFRESH",
+                "status": "FAIL_SOFT",
+                "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            }])
         if isinstance(enrichment_report, pd.DataFrame) and not enrichment_report.empty:
             if isinstance(fundamental_report, pd.DataFrame) and not fundamental_report.empty:
                 fundamental_report = pd.concat([fundamental_report, enrichment_report], ignore_index=True, sort=False)
@@ -1260,13 +1408,17 @@ def finalize_daily_scan_job(
     # Execution verification is an expensive second-source operation.  Verify
     # the actual provisional leaders/swing candidates first instead of spending
     # up to 40 provider checks on a generic technical rescue list.
-    requested_verify_cap = int(config.get("execution_verification_cap", 10) or 10)
-    verification_cap = min(
-        12,
-        max(6, requested_verify_cap),
-        len(completed_tickers),
-        max(1, int(cfg.max_automatic_price_candidates)),
-    ) if completed_tickers else 0
+    requested_verify_cap = max(0, _int_config(config, "execution_verification_cap", 10))
+    verification_cap = (
+        min(
+            12,
+            requested_verify_cap,
+            len(completed_tickers),
+            max(1, int(cfg.max_automatic_price_candidates)),
+        )
+        if completed_tickers and requested_verify_cap > 0
+        else 0
+    )
 
     priority_verification = list(dict.fromkeys(
         portfolio_tickers
@@ -1318,18 +1470,39 @@ def finalize_daily_scan_job(
         })
     if verification:
         # Yahoo execution snapshots and the independent-provider chain do not
-        # depend on each other. Run both bounded I/O branches concurrently.
+        # depend on each other. Run both bounded I/O branches concurrently, but
+        # make each branch independently fail-soft. Verification can block an
+        # order; it must never erase a valid research ranking.
+        def _safe_snapshots() -> pd.DataFrame:
+            try:
+                value = fetch_execution_snapshots(verification)
+                return value if isinstance(value, pd.DataFrame) else pd.DataFrame()
+            except Exception:
+                return pd.DataFrame()
+
+        def _safe_independent() -> tuple[pd.DataFrame, pd.DataFrame]:
+            try:
+                value, report = fetch_automatic_independent_prices(
+                    verification,
+                    twelve_data_api_key=str(runtime.get("twelve_data_api_key", "") or ""),
+                    itick_api_token=str(runtime.get("itick_api_token", "") or ""),
+                    primary_reference=primary_reference,
+                    primary_source_tiers=primary_source_tiers,
+                    config=cfg,
+                )
+                return (
+                    value if isinstance(value, pd.DataFrame) else pd.DataFrame(),
+                    report if isinstance(report, pd.DataFrame) else pd.DataFrame(),
+                )
+            except Exception as exc:
+                return pd.DataFrame(), pd.DataFrame([{
+                    "provider": "INDEPENDENT_PRICE", "status": "FAIL_SOFT",
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                }])
+
         with ThreadPoolExecutor(max_workers=2) as pool:
-            snapshot_future = pool.submit(fetch_execution_snapshots, verification)
-            independent_future = pool.submit(
-                fetch_automatic_independent_prices,
-                verification,
-                twelve_data_api_key=str(runtime.get("twelve_data_api_key", "") or ""),
-                itick_api_token=str(runtime.get("itick_api_token", "") or ""),
-                primary_reference=primary_reference,
-                primary_source_tiers=primary_source_tiers,
-                config=cfg,
-            )
+            snapshot_future = pool.submit(_safe_snapshots)
+            independent_future = pool.submit(_safe_independent)
             snapshots = snapshot_future.result()
             independent, independent_report = independent_future.result()
     else:

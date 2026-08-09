@@ -59,6 +59,11 @@ _ALIAS = {
     "TRANSPORTATION AND LOGISTICS": "TRANSPORTATION",
     "TRANSPORTATION & LOGISTICS": "TRANSPORTATION",
     "TRANSPORTATION": "TRANSPORTATION",
+    # This is an explicit universe classification, but there is deliberately no
+    # generic macro transmission weight for diversified holdings. The issuer
+    # remains sector-known while its macro score stays evidence-pending.
+    "MULTI-SECTOR HOLDINGS": "MULTI-SECTOR HOLDINGS",
+    "MULTI SECTOR HOLDINGS": "MULTI-SECTOR HOLDINGS",
 }
 
 # Conservative keyword inference.  Order matters: specific phrases precede

@@ -45,7 +45,9 @@ def check_single_scan_sidebar() -> None:
     assert 'st.radio("Mode kerja"' not in source
     assert 'Mulai / Lanjutkan Isi Database' not in source
     assert 'st.button("SCAN", type="primary", width="stretch")' in source
-    assert 'job_type = "DAILY_SCAN"' in source
+    assert 'run_fast_single_scan' in source
+    assert 'read_latest_scan_job' not in source
+    assert 'create_or_resume_scan_job' not in source
 
 
 def check_staged_budget_contract() -> None:
@@ -58,16 +60,17 @@ def check_staged_budget_contract() -> None:
         'daily_official_fundamental_refresh_limit',
     ):
         assert f'"{key}": int(job_chunk_size)' not in app_source
-    assert '"evidence_refresh_cap": 16' in app_source
-    assert '"execution_verification_cap": 10' in app_source
+    assert '"evidence_refresh_cap": 8' in app_source
+    assert '"execution_verification_cap": 6' in app_source
 
     chunk_source = inspect.getsource(process_daily_scan_chunk)
     final_source = inspect.getsource(finalize_daily_scan_job)
     assert '_refresh_missing_daily_evidence(' not in chunk_source
     assert final_source.count('_refresh_missing_daily_evidence(') == 1
     assert 'phase="EVIDENCE_REFRESH"' in final_source
-    assert 'execution_verification_cap", 10' in final_source
-    assert 'min(\n        12,' in final_source
+    assert 'execution_verification_cap", 10' in final_source or 'execution_verification_cap", 6' in final_source
+    assert 'requested_verify_cap = max(0, _int_config(config, "execution_verification_cap", 10))' in final_source
+    assert 'requested_verify_cap > 0' in final_source
 
 
 def check_job_level_evidence_cache_contract() -> None:
@@ -282,11 +285,12 @@ def check_batch_transport() -> None:
 
 def check_version_contract() -> None:
     import resumable_app_engine as eng
-    import resumable_scan as rs
-    assert eng.ENGINE_VERSION == '9.8.0'
-    assert rs.RESUMABLE_SCAN_VERSION == '9.8.0'
+    assert str(eng.ENGINE_VERSION).startswith('9.8.2')
     app_source = (ROOT / 'app.py').read_text(encoding='utf-8')
-    assert 'APP_VERSION = "9.8.0-guarded-real-money"' in app_source
+    assert 'APP_VERSION = "9.8.2-hotfix7-persistence-integrity"' in app_source
+    fast_source = (ROOT / 'fast_scan_engine.py').read_text(encoding='utf-8')
+    # Feature-cache contract intentionally remains stable across calibration/runtime hotfixes.
+    assert 'FAST_SCAN_VERSION = "9.8.2-all-eligible-lite"' in fast_source
 
 
 def main() -> None:

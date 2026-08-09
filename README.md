@@ -1,95 +1,70 @@
-# IDX Super Scanner v9.7.0 — Modular Inventory & Emir-Style Dashboard
+> Production runtime audit: v9.8.2 Hotfix 7 (persistence and database integrity).
 
-v9.7.0 keeps the v9.6.1 database-first/network-resilient backbone and changes the **decision/UI architecture**, not the fundamental valuation contract.
+# IDX Super Scanner v9.8.2 — ALL_ELIGIBLE_LITE / Database Acceleration
+
+Production workflow:
+
+`Upload ticker CSV -> SCAN -> ALL_ELIGIBLE_LITE discovery -> bounded evidence enrichment -> final ranking -> fail-soft persistence`
 
 ## What changed
 
-### 1. Lower coupling
+v9.8.2 freezes the analytical methodology and changes only runtime/database architecture.
 
-- `decision_overlay.py` is a pure OHLCV/decision module. It does **not** import Streamlit, Supabase, scanner providers, or the fundamental engine.
-- `v9_dashboard.py` is presentation-only. It accepts DataFrames and renders the Top 3 report card without importing scanner/database/network code.
-- `app.py` no longer imports 18 unused symbols from `scanner.py`; all unused `two_stage_pipeline` UI imports were removed.
-- `scanner.py` remains unchanged in this release. This is intentional: a large refactor of the stable 11k-line core during a dashboard/methodology change would increase regression risk.
+- Every ticker in the uploaded universe remains eligible for discovery/ranking.
+- A current `scanner_feature_cache` row is reused directly; the scanner does not re-open 800–900 OHLCV bars for that ticker.
+- Missing/stale feature rows alone go through the full technical engine.
+- Persistent OHLCV uses compact zlib/base64 CSV transport (`payload_compact`) instead of selecting the large legacy JSONB payload on normal reads.
+- Legacy OHLCV rows are converted lazily in one bounded batch after they are read.
+- Existing incremental Yahoo/IDX refresh remains active: current caches generate zero provider calls; stale caches request a short overlap window.
+- Deep fundamental/news/official IDX work remains bounded to the promoted shortlist plus a small maintenance lane.
+- Supabase remains fail-soft. A database outage cannot block ranking production.
 
-### 2. Multi-horizon smart-money inventory overlay
+## Runtime policy
 
-Every technical-ready ticker now receives an OHLCV proxy across:
+- Universe: max 400 tickers.
+- `ALL_ELIGIBLE_LITE`: all tickers compete; current feature-cache hits skip technical recomputation.
+- Evidence enrichment: max 8 names/job by default.
+- Two enrichment slots are reserved for rotating stale/missing database maintenance when possible.
+- Official IDX/XBRL refresh: max 4 names/job.
+- Execution verification: max 6 names/job.
+- Individual yfinance retry remains disabled by default.
+- Real-money authorization, valuation, future fundamental, inventory lifecycle, anti-chase, distribution guard, and SMC/ICT logic are unchanged.
 
-- 20D
-- 60D
-- 120D
-- 252D
-- 504D
-- 756D
+## Database migration
 
-The overlay emits:
+Run `database/migration_v15_database_acceleration.sql` once.
 
-- `inventory_multi_horizon_score`
-- `inventory_multi_horizon_coverage_pct`
-- `distribution_risk_score`
-- `inventory_lifecycle`
-- `anti_chase_gate`
-- `markup_extension_pct`
-- `reaccumulation_quality_score`
-- `accumulation_dominance_pct`
+The scanner remains fail-soft without v15, but it falls back to legacy v9.8.1 database behavior and therefore does **not** receive the main feature-cache/compact-OHLCV acceleration.
 
-The 756D horizon is supported by raising the bounded per-ticker technical history from 750 to 800 bars.
+v15 adds:
 
-This is explicitly an **OHLCV proxy**. It never claims to identify a specific broker or shareholder.
+- `scanner_feature_cache`
+- `ohlcv_daily_cache.payload_compact`
+- `ohlcv_daily_cache.payload_codec`
+- `ohlcv_daily_cache.compact_bar_count`
+- `ohlcv_daily_cache.compact_hash`
 
-### 3. Lifecycle and anti-chasing guardrails
+Legacy `ohlcv_daily_cache.payload` data is not destructively deleted.
 
-Lifecycle states:
+## Freeze policy
 
-`INVENTORY_COLLECTION → EARLY_CONVERGENCE → MARKUP → REACCUMULATION → DISTRIBUTION`
+After v9.8.2, do not add indicators or scoring modules before live calibration. Changes should be limited to proven bugs, data-integrity failures, or provider/runtime defects. The next phase is scanner-vs-independent-analysis calibration and market-outcome tracking.
 
-Guardrails are applied **after** the core v9 score is calculated:
+## v9.8.2 Hotfix 3 — Calibration
+Hotfix 3 freezes scoring weights and adds calendar-aware fundamental freshness, latest-history-over-proxy precedence, thesis archetypes, bounded refresh promotion and clearer research-vs-execution labelling. No new SQL migration is required; migration v15 remains current.
 
-- advanced MARKUP + anti-chase condition: a Next Leader `BUY_ZONE` is downgraded to `WAIT`; Swing execution states are downgraded to `WATCHLIST` and `WAIT_REACCUMULATION`.
-- DISTRIBUTION: methodology gate blocks production ranking/order eligibility.
-- core business/future fundamental/valuation score math is not rewritten by the lifecycle overlay.
+## v9.8.2 Hotfix 4 — Runtime Stability
+Hotfix 4 fixes the production finalizer crash caused by `fundamental_map` being read before initialization and hardens optional provider branches so research ranking survives missing external evidence. Analytical weights/methodology are unchanged; migration v15 remains current.
 
-### 4. Emir-style Top 3 dashboard
+## v9.8.2 Hotfix 5 — 400 Universe Audit
+Hotfix 5 keeps explicit provider budgets exact and rejects malformed feature-cache rows before they can suppress ranking. No scoring or schema change.
 
-New first tab: **Top 3 Dashboard** with two sub-tabs:
+## v9.8.2 Hotfix 6 — Data Contract Integrity
+Hotfix 6 preserves uploaded IDX-IC sector/rank/role metadata, prevents metadata-only fundamental rows from crashing a cold scan, and separates OHLCV acquisition state from database cache/write state. All analytical weights remain frozen and migration v15 remains current.
 
-- Top 3 Next Leader
-- Top 3 Swing
-
-Each card displays:
-
-- final score and coverage
-- recommendation state
-- entry / trigger / stop / TP1 / TP2 / RR
-- factor bars
-- accumulation gauge
-- silent accumulation, multi-horizon inventory, distribution risk and reaccumulation quality
-- lifecycle / anti-chase badges
-- report-card stars
-- thesis summary and primary risk
-
-The old Market Map, The Next Leader, Swing Ready and Portfolio/Audit tables remain available.
-
-## Core production contract retained
-
-1. Read persistent OHLCV/fundamental/narrative evidence first.
-2. Refresh only missing/stale evidence.
-3. Persist deltas to the database.
-4. Compute business quality, future fundamental, valuation/MOS, management/capital allocation, macro/sector, narrative-flow and technical readiness.
-5. Apply production evidence gates.
-6. Apply lifecycle/anti-chase guardrails as a separate final decision layer.
-7. Rank only production-eligible candidates.
-
-## Database
-
-**No new SQL migration is required.** New lifecycle fields are stored inside the existing resumable item/result JSON payload and scan artifacts.
-
-Keep all v9.6.1 database migrations/hotfixes, especially v12 resumable jobs, v13 persistent OHLCV and `permissions_hotfix_v9_4_1.sql`.
-
-## Validation
-
-See `TEST_REPORT_V9_7_0.md` and run:
-
-```bash
-python validation_v9_7_0.py
-```
+## v9.8.2 Hotfix 7 — Persistence Integrity
+Hotfix 7 separates the generic `updated_at` trigger from the `refresh_state`
+content-hash rule, repairs missing v13/v15 OHLCV tables through idempotent
+migration v16, and prevents pandas/string `NaT` values from crossing typed date
+contracts. Scoring weights and the feature-cache compatibility version remain
+unchanged.

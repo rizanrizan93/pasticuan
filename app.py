@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "9.8.2-hotfix3-calibration"
+APP_VERSION = "9.8.2-hotfix7-persistence-integrity"
 APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
@@ -28,7 +28,7 @@ if missing:
     st.code("\n".join(missing), language="text")
     st.stop()
 
-from scanner import parse_portfolio_csv, parse_ticker_csv  # noqa: E402
+from scanner import parse_portfolio_csv, parse_universe_csv  # noqa: E402
 from macro_engine import MACRO_ENGINE_VERSION  # noqa: E402
 from simple_focus import SIMPLE_FOCUS_VERSION  # noqa: E402
 from decision_overlay import DECISION_OVERLAY_VERSION  # noqa: E402
@@ -80,7 +80,7 @@ def _runtime_tokens(itick_token: str = "", twelve_token: str = "") -> dict[str, 
     }
 
 
-st.title("IDX Super Scanner v9.8.2 Hotfix 3 — Calibration")
+st.title("IDX Super Scanner v9.8.2 Hotfix 7 — Persistence Integrity")
 st.caption(
     f"{APP_VERSION} • fast {FAST_SCAN_VERSION} • macro {MACRO_ENGINE_VERSION} • "
     f"decision {SIMPLE_FOCUS_VERSION} • calibration {CALIBRATION_VERSION} • inventory {DECISION_OVERLAY_VERSION} • dashboard {V9_DASHBOARD_VERSION}"
@@ -115,7 +115,8 @@ if run_scan:
         st.error("Upload CSV ticker terlebih dahulu.")
         st.stop()
     try:
-        tickers = parse_ticker_csv(ticker_file, max_tickers=400, strict_limit=True)
+        universe_metadata = parse_universe_csv(ticker_file, max_tickers=400, strict_limit=True)
+        tickers = universe_metadata["ticker"].tolist()
     except Exception as exc:
         st.error(f"CSV ticker tidak valid: {exc}")
         st.stop()
@@ -134,6 +135,9 @@ if run_scan:
         "cash_on_hand_idr": cash_on_hand,
         "risk_per_trade_pct": risk_per_trade_pct,
         "portfolio_records": portfolio.to_dict("records") if not portfolio.empty else [],
+        # Preserve uploaded IDX-IC classification through the ticker-only
+        # technical path. This is source metadata, not a score override.
+        "universe_records": universe_metadata.to_dict("records"),
         # Hard runtime budgets: analysis depth is concentrated on names that can
         # actually enter Top 3/Top ranking. Database coverage expands gradually.
         "evidence_refresh_cap": 8,

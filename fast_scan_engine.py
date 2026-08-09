@@ -29,18 +29,20 @@ FAST_SCAN_VERSION = "9.8.2-all-eligible-lite"
 
 
 class FastDatabaseBridge(ScannerDatabaseBridge):
-    """Short-timeout bridge with a per-scan transport circuit breaker.
+    """Short-timeout bridge with independent read/write transport circuits.
 
-    A remote database outage must cost seconds, not minutes.  After the first
-    transport failure all later REST operations in the same scan fail instantly;
-    provider/local-cache paths continue normally.  HTTP/schema errors are still
-    surfaced by the normal bridge and do not get silently reclassified.
+    A slow optional cache read must never disable database writes.  The previous
+    single circuit classified one scanner_feature_cache timeout as a complete
+    Supabase outage, which made a healthy project look unavailable and prevented
+    persistence for the rest of the scan.  Read and write health are now tracked
+    independently and a read circuit only opens after two consecutive transport
+    failures.  Any successful read resets that failure streak.
     """
 
     def __init__(self) -> None:
         base = DatabaseSettings.from_env()
-        timeout = max(2.0, min(8.0, float(os.environ.get("SCANNER_FAST_DATABASE_TIMEOUT", "4"))))
-        connect = max(1.0, min(4.0, float(os.environ.get("SCANNER_FAST_DATABASE_CONNECT_TIMEOUT", "2"))))
+        timeout = max(4.0, min(12.0, float(os.environ.get("SCANNER_FAST_DATABASE_TIMEOUT", "8"))))
+        connect = max(1.0, min(4.0, float(os.environ.get("SCANNER_FAST_DATABASE_CONNECT_TIMEOUT", "3"))))
         settings = replace(
             base,
             timeout_seconds=timeout,
@@ -48,25 +50,77 @@ class FastDatabaseBridge(ScannerDatabaseBridge):
             read_attempts=1,
             write_attempts=1,
             retry_backoff_seconds=0.1,
-            read_batch_size=max(100, min(250, int(base.read_batch_size))),
+            # Smaller REST batches are more predictable for JSONB payloads.
+            read_batch_size=max(40, min(80, int(base.read_batch_size))),
         )
         super().__init__(settings=settings)
-        self.transport_circuit_open = False
-        self.transport_error = ""
+        self.read_circuit_open = False
+        self.write_circuit_open = False
+        self.read_transport_failures = 0
+        self.write_transport_failures = 0
+        self.read_transport_error = ""
+        self.write_transport_error = ""
+
+    @property
+    def transport_circuit_open(self) -> bool:
+        # Compatibility alias: only a complete read+write outage is a global
+        # circuit-open state.  A degraded read path may still persist results.
+        return bool(self.read_circuit_open and self.write_circuit_open)
+
+    @property
+    def transport_error(self) -> str:
+        return " | ".join(v for v in (self.read_transport_error, self.write_transport_error) if v)
+
+    def transport_state(self) -> str:
+        if self.read_circuit_open and self.write_circuit_open:
+            return "READ_WRITE_DEGRADED_FAIL_SOFT"
+        if self.read_circuit_open:
+            return "READ_DEGRADED_WRITE_AVAILABLE"
+        if self.write_circuit_open:
+            return "WRITE_DEGRADED_READ_AVAILABLE"
+        return self.settings.mode
 
     def _request(self, method: str, endpoint: str, *, operation: str, retry_safe: bool, **kwargs: Any) -> Any:
-        if self.transport_circuit_open and self.settings.mode == "SUPABASE_REST":
-            raise DatabaseTransportError(operation, endpoint, self.transport_error or "FAST_DATABASE_CIRCUIT_OPEN", 1)
+        verb = str(method or "").strip().lower()
+        is_read = verb in {"get", "head"}
+        if self.settings.mode == "SUPABASE_REST":
+            if is_read and self.read_circuit_open:
+                raise DatabaseTransportError(operation, endpoint, self.read_transport_error or "FAST_DATABASE_READ_CIRCUIT_OPEN", 1)
+            if not is_read and self.write_circuit_open:
+                raise DatabaseTransportError(operation, endpoint, self.write_transport_error or "FAST_DATABASE_WRITE_CIRCUIT_OPEN", 1)
         try:
             response = super()._request(method, endpoint, operation=operation, retry_safe=retry_safe, **kwargs)
             status = int(getattr(response, "status_code", 0) or 0)
             if status in {408, 425, 429, 500, 502, 503, 504}:
-                self.transport_circuit_open = True
-                self.transport_error = f"HTTP {status} during {operation}"
+                if is_read:
+                    self.read_transport_failures += 1
+                    self.read_transport_error = f"HTTP {status} during {operation}"
+                    if self.read_transport_failures >= 2:
+                        self.read_circuit_open = True
+                else:
+                    self.write_transport_failures += 1
+                    self.write_transport_error = f"HTTP {status} during {operation}"
+                    if self.write_transport_failures >= 2:
+                        self.write_circuit_open = True
+            else:
+                if is_read:
+                    self.read_transport_failures = 0
+                    self.read_transport_error = ""
+                else:
+                    self.write_transport_failures = 0
+                    self.write_transport_error = ""
             return response
         except DatabaseTransportError as exc:
-            self.transport_circuit_open = True
-            self.transport_error = str(exc)[:500]
+            if is_read:
+                self.read_transport_failures += 1
+                self.read_transport_error = str(exc)[:500]
+                if self.read_transport_failures >= 2:
+                    self.read_circuit_open = True
+            else:
+                self.write_transport_failures += 1
+                self.write_transport_error = str(exc)[:500]
+                if self.write_transport_failures >= 2:
+                    self.write_circuit_open = True
             raise
 
 
@@ -117,6 +171,48 @@ def _outcomes_to_items(items: pd.DataFrame, outcomes: Mapping[str, Any]) -> pd.D
         rows.append(row)
     return pd.DataFrame(rows)
 
+
+
+def _compact_scalar_mapping(value: Any, *, max_text: int = 500) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        if item is None or isinstance(item, (bool, int, float)):
+            out[str(key)] = item
+        elif isinstance(item, str):
+            out[str(key)] = item[:max_text]
+        elif isinstance(item, pd.Timestamp):
+            out[str(key)] = item.isoformat()
+    return out
+
+
+def _compact_feature_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only fields required to reconstruct all-eligible discovery.
+
+    Narrative event/outcome lists belong to durable research tables, not the
+    lightweight feature cache.  Removing nested/heavy objects keeps the cache a
+    real accelerator instead of another large JSON transfer.
+    """
+    local = dict(payload or {})
+    compact = {
+        "ticker": local.get("ticker"),
+        "completion_state": local.get("completion_state", "TECHNICAL_READY"),
+        "technical_ready": bool(local.get("technical_ready", False)),
+        "signal": _compact_scalar_mapping(local.get("signal")),
+        "silent_profile": _compact_scalar_mapping(local.get("silent_profile")),
+        "narrative_profile": _compact_scalar_mapping(local.get("narrative_profile")),
+        "narrative_events": [],
+        "narrative_outcomes": [],
+        "breadth": _compact_scalar_mapping(local.get("breadth")),
+        "ohlcv_state": local.get("ohlcv_state"),
+        "ohlcv_bars": local.get("ohlcv_bars"),
+        "ohlcv_last_bar_date": local.get("ohlcv_last_bar_date"),
+        "ohlcv_session_lag": local.get("ohlcv_session_lag"),
+        "ohlcv_source_tier": local.get("ohlcv_source_tier"),
+        "completed_at": local.get("completed_at"),
+    }
+    return compact
 
 def run_fast_single_scan(
     tickers: Sequence[str],
@@ -218,13 +314,13 @@ def run_fast_single_scan(
     # fail-soft; ranking never waits for a durable job repository.
     feature_write_report = pd.DataFrame()
     feature_write_started = time.perf_counter()
-    if not computed_completed.empty and hasattr(bridge, "write_feature_cache") and not bridge.transport_circuit_open:
+    if not computed_completed.empty and hasattr(bridge, "write_feature_cache") and not bridge.write_circuit_open:
         fresh_payloads: dict[str, Mapping[str, Any]] = {}
         for row in computed_completed.to_dict("records"):
             payload = row.get("result_payload") or {}
             ticker = _ticker(row.get("ticker") or (payload.get("ticker") if isinstance(payload, Mapping) else ""))
             if ticker and isinstance(payload, Mapping) and bool(payload.get("technical_ready", False)):
-                fresh_payloads[ticker] = dict(payload)
+                fresh_payloads[ticker] = _compact_feature_payload(payload)
         if fresh_payloads:
             feature_write_report = bridge.write_feature_cache(fresh_payloads, scanner_version=FAST_SCAN_VERSION)
     feature_write_elapsed = time.perf_counter() - feature_write_started
@@ -263,8 +359,8 @@ def run_fast_single_scan(
     result["feature_cache_audit"] = feature_audit
     result["feature_cache_write_report"] = feature_write_report
     result["scan_finished_at"] = datetime.now(timezone.utc).isoformat()
-    result["database_transport_state"] = "CIRCUIT_OPEN_FAIL_SOFT" if bridge.transport_circuit_open else bridge.settings.mode
-    result["database_transport_error"] = bridge.transport_error
+    result["database_transport_state"] = bridge.transport_state() if hasattr(bridge, "transport_state") else ("CIRCUIT_OPEN_FAIL_SOFT" if bool(getattr(bridge, "transport_circuit_open", False)) else str(getattr(getattr(bridge, "settings", None), "mode", "UNKNOWN")))
+    result["database_transport_error"] = str(getattr(bridge, "transport_error", "") or "")
     result["scan_id"] = jid
     stage_frame = result.get("stage_timings")
     if isinstance(stage_frame, pd.DataFrame) and not stage_frame.empty:

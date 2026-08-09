@@ -1104,36 +1104,88 @@ def normalize_idx_ticker(value: object) -> str | None:
         return None
     return f'{base}.JK'
 
-def parse_ticker_csv(source: bytes | BinaryIO | pd.DataFrame, max_tickers: int=1200, strict_limit: bool=False) -> list[str]:
-    if isinstance(source, pd.DataFrame):
-        frame = source.copy()
-    else:
-        payload = BytesIO(source) if isinstance(source, bytes) else source
-        try:
-            frame = pd.read_csv(payload, sep=None, engine='python')
-        except UnicodeDecodeError:
-            if hasattr(payload, 'seek'):
-                payload.seek(0)
-            frame = pd.read_csv(payload, encoding='latin-1', sep=None, engine='python')
+def _universe_column_key(value: object) -> str:
+    return re.sub(r'[^a-z0-9]+', '_', str(value or '').strip().lower()).strip('_')
+
+
+def parse_universe_csv(
+    source: bytes | BinaryIO | pd.DataFrame,
+    max_tickers: int=1200,
+    strict_limit: bool=False,
+) -> pd.DataFrame:
+    """Parse tickers while preserving decision-relevant universe metadata.
+
+    Older UI code returned only a list of symbols, silently discarding an
+    uploaded IDX-IC sector. The macro/sector engine then saw otherwise valid
+    issuers as ``UNKNOWN``. Arbitrary CSV columns never enter the scorer.
+    """
+    frame = _read_csv(source)
+    output_columns = [
+        'ticker', 'yahoo_ticker', 'idx_sector', 'sector_idx_ic',
+        'rank_universe', 'universe_role', 'priority', 'active_scan',
+    ]
     if frame.empty or len(frame.columns) == 0:
-        return []
-    lookup = {str(c).strip().lower(): c for c in frame.columns}
-    selected = next((lookup[name] for name in TICKER_COLUMNS if name in lookup), frame.columns[0])
-    result: list[str] = []
+        return pd.DataFrame(columns=output_columns)
+
+    lookup = {_universe_column_key(column): column for column in frame.columns}
+    selected = next(
+        (lookup[_universe_column_key(name)] for name in TICKER_COLUMNS if _universe_column_key(name) in lookup),
+        frame.columns[0],
+    )
+
+    def source_column(*aliases: str) -> object | None:
+        return next((lookup[key] for key in map(_universe_column_key, aliases) if key in lookup), None)
+
+    yahoo_column = source_column('yahoo_ticker', 'yahoo_symbol')
+    sector_column = source_column('sector_idx_ic', 'idx_sector', 'idx_ic_sector', 'sector')
+    rank_column = source_column('rank_universe', 'universe_rank')
+    role_column = source_column('universe_role', 'role')
+    priority_column = source_column('priority', 'universe_priority')
+    active_column = source_column('active_scan', 'scan_active', 'aktif_scan')
+
+    records: list[dict[str, object]] = []
     seen: set[str] = set()
-    for value in frame[selected].tolist():
-        ticker = normalize_idx_ticker(value)
-        if ticker and ticker not in seen:
-            if len(result) >= max_tickers:
-                if strict_limit:
-                    raise ValueError(
-                        f"Universe berisi lebih dari {max_tickers} ticker valid. "
-                        "Pecah universe atau kurangi jumlah ticker; scanner tidak melakukan truncation diam-diam."
-                    )
-                break
-            result.append(ticker)
-            seen.add(ticker)
-    return result
+    for _, source_row in frame.iterrows():
+        ticker = normalize_idx_ticker(source_row.get(selected))
+        if not ticker or ticker in seen:
+            continue
+        if len(records) >= max_tickers:
+            if strict_limit:
+                raise ValueError(
+                    f"Universe berisi lebih dari {max_tickers} ticker valid. "
+                    "Pecah universe atau kurangi jumlah ticker; scanner tidak melakukan truncation diam-diam."
+                )
+            break
+
+        def value(column: object | None, default: object='') -> object:
+            if column is None:
+                return default
+            item = source_row.get(column, default)
+            if item is None:
+                return default
+            try:
+                return default if bool(pd.isna(item)) else item
+            except (TypeError, ValueError):
+                return item
+
+        raw_sector = str(value(sector_column, '') or '').strip()
+        records.append({
+            'ticker': ticker,
+            'yahoo_ticker': str(value(yahoo_column, ticker) or ticker).strip().upper(),
+            'idx_sector': raw_sector,
+            'sector_idx_ic': raw_sector,
+            'rank_universe': value(rank_column, np.nan),
+            'universe_role': value(role_column, ''),
+            'priority': value(priority_column, ''),
+            'active_scan': value(active_column, np.nan),
+        })
+        seen.add(ticker)
+    return pd.DataFrame(records, columns=output_columns)
+
+
+def parse_ticker_csv(source: bytes | BinaryIO | pd.DataFrame, max_tickers: int=1200, strict_limit: bool=False) -> list[str]:
+    universe = parse_universe_csv(source, max_tickers=max_tickers, strict_limit=strict_limit)
+    return universe['ticker'].tolist() if not universe.empty else []
 
 def _clean_ohlcv(frame: pd.DataFrame, strict: bool=False) -> pd.DataFrame:
     if frame is None or frame.empty:
@@ -1883,9 +1935,34 @@ def attach_fundamentals(signals: pd.DataFrame, fundamentals: pd.DataFrame) -> pd
         result['composite_score'] = result['quality_score']
         return result
     result = signals.merge(fundamentals, on='ticker', how='left')
-    usable = result['fundamental_coverage'].fillna(0) >= 60
-    result['composite_score'] = result['quality_score']
-    result.loc[usable, 'composite_score'] = (0.78 * result.loc[usable, 'quality_score'] + 0.22 * result.loc[usable, 'fundamental_score']).round(1)
+    # A cold database can legitimately return metadata-only rows (for example
+    # ticker + IDX sector). Missing financial evidence remains missing, but the
+    # row shape must not crash the technical/research ranking.
+    defaults: dict[str, object] = {
+        'fundamental_score': np.nan,
+        'fundamental_coverage': 0.0,
+        'fundamental_reliability': 'NONE',
+        'fundamental_red_flags': '',
+        'fundamental_error': 'Fundamental tidak diambil/tersedia',
+    }
+    for column, default in defaults.items():
+        if column not in result.columns:
+            result[column] = default
+    result['fundamental_coverage'] = pd.to_numeric(
+        result['fundamental_coverage'], errors='coerce',
+    ).fillna(0.0)
+    result['fundamental_score'] = pd.to_numeric(result['fundamental_score'], errors='coerce')
+    result['fundamental_reliability'] = result['fundamental_reliability'].fillna('NONE')
+    result['fundamental_red_flags'] = result['fundamental_red_flags'].fillna('')
+    result['fundamental_error'] = result['fundamental_error'].fillna('Fundamental tidak diambil/tersedia')
+    quality = pd.to_numeric(
+        result.get('quality_score', pd.Series(np.nan, index=result.index)), errors='coerce',
+    )
+    usable = result['fundamental_coverage'].ge(60.0) & result['fundamental_score'].notna() & quality.notna()
+    result['composite_score'] = quality
+    result.loc[usable, 'composite_score'] = (
+        0.78 * quality.loc[usable] + 0.22 * result.loc[usable, 'fundamental_score']
+    ).round(1)
     return result
 from io import BytesIO
 from typing import BinaryIO

@@ -12,6 +12,7 @@ No macro factor is allowed to create a buy signal on its own.
 """
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -21,7 +22,7 @@ from free_data_providers import yahoo_chart_direct
 from issuer_classification import canonical_sector, normalize_fundamental_classification
 
 
-MACRO_ENGINE_VERSION = "9.8.0-blended-ihsg-breadth"
+MACRO_ENGINE_VERSION = "9.8.1-parallel-macro-blended-breadth"
 
 MACRO_SYMBOLS: dict[str, str] = {
     "USDIDR": "USDIDR=X",
@@ -148,28 +149,32 @@ def _prepared_breadth(prepared: Mapping[str, pd.DataFrame]) -> dict[str, float]:
 
 
 def fetch_macro_series(*, period: str = "6mo", timeout: int = 12) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """Fetch independent macro factors concurrently with bounded latency."""
     series: dict[str, pd.DataFrame] = {}
     reports: list[dict[str, Any]] = []
-    for factor, symbol in MACRO_SYMBOLS.items():
+
+    def one(factor: str, symbol: str) -> tuple[str, str, pd.DataFrame, dict[str, Any], str]:
         try:
-            frame, report = yahoo_chart_direct(symbol, period=period, timeout=timeout)
-            if isinstance(frame, pd.DataFrame) and not frame.empty:
+            frame, report = yahoo_chart_direct(symbol, period=period, timeout=timeout, retry_count=0)
+            return factor, symbol, frame if isinstance(frame, pd.DataFrame) else pd.DataFrame(), dict(report or {}), ""
+        except Exception as exc:
+            return factor, symbol, pd.DataFrame(), {}, f"{type(exc).__name__}: {str(exc)[:160]}"
+
+    with ThreadPoolExecutor(max_workers=min(5, len(MACRO_SYMBOLS))) as pool:
+        futures = [pool.submit(one, factor, symbol) for factor, symbol in MACRO_SYMBOLS.items()]
+        for future in as_completed(futures):
+            factor, symbol, frame, report, error = future.result()
+            if not frame.empty:
                 series[factor] = frame
             reports.append({
                 "factor": factor,
                 "symbol": symbol,
-                "status": report.get("status", "OK" if factor in series else "EMPTY"),
+                "status": report.get("status", "OK" if factor in series else "FAIL_SOFT" if error else "EMPTY"),
                 "source": report.get("provider", "YAHOO_CHART_DIRECT"),
-                "error": report.get("error", ""),
+                "error": error or report.get("error", ""),
             })
-        except Exception as exc:
-            reports.append({
-                "factor": factor,
-                "symbol": symbol,
-                "status": "FAIL_SOFT",
-                "source": "YAHOO_CHART_DIRECT",
-                "error": f"{type(exc).__name__}: {str(exc)[:160]}",
-            })
+    order = {name: idx for idx, name in enumerate(MACRO_SYMBOLS)}
+    reports.sort(key=lambda row: order.get(str(row.get("factor")), 999))
     return series, pd.DataFrame(reports)
 
 

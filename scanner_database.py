@@ -48,8 +48,8 @@ from research_maintenance import MODEL_VERSIONS, semantic_refresh_reason, model_
 from ihsg_direction import ihsg_snapshot_frame
 from selector_engine import selector_snapshot_frame
 
-DATABASE_BRIDGE_VERSION = "15.0-feature-cache-compact-ohlcv"
-DATABASE_SCHEMA_VERSION = "scanner_schema_v15"
+DATABASE_BRIDGE_VERSION = "16.0.0-persistence-integrity"
+DATABASE_SCHEMA_VERSION = "scanner_schema_v16"
 LEGACY_DATABASE_HEALTH_STATE_V14 = "HEALTHY_V14_GUARDED_REAL_MONEY"  # compatibility marker for v9.8.0 regression audit
 
 DATABASE_VERIFICATION_TABLES: tuple[str, ...] = (
@@ -671,8 +671,58 @@ def _finite(value: Any, default: float = np.nan) -> float:
     return number if math.isfinite(number) else float(default)
 
 
-def _json_safe(value: Any) -> Any:
+_NULLISH_TEXT_TOKENS = {"", "<NA>", "NA", "N/A", "NAN", "NAT", "NONE", "NULL"}
+_DATE_FIELD_NAMES = {
+    "trade_date", "period_end", "statement_date", "latest_period",
+    "first_bar_date", "last_bar_date", "event_date", "best_buy_date",
+    "best_buy_window_start", "best_buy_window_end",
+}
+
+
+def _is_nullish_scalar(value: Any) -> bool:
     if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().upper() in _NULLISH_TEXT_TOKENS
+    try:
+        missing = pd.isna(value)
+    except Exception:
+        return False
+    return isinstance(missing, (bool, np.bool_)) and bool(missing)
+
+
+def _temporal_kind(field: str) -> str:
+    key = str(field or "").strip().lower()
+    if key == "as_of" or key.endswith("_at"):
+        return "timestamp"
+    if key in _DATE_FIELD_NAMES or key.endswith("_date"):
+        return "date"
+    return ""
+
+
+def _normalise_temporal_text(field: str, value: Any) -> str | None:
+    """Return a database-safe ISO date/timestamp or ``None``.
+
+    Pandas ``NaT`` is a ``Timestamp`` subtype and previously reached
+    ``Timestamp.isoformat()``, which serialised the literal string ``"NaT"``.
+    Postgres then either rejected typed date columns or retained polluted text
+    cache metadata. Temporal persistence must fail soft to NULL instead.
+    """
+    if _is_nullish_scalar(value):
+        return None
+    kind = _temporal_kind(field)
+    if not kind:
+        return _coerce_text(value)
+    stamp = pd.to_datetime(value, errors="coerce", utc=(kind == "timestamp"))
+    if pd.isna(stamp):
+        return None
+    if kind == "date":
+        return pd.Timestamp(stamp).date().isoformat()
+    return pd.Timestamp(stamp).isoformat()
+
+
+def _json_safe(value: Any) -> Any:
+    if _is_nullish_scalar(value):
         return None
     if isinstance(value, (np.bool_, bool)):
         return bool(value)
@@ -685,11 +735,20 @@ def _json_safe(value: Any) -> Any:
         if isinstance(value, date) and not isinstance(value, datetime):
             return value.isoformat()
         stamp = pd.Timestamp(value)
+        if pd.isna(stamp):
+            return None
         if stamp.tzinfo is None:
             stamp = stamp.tz_localize("UTC")
         return stamp.isoformat()
     if isinstance(value, (dict, Mapping)):
-        return {str(key): _json_safe(item) for key, item in value.items()}
+        output: dict[str, Any] = {}
+        for key, item in value.items():
+            clean_key = str(key)
+            safe = _json_safe(item)
+            if _temporal_kind(clean_key) and _is_nullish_scalar(safe):
+                safe = None
+            output[clean_key] = safe
+        return output
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(item) for item in value]
     try:
@@ -815,9 +874,7 @@ def _normalise_record(table: str, record: Mapping[str, Any]) -> dict[str, Any] |
         elif key in spec.get("json", set()):
             output[key] = _json_safe(value)
         else:
-            output[key] = _coerce_text(value)
-            if output[key] == "" and (key.endswith("_date") or key.endswith("_at") or key in {"trade_date", "period_end", "statement_date"}):
-                output[key] = None
+            output[key] = _normalise_temporal_text(key, value) if _temporal_kind(key) else _coerce_text(value)
     for field in spec["required"]:
         value = output.get(field)
         if value is None or value == "":
@@ -1912,24 +1969,34 @@ class ScannerDatabaseBridge:
         expected_session: Any | None = None,
         scanner_version: str = "",
     ) -> tuple[dict[str, dict[str, Any]], pd.DataFrame]:
+        """Read current ALL_ELIGIBLE_LITE rows without one oversized JSONB GET.
+
+        v15 originally selected ``payload`` together with metadata for up to
+        200 tickers.  The payload contains technical/silent/narrative fields and
+        that single response could exceed the aggressive fast-scan timeout even
+        when Supabase itself was healthy.  We now perform a metadata pass first,
+        then fetch payloads only for rows that are current/compatible in small
+        bounded chunks.
+        """
         names = list(dict.fromkeys(str(ticker).upper().strip() for ticker in tickers if str(ticker).strip()))
         if not names or self.settings.mode != "SUPABASE_REST" or not self.settings.read_enabled:
             return {}, pd.DataFrame([{"provider": "SUPABASE_FEATURE_CACHE", "status": "DATABASE_UNAVAILABLE", "requested_tickers": len(names)}])
         expected_date = pd.to_datetime(expected_session, errors="coerce")
         expected_text = pd.Timestamp(expected_date).date().isoformat() if pd.notna(expected_date) else ""
-        hits: dict[str, dict[str, Any]] = {}
         audits: list[dict[str, Any]] = []
-        for start in range(0, len(names), self.settings.read_batch_size):
-            chunk = names[start:start + self.settings.read_batch_size]
+        current_meta: dict[str, dict[str, Any]] = {}
+        meta_batch = max(20, min(100, int(self.settings.read_batch_size)))
+        for start in range(0, len(names), meta_batch):
+            chunk = names[start:start + meta_batch]
             try:
                 rows = self._get_rows("scanner_feature_cache", {
-                    "select": "ticker,last_bar_date,feature_state,source_tier,scanner_version,feature_schema_version,payload,updated_at",
+                    "select": "ticker,last_bar_date,feature_state,source_tier,scanner_version,feature_schema_version,content_hash,updated_at",
                     "ticker": f"in.({','.join(chunk)})",
                     "limit": str(max(1, len(chunk))),
                 })
             except Exception as exc:
                 return {}, pd.DataFrame([{
-                    "provider": "SUPABASE_FEATURE_CACHE", "status": "READ_FAIL_SOFT",
+                    "provider": "SUPABASE_FEATURE_CACHE", "status": "METADATA_READ_FAIL_SOFT",
                     "error": f"{type(exc).__name__}: {str(exc)[:240]}", "requested_tickers": len(names),
                 }])
             by_ticker = {str(row.get("ticker", "")).upper().strip(): row for row in rows}
@@ -1940,20 +2007,84 @@ class ScannerDatabaseBridge:
                     continue
                 last_date = str(row.get("last_bar_date") or "")[:10]
                 version_ok = (not scanner_version) or str(row.get("scanner_version") or "") == str(scanner_version)
+                schema_value = str(row.get("feature_schema_version") or "").strip()
+                schema_ok = (not schema_value) or schema_value == "ALL_ELIGIBLE_LITE_V1"
                 state_ok = str(row.get("feature_state") or "").upper() == "CURRENT"
                 session_ok = (not expected_text) or last_date == expected_text
-                payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
-                ready = bool(payload) and version_ok and state_ok and session_ok
-                if ready:
-                    hits[ticker] = dict(payload)
+                meta_ready = bool(version_ok and schema_ok and state_ok and session_ok)
+                if meta_ready:
+                    current_meta[ticker] = row
                 audits.append({
                     "ticker": ticker, "provider": "SUPABASE_FEATURE_CACHE",
-                    "status": "HIT_CURRENT" if ready else "STALE_OR_INCOMPATIBLE",
+                    "status": "META_CURRENT" if meta_ready else "STALE_OR_INCOMPATIBLE",
                     "last_bar_date": last_date or None, "expected_session": expected_text or None,
                     "feature_state": row.get("feature_state"), "source_tier": row.get("source_tier"),
                     "scanner_version": row.get("scanner_version"), "updated_at": row.get("updated_at"),
                 })
-        return hits, pd.DataFrame(audits)
+
+        hits: dict[str, dict[str, Any]] = {}
+        ready_names = list(current_meta)
+        # JSONB payloads are intentionally fetched in small chunks.  This keeps
+        # response size bounded and prevents a healthy Supabase project from
+        # being classified as unavailable because of one large REST response.
+        payload_batch = 25
+        payload_errors: dict[str, str] = {}
+        for start in range(0, len(ready_names), payload_batch):
+            chunk = ready_names[start:start + payload_batch]
+            try:
+                rows = self._get_rows("scanner_feature_cache", {
+                    "select": "ticker,payload",
+                    "ticker": f"in.({','.join(chunk)})",
+                    "limit": str(max(1, len(chunk))),
+                })
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {str(exc)[:240]}"
+                for ticker in chunk:
+                    payload_errors[ticker] = error
+                continue
+            for row in rows:
+                ticker = str(row.get("ticker", "")).upper().strip()
+                payload = row.get("payload")
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except Exception:
+                        payload = None
+                if ticker in current_meta and isinstance(payload, Mapping) and payload:
+                    local = dict(payload)
+                    payload_ticker = str(local.get("ticker") or ticker).upper().strip()
+                    payload_last = pd.to_datetime(local.get("ohlcv_last_bar_date"), errors="coerce")
+                    payload_last_text = pd.Timestamp(payload_last).date().isoformat() if pd.notna(payload_last) else ""
+                    payload_ready = (
+                        payload_ticker == ticker
+                        and bool(local.get("technical_ready", False))
+                        and str(local.get("completion_state") or "").upper() == "TECHNICAL_READY"
+                        and isinstance(local.get("signal"), Mapping)
+                        and bool(local.get("signal"))
+                        and ((not expected_text) or payload_last_text == expected_text)
+                    )
+                    if payload_ready:
+                        hits[ticker] = local
+                    else:
+                        payload_errors[ticker] = "Feature payload failed technical/session contract; recompute required"
+
+        if audits:
+            audit_frame = pd.DataFrame(audits)
+            if payload_errors or len(hits) != len(current_meta):
+                for ticker in current_meta:
+                    mask = audit_frame["ticker"].astype(str).eq(ticker)
+                    if not mask.any():
+                        continue
+                    if ticker in hits:
+                        audit_frame.loc[mask, "status"] = "HIT_CURRENT"
+                    else:
+                        audit_frame.loc[mask, "status"] = "PAYLOAD_READ_FAIL_SOFT"
+                        audit_frame.loc[mask, "error"] = payload_errors.get(ticker, "Current metadata but payload unavailable")
+            else:
+                audit_frame.loc[audit_frame["status"].eq("META_CURRENT"), "status"] = "HIT_CURRENT"
+        else:
+            audit_frame = pd.DataFrame()
+        return hits, audit_frame
 
     def write_feature_cache(
         self,
@@ -2157,6 +2288,7 @@ class ScannerDatabaseBridge:
                 "last_bar_date": record["last_bar_date"],
                 "refresh_state": state, "error": error,
             })
+        database_unavailable = self.settings.mode not in {"OUTBOX_ONLY", "SUPABASE_REST"}
         if self.settings.mode == "OUTBOX_ONLY":
             written = self._write_outbox("ohlcv_daily_cache", records)
         elif self.settings.mode == "SUPABASE_REST":
@@ -2164,7 +2296,11 @@ class ScannerDatabaseBridge:
         else:
             written = 0
         for index, row in enumerate(audit_rows):
-            row["status"] = "WRITTEN" if index < written else "WRITE_FAILED"
+            row["status"] = (
+                "WRITTEN" if index < written
+                else "WRITE_SKIPPED_DATABASE_UNAVAILABLE" if database_unavailable
+                else "WRITE_FAILED"
+            )
             row["rows_written"] = 1 if index < written else 0
         return pd.DataFrame(audit_rows)
 
@@ -2748,7 +2884,10 @@ class ScannerDatabaseBridge:
                     continue
                 checked_at = payload.get("database_source_checked_at") or payload.get("fundamental_fetched_at") or as_of
                 content_hash = _semantic_hash(payload)
-                statement_date = payload.get("latest_statement_date") or payload.get("statement_date")
+                statement_date = _normalise_temporal_text(
+                    "statement_date",
+                    payload.get("latest_statement_date") or payload.get("statement_date"),
+                )
                 event_fingerprint = _stable_hash({"ticker": ticker, "statement_date": statement_date, "content_hash": content_hash})
                 next_check_at = (pd.to_datetime(checked_at, errors="coerce", utc=True) + timedelta(days=self.settings.fundamental_max_age_days))
                 next_check_at = next_check_at.isoformat() if pd.notna(next_check_at) else as_of
@@ -3400,7 +3539,7 @@ class ScannerDatabaseBridge:
                     return self.status_row(
                         "MIGRATION_REQUIRED_V15",
                         "Migration v14 tersedia, tetapi migration_v15_database_acceleration.sql belum diterapkan. "
-                        "Jalankan migration v15 untuk feature cache + compact OHLCV v9.8.2.",
+                        "Jalankan migration v16 untuk repair trigger + feature cache + compact OHLCV v9.8.2.",
                     )
                 raise
             return self.status_row(
