@@ -4,7 +4,7 @@ Storage-only production hardening. No scoring, feature-cache version, actionabil
 
 Live connected Supabase cleanup:
 - before: ~282 MB database
-- after bounded pruning + VACUUM FULL: ~142 MB
+- after bounded pruning + VACUUM FULL: ~140 MB
 - terminal resumable jobs retained: 2 newest
 
 Migrations:
