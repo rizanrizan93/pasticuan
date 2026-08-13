@@ -1077,6 +1077,7 @@ def build_swing_ready(universe: pd.DataFrame, next_leaders: pd.DataFrame, config
         & out["status"].isin(["EXECUTION_READY", "ENTRY_PLAN_READY", "WATCHLIST", "WAIT"])
         & out["production_gate_pass"].fillna(False).astype(bool)
         & out["methodology_gate_pass"].fillna(False).astype(bool)
+        & out.get("execution_plan_is_current", pd.Series(False, index=out.index)).fillna(False).astype(bool)
     )
     out["rank_eligible"] = (
         pd.to_numeric(out["ranking_score"], errors="coerce").notna()

@@ -9,12 +9,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "9.8.9-production-lane-integrity"
+APP_VERSION = "9.8.10-swing-production-gate"
 APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-st.set_page_config(page_title="IDX Scanner v9.8.9", page_icon="📊", layout="wide")
+st.set_page_config(page_title="IDX Scanner v9.8.10", page_icon="📊", layout="wide")
 
 REQUIRED_FILES = (
     "scanner.py", "scanner_database.py", "narrative_engine.py", "macro_engine.py",
@@ -24,7 +24,7 @@ REQUIRED_FILES = (
 )
 missing = [name for name in REQUIRED_FILES if not (APP_ROOT / name).is_file()]
 if missing:
-    st.error("Deployment v9.8.9 tidak lengkap.")
+    st.error("Deployment v9.8.10 tidak lengkap.")
     st.code("\n".join(missing), language="text")
     st.stop()
 
@@ -80,7 +80,7 @@ def _runtime_tokens(itick_token: str = "", twelve_token: str = "") -> dict[str, 
     }
 
 
-st.title("IDX Super Scanner v9.8.9 — Production Lane Integrity")
+st.title("IDX Super Scanner v9.8.10 — Swing Production Gate")
 st.caption(
     f"{APP_VERSION} • fast {FAST_SCAN_VERSION} • macro {MACRO_ENGINE_VERSION} • "
     f"decision {SIMPLE_FOCUS_VERSION} • calibration {CALIBRATION_VERSION} • inventory {DECISION_OVERLAY_VERSION} • dashboard {V9_DASHBOARD_VERSION}"
