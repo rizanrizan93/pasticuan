@@ -28,7 +28,7 @@ from real_money_guard import apply_real_money_authorization, fundamental_convict
 from fundamental_calibration import reporting_refresh_profile, latest_growth_profile, classify_thesis_archetype
 
 
-SIMPLE_FOCUS_VERSION = "9.8.5-actionability-integrity"
+SIMPLE_FOCUS_VERSION = "9.8.10-swing-production-gate"
 
 
 @dataclass(frozen=True)
