@@ -16,7 +16,8 @@ replace_once("app.py", 'APP_VERSION = "9.8.7-production-hardening"', 'APP_VERSIO
 replace_once("app.py", 'st.set_page_config(page_title="IDX Scanner v9.8.7", page_icon="📊", layout="wide")', 'st.set_page_config(page_title="IDX Scanner v9.8.8", page_icon="📊", layout="wide")')
 replace_once("app.py", 'st.title("IDX Super Scanner v9.8.7 — Production Hardening")', 'st.title("IDX Super Scanner v9.8.8 — Execution Plan Integrity")')
 replace_once("fast_scan_engine.py", 'FAST_SCAN_VERSION = "9.8.7-production-hardening"', 'FAST_SCAN_VERSION = "9.8.8-execution-plan-integrity"')
-replace_once("simple_focus.py", 'SIMPLE_FOCUS_VERSION = "9.8.5-actionability-integrity"', 'SIMPLE_FOCUS_VERSION = "9.8.8-execution-plan-integrity"')
+# SIMPLE_FOCUS_VERSION intentionally remains 9.8.5: the analytical weighting
+# contract is unchanged by this execution-only guardrail hotfix.
 replace_once("decision_overlay.py", 'DECISION_OVERLAY_VERSION = "1.0.0-multihorizon-inventory"', 'DECISION_OVERLAY_VERSION = "1.1.0-execution-plan-integrity"')
 
 marker = '''def apply_methodology_guardrails(frame: pd.DataFrame, *, model: str) -> pd.DataFrame:\n    """Apply anti-chase/distribution guards without altering fundamental score math."""\n    if not isinstance(frame, pd.DataFrame) or frame.empty:\n        return frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()\n    out = frame.copy()\n'''
