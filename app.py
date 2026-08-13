@@ -9,12 +9,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "9.8.8-execution-plan-integrity"
+APP_VERSION = "9.8.9-production-lane-integrity"
 APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-st.set_page_config(page_title="IDX Scanner v9.8.8", page_icon="📊", layout="wide")
+st.set_page_config(page_title="IDX Scanner v9.8.9", page_icon="📊", layout="wide")
 
 REQUIRED_FILES = (
     "scanner.py", "scanner_database.py", "narrative_engine.py", "macro_engine.py",
@@ -80,7 +80,7 @@ def _runtime_tokens(itick_token: str = "", twelve_token: str = "") -> dict[str, 
     }
 
 
-st.title("IDX Super Scanner v9.8.8 — Execution Plan Integrity")
+st.title("IDX Super Scanner v9.8.9 — Production Lane Integrity")
 st.caption(
     f"{APP_VERSION} • fast {FAST_SCAN_VERSION} • macro {MACRO_ENGINE_VERSION} • "
     f"decision {SIMPLE_FOCUS_VERSION} • calibration {CALIBRATION_VERSION} • inventory {DECISION_OVERLAY_VERSION} • dashboard {V9_DASHBOARD_VERSION}"

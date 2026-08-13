@@ -325,6 +325,14 @@ def apply_execution_plan_integrity(frame: pd.DataFrame, *, model: str) -> pd.Dat
         out.loc[expired, "order_builder_eligible"] = False
     if "order_ready" in out.columns:
         out.loc[expired, "order_ready"] = False
+    if "actionable_rank_eligible" in out.columns:
+        out.loc[expired, "actionable_rank_eligible"] = False
+    if "production_rank_eligible" in out.columns:
+        out.loc[expired, "production_rank_eligible"] = False
+    if "production_gate_reason" in out.columns:
+        prior = out["production_gate_reason"].fillna("").astype(str)
+        suffix = np.where(prior.str.len().gt(0), prior + "; EXECUTION_PLAN_STALE_OR_INVALID", "EXECUTION_PLAN_STALE_OR_INVALID")
+        out.loc[expired, "production_gate_reason"] = pd.Series(suffix, index=out.index).loc[expired]
     if "recommended_allocation_idr" in out.columns:
         out.loc[expired, "recommended_allocation_idr"] = 0.0
     if "recommended_lots" in out.columns:
