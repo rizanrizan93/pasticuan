@@ -1,0 +1,62 @@
+name: Fix Super scoring version lineage
+
+on:
+  push:
+    branches: [codex/super-version-lineage-20260813]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/super-version-lineage-20260813
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Patch lineage constant
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('simple_focus.py')
+          text = p.read_text(encoding='utf-8')
+          old = 'SIMPLE_FOCUS_VERSION = "9.8.5-actionability-integrity"'
+          new = 'SIMPLE_FOCUS_VERSION = "9.8.10-swing-production-gate"'
+          if new not in text:
+              if text.count(old) != 1:
+                  raise SystemExit('unexpected SIMPLE_FOCUS_VERSION state')
+              text = text.replace(old, new, 1)
+              p.write_text(text, encoding='utf-8')
+          PY
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+      - name: Validate import and production contract
+        run: |
+          python -m py_compile simple_focus.py app.py fast_scan_engine.py
+          python - <<'PY'
+          import simple_focus
+          assert simple_focus.SIMPLE_FOCUS_VERSION == '9.8.10-swing-production-gate'
+          contract = simple_focus.scoring_contract_frame()
+          assert not contract.empty
+          assert set(contract['model_version']) == {'9.8.10-swing-production-gate'}
+          print(contract[['model','component','weight_pct','model_version']].to_string(index=False))
+          PY
+      - name: Commit validated fix
+        run: |
+          if git diff --quiet; then
+            echo 'No changes required'
+            exit 0
+          fi
+          git config user.name 'rizanrizan93'
+          git config user.email 'rizanrizan93@gmail.com'
+          git add simple_focus.py
+          git commit -m 'Fix Super scoring version lineage'
+          git push origin HEAD:codex/super-version-lineage-20260813
