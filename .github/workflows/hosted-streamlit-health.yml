@@ -1,0 +1,27 @@
+name: Hosted Streamlit health
+
+on:
+  push:
+    branches: [codex/hosted-streamlit-smoke-20260813]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check Super health
+        run: |
+          set -euxo pipefail
+          curl -fLsS --max-time 45 https://rizanpasticuan.streamlit.app/_stcore/health
+          curl -fLsS --max-time 45 -o /tmp/super.html https://rizanpasticuan.streamlit.app/
+          test -s /tmp/super.html
+      - name: Check Emir health
+        run: |
+          set -euxo pipefail
+          curl -fLsS --max-time 45 https://rizancuanmaksimal.streamlit.app/_stcore/health
+          curl -fLsS --max-time 45 -o /tmp/emir.html https://rizancuanmaksimal.streamlit.app/
+          test -s /tmp/emir.html
