@@ -4,9 +4,11 @@ from pathlib import Path
 def replace_once(path: str, old: str, new: str) -> None:
     p = Path(path)
     text = p.read_text(encoding="utf-8")
+    if new in text and old not in text:
+        return
     count = text.count(old)
     if count != 1:
-        raise RuntimeError(f"{path}: expected exactly one match, got {count}: {old!r}")
+        raise RuntimeError(f"{path}: expected exactly one old match or an already-patched new value, got {count}: {old!r}")
     p.write_text(text.replace(old, new, 1), encoding="utf-8")
 
 
@@ -35,4 +37,4 @@ for path in ("app.py", "fast_scan_engine.py"):
     replace_once(path, '"execution_verification_cap": 6,' if path == "app.py" else 'cfg.setdefault("execution_verification_cap", 6)',
                  '"execution_verification_cap": 8,' if path == "app.py" else 'cfg.setdefault("execution_verification_cap", 8)')
 
-print("Super v9.8.7 production hardening patch applied")
+print("Super v9.8.7 production hardening patch verified/applied")
