@@ -24,7 +24,7 @@ REQUIRED_FILES = (
 )
 missing = [name for name in REQUIRED_FILES if not (APP_ROOT / name).is_file()]
 if missing:
-    st.error("Deployment v9.8.5 tidak lengkap.")
+    st.error("Deployment v9.8.8 tidak lengkap.")
     st.code("\n".join(missing), language="text")
     st.stop()
 
@@ -264,158 +264,155 @@ with dashboard_tab:
     top_swings = select_top_candidates(swings, model="SWING_READY", limit=3, lane="ACTIONABLE")
     top_swing_watch = select_top_candidates(swings, model="SWING_READY", limit=3, lane="RESEARCH")
     top_leader_tab, top_investable_tab, top_swing_tab, top_swing_watch_tab = st.tabs([
-        "Top 3 Next Leader", "Top 3 Investable Leader", "Top 3 Swing Ready", "Top 3 Swing Watch"
+        "Top 3 Next Leader", "Top 3 Investable", "Top 3 Swing Ready", "Top 3 Swing Watch",
     ])
     with top_leader_tab:
-        st.markdown(render_dashboard_html(top_leaders, model="NEXT_LEADER", scan_id=scan_id, as_of=as_of, market_regime=market_regime), unsafe_allow_html=True)
-        if not top_leaders.empty:
-            st.download_button("Download Top 3 Next Leader CSV", top_leaders.to_csv(index=False).encode("utf-8-sig"), "v9_top3_next_leader.csv", "text/csv")
+        if top_leaders.empty:
+            st.info("Belum ada kandidat Next Leader research pada scan ini.")
+        else:
+            st.components.v1.html(
+                render_dashboard_html(
+                    top_leaders, model="NEXT_LEADER", market_regime=market_regime,
+                    scan_id=scan_id, as_of=as_of,
+                    completeness_note="Research ranking — bukan izin order. Lihat Real Money Gate dan Production-qualified untuk status eksekusi.",
+                ),
+                height=930, scrolling=True,
+            )
     with top_investable_tab:
         if top_investable.empty:
-            st.warning("Tidak ada Next Leader yang lolos portfolio/investability gate saat ini. Research ranking tetap tersedia.")
+            st.info("Belum ada kandidat Next Leader yang melewati portfolio suitability gate.")
         else:
-            st.markdown(render_dashboard_html(top_investable, model="NEXT_LEADER", scan_id=scan_id, as_of=as_of, market_regime=market_regime), unsafe_allow_html=True)
-            st.download_button("Download Top 3 Investable Leader CSV", top_investable.to_csv(index=False).encode("utf-8-sig"), "v9_top3_investable_leader.csv", "text/csv")
+            st.components.v1.html(
+                render_dashboard_html(
+                    top_investable, model="NEXT_LEADER", market_regime=market_regime,
+                    scan_id=scan_id, as_of=as_of,
+                    completeness_note="Portfolio lane — sudah melewati liquidity/quality suitability, tetapi order tetap tunduk pada Real Money Gate.",
+                ),
+                height=930, scrolling=True,
+            )
     with top_swing_tab:
         if top_swings.empty:
-            st.warning("Tidak ada production-qualified actionable Swing setup. Scanner tidak memaksa RESEARCH_ONLY menjadi Top 3 Swing Ready.")
+            st.info("Belum ada Swing Ready yang benar-benar actionable setelah price/execution gate.")
         else:
-            st.markdown(render_dashboard_html(top_swings, model="SWING_READY", scan_id=scan_id, as_of=as_of, market_regime=market_regime), unsafe_allow_html=True)
-            st.download_button("Download Top 3 Swing Ready CSV", top_swings.to_csv(index=False).encode("utf-8-sig"), "v9_top3_swing_ready.csv", "text/csv")
+            st.components.v1.html(
+                render_dashboard_html(
+                    top_swings, model="SWING_READY", market_regime=market_regime,
+                    scan_id=scan_id, as_of=as_of,
+                    completeness_note="Actionable lane — hanya kandidat dengan executable entry/trigger dan guardrail produksi.",
+                ),
+                height=930, scrolling=True,
+            )
     with top_swing_watch_tab:
-        st.markdown(render_dashboard_html(top_swing_watch, model="SWING_READY", scan_id=scan_id, as_of=as_of, market_regime=market_regime), unsafe_allow_html=True)
-        if not top_swing_watch.empty:
-            st.download_button("Download Top 3 Swing Watch CSV", top_swing_watch.to_csv(index=False).encode("utf-8-sig"), "v9_top3_swing_watch.csv", "text/csv")
+        if top_swing_watch.empty:
+            st.info("Belum ada kandidat Swing research/watch pada scan ini.")
+        else:
+            st.components.v1.html(
+                render_dashboard_html(
+                    top_swing_watch, model="SWING_READY", market_regime=market_regime,
+                    scan_id=scan_id, as_of=as_of,
+                    completeness_note="Research/watch lane — boleh dipantau tetapi belum tentu memiliki order yang valid saat ini.",
+                ),
+                height=930, scrolling=True,
+            )
 
 with market_tab:
-    if not macro_snapshot.empty:
-        row = macro_snapshot.iloc[0]
-        cols = st.columns(4)
-        cols[0].metric("Market context", f"{_finite(row.get('market_context_score', row.get('macro_regime_score'))):.1f}")
-        cols[1].metric("Coverage", f"{_finite(row.get('macro_data_coverage_pct')):.0f}%")
-        cols[2].metric("Breadth > EMA50", f"{_finite(row.get('breadth_above_ema50_pct')):.1f}%")
-        cols[3].metric("IHSG 20D", f"{100.0 * _finite(row.get('ihsg_return_20d')):.2f}%")
-        factor_cols = [column for column in macro_snapshot.columns if column.startswith("factor_")]
-        factor_view = pd.DataFrame({
-            "factor": [column.replace("factor_", "").replace("_score", "") for column in factor_cols],
-            "score": [row.get(column) for column in factor_cols],
-        })
-        st.subheader("Macro factors")
-        st.dataframe(_safe_display(factor_view), width="stretch", hide_index=True)
-    st.subheader("Sector opportunity map")
-    st.dataframe(_safe_display(result.get("macro_sector_map", pd.DataFrame())), width="stretch", hide_index=True)
-    ihsg = result.get("ihsg_direction") or {}
-    if isinstance(ihsg, Mapping):
-        st.caption(
-            f"IHSG model: {ihsg.get('consensus_direction', 'NO_EDGE')} • "
-            f"confidence {_finite(ihsg.get('consensus_confidence')):.1f}% • "
-            f"risk multiplier {_finite(ihsg.get('risk_budget_multiplier'), 0.5):.2f}x"
-        )
-    with st.expander("Macro source audit"):
-        st.dataframe(_safe_display(result.get("macro_source_report", pd.DataFrame())), width="stretch", hide_index=True)
+    st.subheader("Market & Sector Map")
+    st.caption("Macro hanya memengaruhi Macro-Sector Fit dan risk overlay. Macro tidak mengganti seleksi emiten.")
+    safe_dataframe(macro_snapshot, width="stretch", hide_index=True)
+    market_context = result.get("market_context", pd.DataFrame())
+    if isinstance(market_context, pd.DataFrame) and not market_context.empty:
+        st.markdown("#### Market context")
+        safe_dataframe(market_context, width="stretch", hide_index=True)
+    sector_map = result.get("sector_map", pd.DataFrame())
+    if isinstance(sector_map, pd.DataFrame) and not sector_map.empty:
+        st.markdown("#### Sector Opportunity Map")
+        safe_dataframe(sector_map, width="stretch", hide_index=True)
 
 with leader_tab:
-    columns = [
-        "rank", "production_rank", "portfolio_rank", "ticker", "sector", "candidate_type", "thesis_archetype", "status",
-        "Ranking Score", "Production Score", "ranking_score_state", "production_rank_eligible", "score_coverage_pct",
-        "fundamental_freshness_state", "fundamental_refresh_state", "fundamental_trend_state", "fundamental_growth_basis_state", "fundamental_growth_conflict_state", "fundamental_data_quality_score", "fundamental_conviction_cap",
-        "fundamental_official_verified", "fundamental_official_source_coverage_pct", "fundamental_cashflow_state",
-        "market_regime", "market_context_score", "real_money_authorization_state", "real_money_authorization_blockers", "real_money_manual_checks",
-        "sector_source", "sector_confidence_pct",
-        "business_quality_score", "future_fundamental_score", "valuation_mos_score",
-        "management_capital_score", "issuer_macro_alignment_score",
-        "narrative_flow_score", "technical_readiness_score",
-        "silent_accumulation_score", "inventory_multi_horizon_score", "inventory_lifecycle",
-        "distribution_risk_score", "anti_chase_gate", "decision_overlay_state", "retail_adoption_stage",
-        "research_gate_state", "portfolio_gate_state", "execution_gate_state", "thesis_confidence_pct", "research_accumulation_zone_low", "research_accumulation_zone_high", "research_preferred_reentry", "research_invalidation_reference", "research_zone_state", "entry_low", "entry_high", "trigger", "stop_loss", "tp1", "tp2", "rr1",
-        "recommended_allocation_idr", "recommended_lots", "selected_reason", "primary_risk",
-    ]
-    view = _safe_display(leaders.head(50), columns)
-    if view.empty:
-        st.warning("Belum ada kandidat The Next Leader.")
+    st.subheader("The Next Leader")
+    if leaders.empty:
+        st.info("Tidak ada kandidat Next Leader yang memenuhi minimum evidence hari ini.")
     else:
-        st.dataframe(view, width="stretch", hide_index=True)
-        st.download_button("Download The Next Leader CSV", view.to_csv(index=False).encode("utf-8-sig"), "v9_the_next_leader.csv", "text/csv")
+        show_cols = [
+            "research_rank", "production_rank", "ticker", "thesis_archetype", "Ranking Score", "Production Score", "v9_next_leader_score", "v9_next_leader_raw_score", "score_inflation_guard_active", "score_inflation_guard_reason",
+            "business_quality_score", "business_quality_coverage_pct", "future_fundamental_score", "future_fundamental_coverage_pct", "valuation_mos_score", "management_capital_allocation_score", "macro_sector_fit_score", "narrative_moneyflow_score", "technical_readiness_score",
+            "silent_accumulation_score", "silent_accumulation_confidence", "silent_accumulation_state", "inventory_cycle_score", "inventory_cycle_coverage_pct", "inventory_cycle_phase", "broker_inventory_shift_state", "distribution_penalty", "strong_accumulation_flag",
+            "growth_lane_rank_eligible", "turnaround_lane_rank_eligible", "growth_lane_reject_reason", "turnaround_lane_reject_reason",
+            "status", "thesis_state", "execution_state", "decision_overlay_state", "real_money_authorization_state", "real_money_authorized", "real_money_gate_reasons", "actionability_score", "actionability_state", "actionability_block_reasons", "next_action",
+            "entry", "entry_low", "entry_high", "trigger", "stop_loss", "tp1", "tp2", "rr1", "rr2", "recommended_lots", "recommended_allocation_idr", "allocation_action",
+            "execution_entry_type", "stockbit_order_instruction", "stockbit_trigger_price", "stockbit_limit_price", "stockbit_order_lots", "order_builder_eligible",
+            "research_accumulation_zone_low", "research_accumulation_zone_high", "research_accumulation_reference", "research_zone_state", "research_zone_note",
+            "portfolio_rank_eligible", "portfolio_gate_reason", "production_rank_eligible", "production_gate_reason", "ranking_tier", "ranking_reason", "thesis_reason", "next_proof", "invalidation",
+            "fundamental_data_state", "fundamental_freshness_class", "fundamental_statement_age_days", "fundamental_latest_period_end", "growth_period_alignment_state", "fundamental_data_grade", "fundamental_completeness",
+            "current_debt", "long_term_debt", "total_debt", "cash", "cash_to_debt", "debt_equity", "gross_margin", "operating_margin", "net_margin", "roe", "roa", "cash_conversion_ttm", "fcf_yield",
+            "smc_state", "smc_sweep_state", "smc_bos_state", "smc_choch_state", "smc_fvg_state", "fvg_low", "fvg_high", "order_block_low", "order_block_high", "liquidity_sweep_level", "technical_reason", "narrative_reason",
+            "idx_official_coverage_pct", "idx_official_evidence_status", "idx_official_state",
+            "evidence_coverage_pct", "evidence_class", "top_evidence_sources", "top_reason", "top_risk", "top_catalyst", "expected_return_1_3m_pct", "probability_1_3m_pct", "holding_horizon", "estimated_days_to_entry", "estimated_days_to_tp1", "estimated_days_to_tp2",
+        ]
+        safe_dataframe(leaders, show_cols, width="stretch", hide_index=True)
 
 with swing_tab:
-    columns = [
-        "rank", "production_rank", "actionable_rank", "ticker", "sector", "status", "Ranking Score", "Production Score",
-        "ranking_score_state", "production_rank_eligible", "score_coverage_pct",
-        "real_money_authorization_state", "real_money_authorization_blockers", "real_money_manual_checks",
-        "fundamental_data_quality_score", "fundamental_official_verified", "market_regime", "market_context_score",
-        "production_gate_reason", "technical_execution_score", "issuer_macro_alignment_score", "narrative_flow_score",
-        "silent_accumulation_score", "inventory_multi_horizon_score", "inventory_lifecycle",
-        "distribution_risk_score", "anti_chase_gate", "decision_overlay_state",
-        "business_quality_score", "risk_data_score", "next_leader_score", "strategy",
-        "entry_zone_role", "entry_zone_is_executable", "execution_entry", "entry_low", "entry_high", "trigger_price", "stop_loss", "tp1", "tp2", "rr1", "rr2",
-        "stockbit_order_lots", "next_action", "selected_reason", "primary_risk",
-    ]
-    view = _safe_display(swings.head(50), columns)
-    if view.empty:
-        st.warning("Belum ada setup Swing Ready.")
+    st.subheader("Swing Ready")
+    if swings.empty:
+        st.info("Tidak ada setup swing yang memenuhi struktur + fundamental gate saat ini.")
     else:
-        st.dataframe(view, width="stretch", hide_index=True)
-        st.download_button("Download Swing Ready CSV", view.to_csv(index=False).encode("utf-8-sig"), "v9_swing_ready.csv", "text/csv")
+        show_cols = [
+            "research_rank", "production_rank", "ticker", "Ranking Score", "Production Score", "v9_swing_score", "v9_swing_raw_score", "score_inflation_guard_active", "score_inflation_guard_reason",
+            "technical_execution_score", "macro_sector_fit_score", "narrative_moneyflow_score", "business_quality_score", "risk_data_score", "silent_accumulation_score", "silent_accumulation_confidence", "silent_accumulation_state", "inventory_cycle_score", "inventory_cycle_coverage_pct", "inventory_cycle_phase", "broker_inventory_shift_state", "distribution_penalty", "strong_accumulation_flag", "status", "setup_type", "entry_type", "thesis_state", "execution_state", "decision_overlay_state", "real_money_authorization_state", "real_money_authorized", "real_money_gate_reasons", "actionability_score", "actionability_state", "actionability_block_reasons", "next_action",
+            "entry", "entry_low", "entry_high", "trigger", "stop_loss", "tp1", "tp2", "rr1", "rr2", "recommended_lots", "recommended_allocation_idr", "allocation_action",
+            "execution_entry_type", "stockbit_order_instruction", "stockbit_trigger_price", "stockbit_limit_price", "stockbit_order_lots", "order_builder_eligible",
+            "entry_zone_role", "entry_zone_is_executable", "research_accumulation_zone_low", "research_accumulation_zone_high", "research_accumulation_reference", "research_zone_state", "research_zone_note",
+            "actionable_rank_eligible", "production_rank_eligible", "production_gate_reason", "ranking_tier", "ranking_reason", "fundamental_data_state", "fundamental_freshness_class", "fundamental_statement_age_days", "growth_period_alignment_state", "smc_state", "smc_sweep_state", "smc_bos_state", "smc_choch_state", "smc_fvg_state", "fvg_low", "fvg_high", "order_block_low", "order_block_high", "liquidity_sweep_level", "next_proof", "invalidation", "evidence_coverage_pct", "evidence_class", "top_evidence_sources", "top_reason", "top_risk", "top_catalyst", "expected_return_1_3m_pct", "probability_1_3m_pct", "holding_horizon", "estimated_days_to_entry", "estimated_days_to_tp1", "estimated_days_to_tp2",
+        ]
+        safe_dataframe(swings, show_cols, width="stretch", hide_index=True)
 
 with portfolio_tab:
-    portfolio_analysis = result.get("portfolio_analysis", pd.DataFrame())
-    portfolio_summary = result.get("portfolio_summary", {})
-    if isinstance(portfolio_summary, Mapping) and portfolio_summary:
-        cols = st.columns(4)
-        cols[0].metric("Nilai pasar", f"Rp {_finite(portfolio_summary.get('market_value_idr')):,.0f}")
-        cols[1].metric("Unrealized P/L", f"Rp {_finite(portfolio_summary.get('unrealized_pnl_idr')):,.0f}")
-        cols[2].metric("Open risk", f"Rp {_finite(portfolio_summary.get('open_risk_idr')):,.0f}")
-        cols[3].metric("Estimasi equity", f"Rp {_finite(portfolio_summary.get('estimated_equity_idr')):,.0f}")
-    if isinstance(portfolio_analysis, pd.DataFrame) and not portfolio_analysis.empty:
-        st.dataframe(_safe_display(portfolio_analysis), width="stretch", hide_index=True)
+    st.subheader("Portfolio & Audit")
+    portfolio_view = result.get("portfolio_view", pd.DataFrame())
+    if isinstance(portfolio_view, pd.DataFrame) and not portfolio_view.empty:
+        safe_dataframe(portfolio_view, width="stretch", hide_index=True)
     else:
-        st.info("Portfolio CSV belum diunggah.")
-
-    with st.expander("Ticker belum masuk ranking"):
-        leader_all = focus.get("next_leaders_all", pd.DataFrame())
-        swing_all = focus.get("swing_ready_all", pd.DataFrame())
-        pending_frames = []
-        if isinstance(leader_all, pd.DataFrame) and not leader_all.empty:
-            leader_mask = leader_all["rank_eligible"].fillna(False).astype(bool) if "rank_eligible" in leader_all.columns else pd.Series(False, index=leader_all.index)
-            local = leader_all.loc[~leader_mask].copy()
-            if not local.empty:
-                local["model"] = "THE_NEXT_LEADER"
-                pending_frames.append(local)
-        if isinstance(swing_all, pd.DataFrame) and not swing_all.empty:
-            swing_mask = swing_all["rank_eligible"].fillna(False).astype(bool) if "rank_eligible" in swing_all.columns else pd.Series(False, index=swing_all.index)
-            local = swing_all.loc[~swing_mask].copy()
-            if not local.empty:
-                local["model"] = "SWING_READY"
-                pending_frames.append(local)
-        if pending_frames:
-            concat_frames = [frame.dropna(axis=1, how="all") for frame in pending_frames]
-            pending = pd.concat(concat_frames, ignore_index=True, sort=False)
-        else:
-            pending = pd.DataFrame()
-        st.dataframe(_safe_display(pending), width="stretch", hide_index=True)
-    with st.expander("Scoring contract"):
-        st.dataframe(_safe_display(focus.get("production_scoring_audit", pd.DataFrame())), width="stretch", hide_index=True)
-    with st.expander("Evidence per ticker"):
-        evidence = _safe_display(focus.get("production_evidence_detail", pd.DataFrame()))
-        st.dataframe(evidence, width="stretch", hide_index=True)
-        if not evidence.empty:
-            st.download_button("Download Evidence CSV", evidence.to_csv(index=False).encode("utf-8-sig"), "v9_evidence.csv", "text/csv")
-    with st.expander("Data coverage dan pipeline"):
-        st.dataframe(_safe_display(result.get("scan_coverage_summary", pd.DataFrame())), width="stretch", hide_index=True)
-        st.dataframe(_safe_display(result.get("scanner_data_contract_audit", pd.DataFrame())), width="stretch", hide_index=True)
-        st.dataframe(_safe_display(result.get("stage_timings", pd.DataFrame())), width="stretch", hide_index=True)
-        st.dataframe(_safe_display(result.get("two_stage_coverage_audit", pd.DataFrame())), width="stretch", hide_index=True)
-    with st.expander("OHLCV database dan provider audit"):
-        ohlcv_audit = _safe_display(result.get("ohlcv_database_audit", pd.DataFrame()))
-        st.dataframe(ohlcv_audit, width="stretch", hide_index=True)
-        if not ohlcv_audit.empty:
-            st.download_button("Download OHLCV Audit CSV", ohlcv_audit.to_csv(index=False).encode("utf-8-sig"), "v9_ohlcv_audit.csv", "text/csv")
-    with st.expander("ALL_ELIGIBLE_LITE feature cache"):
-        feature_audit = _safe_display(result.get("feature_cache_audit", pd.DataFrame()))
-        st.dataframe(feature_audit, width="stretch", hide_index=True)
-        st.dataframe(_safe_display(result.get("feature_cache_write_report", pd.DataFrame())), width="stretch", hide_index=True)
-        if not feature_audit.empty:
-            st.download_button("Download Feature Cache Audit CSV", feature_audit.to_csv(index=False).encode("utf-8-sig"), "v9_feature_cache_audit.csv", "text/csv")
-    with st.expander("Fundamental dan database audit"):
-        st.dataframe(_safe_display(result.get("fundamental_history_report", pd.DataFrame())), width="stretch", hide_index=True)
-        st.dataframe(_safe_display(result.get("database_sync_report", pd.DataFrame())), width="stretch", hide_index=True)
+        st.caption("Upload portfolio CSV untuk review posisi. Scanner universe tetap dapat berjalan tanpa portfolio.")
+    st.markdown("#### Scanner Contract")
+    contract = result.get("scanner_contract", pd.DataFrame())
+    if isinstance(contract, pd.DataFrame) and not contract.empty:
+        safe_dataframe(contract, width="stretch", hide_index=True)
+    st.markdown("#### Scan Coverage")
+    if isinstance(coverage_summary, pd.DataFrame) and not coverage_summary.empty:
+        safe_dataframe(coverage_summary, width="stretch", hide_index=True)
+    evidence_report = result.get("evidence_refresh_report", pd.DataFrame())
+    if isinstance(evidence_report, pd.DataFrame) and not evidence_report.empty:
+        st.markdown("#### Evidence Refresh Report")
+        safe_dataframe(evidence_report, width="stretch", hide_index=True)
+    backfill_report = result.get("maintenance_backfill_report", pd.DataFrame())
+    if isinstance(backfill_report, pd.DataFrame) and not backfill_report.empty:
+        st.markdown("#### Maintenance Backfill Report")
+        safe_dataframe(backfill_report, width="stretch", hide_index=True)
+    provider_audit = result.get("provider_audit", pd.DataFrame())
+    if isinstance(provider_audit, pd.DataFrame) and not provider_audit.empty:
+        st.markdown("#### Provider Audit")
+        safe_dataframe(provider_audit, width="stretch", hide_index=True)
+    gate_audit = result.get("gate_audit", pd.DataFrame())
+    if isinstance(gate_audit, pd.DataFrame) and not gate_audit.empty:
+        st.markdown("#### Decision Gate Audit")
+        safe_dataframe(gate_audit, width="stretch", hide_index=True)
+    revalidation = result.get("execution_revalidation_report", pd.DataFrame())
+    if isinstance(revalidation, pd.DataFrame) and not revalidation.empty:
+        st.markdown("#### Execution Revalidation")
+        safe_dataframe(revalidation, width="stretch", hide_index=True)
+    data_quality_report = result.get("data_quality_report", pd.DataFrame())
+    if isinstance(data_quality_report, pd.DataFrame) and not data_quality_report.empty:
+        st.markdown("#### Data Quality")
+        safe_dataframe(data_quality_report, width="stretch", hide_index=True)
+    database_sync = result.get("database_sync_report", pd.DataFrame())
+    if isinstance(database_sync, pd.DataFrame) and not database_sync.empty:
+        st.markdown("#### Database Sync Report")
+        safe_dataframe(database_sync, width="stretch", hide_index=True)
+    database_detail = result.get("database_sync_detail", pd.DataFrame())
+    if isinstance(database_detail, pd.DataFrame) and not database_detail.empty:
+        with st.expander("Database Sync Detail", expanded=False):
+            safe_dataframe(database_detail, width="stretch", hide_index=True)
+    stage_timings = result.get("stage_timings", pd.DataFrame())
+    if isinstance(stage_timings, pd.DataFrame) and not stage_timings.empty:
+        st.markdown("#### Stage Timings")
+        safe_dataframe(stage_timings, width="stretch", hide_index=True)
