@@ -24,7 +24,7 @@ REQUIRED_FILES = (
 )
 missing = [name for name in REQUIRED_FILES if not (APP_ROOT / name).is_file()]
 if missing:
-    st.error("Deployment v9.8.8 tidak lengkap.")
+    st.error("Deployment v9.8.9 tidak lengkap.")
     st.code("\n".join(missing), language="text")
     st.stop()
 
