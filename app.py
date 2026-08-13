@@ -9,12 +9,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "9.8.5-actionability-integrity"
+APP_VERSION = "9.8.7-production-hardening"
 APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-st.set_page_config(page_title="IDX Scanner v9.8.5", page_icon="📊", layout="wide")
+st.set_page_config(page_title="IDX Scanner v9.8.7", page_icon="📊", layout="wide")
 
 REQUIRED_FILES = (
     "scanner.py", "scanner_database.py", "narrative_engine.py", "macro_engine.py",
@@ -80,7 +80,7 @@ def _runtime_tokens(itick_token: str = "", twelve_token: str = "") -> dict[str, 
     }
 
 
-st.title("IDX Super Scanner v9.8.5 — Actionability Integrity")
+st.title("IDX Super Scanner v9.8.7 — Production Hardening")
 st.caption(
     f"{APP_VERSION} • fast {FAST_SCAN_VERSION} • macro {MACRO_ENGINE_VERSION} • "
     f"decision {SIMPLE_FOCUS_VERSION} • calibration {CALIBRATION_VERSION} • inventory {DECISION_OVERLAY_VERSION} • dashboard {V9_DASHBOARD_VERSION}"
@@ -140,14 +140,14 @@ if run_scan:
         "universe_records": universe_metadata.to_dict("records"),
         # Hard runtime budgets: analysis depth is concentrated on names that can
         # actually enter Top 3/Top ranking. Database coverage expands gradually.
-        "evidence_refresh_cap": 8,
-        "decision_evidence_cap": 8,
-        "evidence_fundamental_cap": 8,
-        "evidence_official_cap": 4,
-        "evidence_snapshot_cap": 6,
+        "evidence_refresh_cap": 20,
+        "decision_evidence_cap": 12,
+        "evidence_fundamental_cap": 20,
+        "evidence_official_cap": 12,
+        "evidence_snapshot_cap": 16,
         "evidence_market_cap": 6,
-        "evidence_news_cap": 6,
-        "execution_verification_cap": 6,
+        "evidence_news_cap": 10,
+        "execution_verification_cap": 8,
         "daily_market_refresh_limit": 6,
         "macro_external_enabled": True,
         "macro_timeout_seconds": 3,

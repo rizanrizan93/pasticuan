@@ -25,7 +25,7 @@ from scanner_database import (
 )
 from resumable_app_engine import process_daily_scan_chunk, finalize_daily_scan_job, _expected_completed_session
 
-FAST_SCAN_VERSION = "9.8.5-actionability-integrity"
+FAST_SCAN_VERSION = "9.8.7-production-hardening"
 
 
 class FastDatabaseBridge(ScannerDatabaseBridge):
@@ -230,14 +230,14 @@ def run_fast_single_scan(
     # Lean production policy. These are research budgets, not user-facing modes.
     cfg.setdefault("period", "5y")
     cfg.setdefault("provider_batch_size", 80)
-    cfg.setdefault("evidence_refresh_cap", 8)
-    cfg.setdefault("decision_evidence_cap", 8)
-    cfg.setdefault("evidence_fundamental_cap", 8)
-    cfg.setdefault("evidence_official_cap", 4)
-    cfg.setdefault("evidence_snapshot_cap", 6)
+    cfg.setdefault("evidence_refresh_cap", 20)
+    cfg.setdefault("decision_evidence_cap", 12)
+    cfg.setdefault("evidence_fundamental_cap", 20)
+    cfg.setdefault("evidence_official_cap", 12)
+    cfg.setdefault("evidence_snapshot_cap", 16)
     cfg.setdefault("evidence_market_cap", 6)
-    cfg.setdefault("evidence_news_cap", 6)
-    cfg.setdefault("execution_verification_cap", 6)
+    cfg.setdefault("evidence_news_cap", 10)
+    cfg.setdefault("execution_verification_cap", 8)
     cfg.setdefault("macro_external_enabled", True)
     cfg.setdefault("macro_timeout_seconds", 3)
     cfg.setdefault("lean_persistence", True)
