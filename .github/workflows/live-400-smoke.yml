@@ -1,0 +1,36 @@
+name: Super live 400 cold smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/live-400-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  SCANNER_DATABASE_ENABLED: '0'
+
+jobs:
+  cold-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install production dependencies
+        run: pip install -r requirements.txt
+      - name: Run 400-name cold production engine
+        run: python tools/live_scan_400_smoke.py | tee /tmp/live-scan.log
+      - name: Upload scanner outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: super-live-400-cold-scan
+          path: live_scan_output/
+          if-no-files-found: warn
