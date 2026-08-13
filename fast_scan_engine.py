@@ -25,7 +25,7 @@ from scanner_database import (
 )
 from resumable_app_engine import process_daily_scan_chunk, finalize_daily_scan_job, _expected_completed_session
 
-FAST_SCAN_VERSION = "9.8.7-production-hardening"
+FAST_SCAN_VERSION = "9.8.8-execution-plan-integrity"
 
 
 class FastDatabaseBridge(ScannerDatabaseBridge):

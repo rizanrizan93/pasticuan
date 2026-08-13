@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 
-DECISION_OVERLAY_VERSION = "1.0.0-multihorizon-inventory"
+DECISION_OVERLAY_VERSION = "1.1.0-execution-plan-integrity"
 HORIZONS = (20, 60, 120, 252, 504, 756)
 HORIZON_WEIGHTS = {20: 0.22, 60: 0.22, 120: 0.18, 252: 0.15, 504: 0.13, 756: 0.10}
 
@@ -265,11 +265,92 @@ def lifecycle_priority(value: Any) -> int:
     }.get(str(value or "").strip().upper(), 7)
 
 
-def apply_methodology_guardrails(frame: pd.DataFrame, *, model: str) -> pd.DataFrame:
-    """Apply anti-chase/distribution guards without altering fundamental score math."""
+def apply_execution_plan_integrity(frame: pd.DataFrame, *, model: str) -> pd.DataFrame:
+    """Expire consumed or geometrically invalid execution plans.
+
+    Research ranking is preserved, but stale order levels are removed so an old
+    setup can never look like a current re-entry instruction after price has
+    already reached its first target.  An executable entry zone must also sit
+    completely above its stop; otherwise part of the displayed zone would imply
+    negative/undefined risk.
+    """
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         return frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
     out = frame.copy()
+
+    def num(name: str) -> pd.Series:
+        if name not in out.columns:
+            return pd.Series(np.nan, index=out.index, dtype=float)
+        return pd.to_numeric(out[name], errors="coerce")
+
+    entry = num("entry")
+    low = num("entry_low").where(num("entry_low").notna(), entry)
+    high = num("entry_high").where(num("entry_high").notna(), entry)
+    trigger = num("trigger").where(num("trigger").notna(), num("trigger_price")).where(lambda s: s.notna(), entry)
+    stop = num("stop_loss")
+    tp1 = num("tp1")
+    tp2 = num("tp2")
+    last = num("independent_last_price").where(num("independent_last_price").notna(), num("quote_last_price"))
+    last = last.where(last.notna(), num("last_price"))
+    zone_exec = out.get("entry_zone_is_executable", pd.Series(True, index=out.index)).fillna(False).astype(bool)
+
+    has_plan = low.notna() & high.notna() & stop.notna() & tp1.notna() & tp2.notna()
+    invalid_zone = has_plan & ((low > high) | (zone_exec & (stop >= low)))
+    invalid_targets = has_plan & ((tp1 <= trigger) | (tp2 <= tp1))
+    consumed = has_plan & ~invalid_zone & ~invalid_targets & last.notna() & (last >= tp1)
+    invalid = invalid_zone | invalid_targets
+    expired = invalid | consumed
+
+    out["execution_plan_integrity_state"] = np.select(
+        [invalid_zone, invalid_targets, consumed, has_plan],
+        ["INVALID_ENTRY_STOP_GEOMETRY", "INVALID_TARGET_GEOMETRY", "STALE_TARGET_ALREADY_REACHED", "CURRENT_PLAN"],
+        default="NO_EXECUTION_PLAN",
+    )
+    out["execution_plan_is_current"] = has_plan & ~expired
+    out["execution_plan_block_reason"] = np.select(
+        [invalid_zone, invalid_targets, consumed],
+        ["STOP_NOT_BELOW_FULL_EXECUTABLE_ENTRY_ZONE", "TARGETS_NOT_ABOVE_TRIGGER_IN_ORDER", "LATEST_PRICE_ALREADY_REACHED_TP1"],
+        default="",
+    )
+
+    # Stale/invalid levels are intentionally removed from the current order
+    # contract.  The research score and historical thesis remain untouched.
+    order_fields = ["entry", "execution_entry", "entry_low", "entry_high", "trigger", "trigger_price", "stop_loss", "tp1", "tp2", "rr1", "rr2"]
+    for name in order_fields:
+        if name in out.columns:
+            out.loc[expired, name] = np.nan
+    if "entry_zone_is_executable" in out.columns:
+        out.loc[expired, "entry_zone_is_executable"] = False
+    if "order_builder_eligible" in out.columns:
+        out.loc[expired, "order_builder_eligible"] = False
+    if "order_ready" in out.columns:
+        out.loc[expired, "order_ready"] = False
+    if "recommended_allocation_idr" in out.columns:
+        out.loc[expired, "recommended_allocation_idr"] = 0.0
+    if "recommended_lots" in out.columns:
+        out.loc[expired, "recommended_lots"] = 0
+    if "stockbit_order_lots" in out.columns:
+        out.loc[expired, "stockbit_order_lots"] = 0
+
+    model_name = str(model or "").strip().upper()
+    if "status" in out.columns:
+        if model_name == "NEXT_LEADER":
+            out.loc[consumed, "status"] = "WAIT"
+            out.loc[invalid, "status"] = "RESEARCH_ONLY"
+        elif model_name == "SWING_READY":
+            out.loc[consumed, "status"] = "WATCHLIST"
+            out.loc[invalid, "status"] = "RESEARCH_ONLY"
+    if "next_action" in out.columns:
+        out.loc[consumed, "next_action"] = "WAIT_NEW_SETUP_AFTER_TARGET_REACHED"
+        out.loc[invalid, "next_action"] = "REBUILD_INVALID_EXECUTION_PLAN"
+    return out
+
+
+def apply_methodology_guardrails(frame: pd.DataFrame, *, model: str) -> pd.DataFrame:
+    """Apply execution-integrity, anti-chase and distribution guards without altering research score math."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    out = apply_execution_plan_integrity(frame, model=model)
     model_name = str(model or "").strip().upper()
     lifecycle = out.get("inventory_lifecycle", pd.Series("NEUTRAL", index=out.index)).astype(str).str.upper()
     distribution_source = out["distribution_risk_score"] if "distribution_risk_score" in out.columns else pd.Series(np.nan, index=out.index)
@@ -329,5 +410,6 @@ __all__ = [
     "inventory_lifecycle_profile",
     "enrich_silent_profile",
     "lifecycle_priority",
+    "apply_execution_plan_integrity",
     "apply_methodology_guardrails",
 ]
