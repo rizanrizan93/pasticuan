@@ -17,6 +17,7 @@ from evidence_enrichment import enrich_fundamental_evidence
 from ihsg_direction import IHSGDirectionConfig, analyze_ihsg_direction
 from macro_engine import build_macro_regime, fetch_macro_series
 from issuer_classification import normalize_fundamental_classification
+from official_evidence_guard import canonicalize_official_fundamental_evidence
 from narrative_engine import build_narrative_intelligence
 from resumable_scan import ItemOutcome, json_safe
 from scanner import (
@@ -241,7 +242,11 @@ def _load_fundamentals(bridge: ScannerDatabaseBridge, tickers: Sequence[str], cf
     snapshot = _coalesce_primary_evidence(db_snapshot, local_snapshot)
     history = combine_fundamental_history(db_history, local_history)
     snapshot = normalize_fundamental_classification(
-        _mark_history_eligible(enrich_fundamentals_with_history(snapshot, history))
+        _mark_history_eligible(
+            canonicalize_official_fundamental_evidence(
+                enrich_fundamentals_with_history(snapshot, history)
+            )
+        )
     )
     audits = [frame for frame in (audit_snapshot, audit_history) if isinstance(frame, pd.DataFrame) and not frame.empty]
     return snapshot, history, pd.concat(audits, ignore_index=True, sort=False) if audits else pd.DataFrame()
@@ -795,7 +800,9 @@ def _refresh_missing_daily_evidence(
         live_snapshot = fetch_resilient_fundamentals(snapshot_targets, cfg) if snapshot_targets else pd.DataFrame()
         fundamentals = normalize_fundamental_classification(
             _mark_history_eligible(
-                enrich_fundamentals_with_history(_coalesce_primary_evidence(live_snapshot, fundamentals), history)
+                canonicalize_official_fundamental_evidence(
+                    enrich_fundamentals_with_history(_coalesce_primary_evidence(live_snapshot, fundamentals), history)
+                )
             )
         )
         for report in (idx_report, yahoo_report):
