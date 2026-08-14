@@ -6,8 +6,13 @@ on:
     paths:
       - '.github/workflows/live-400-smoke.yml'
       - 'fast_scan_engine.py'
+      - 'scanner.py'
+      - 'simple_focus.py'
       - 'persistence_contract_patch.py'
       - 'tests/test_v9_8_10_persistence_contract.py'
+      - 'tests/test_narrative_coverage_precedence.py'
+      - 'tests/test_ksei_valuation_provenance_alias.py'
+      - 'tests/test_silent_confidence_output_contract.py'
   workflow_dispatch:
 
 permissions:
@@ -31,8 +36,9 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install pytest
-      - name: Run persistence contract regression
-        run: pytest -q tests/test_v9_8_10_persistence_contract.py
+      - name: Run evidence and persistence regressions
+        run: |
+          pytest -q tests/test_v9_8_10_persistence_contract.py tests/test_narrative_coverage_precedence.py tests/test_ksei_valuation_provenance_alias.py tests/test_silent_confidence_output_contract.py
       - name: Run 400-name cold production engine
         run: python tools/live_scan_400_smoke.py | tee /tmp/live-scan.log
       - name: Upload scanner outputs
