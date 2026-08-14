@@ -392,8 +392,16 @@ def _flow_score_from_row(row: Mapping[str, Any]) -> tuple[float, float]:
 
 
 def _narrative_flow_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
-    narrative = _first_num(row, ("nar_narrative_event_effective_score", "nar_narrative_effective_score"))
-    narrative_cov = _first_num(row, ("nar_narrative_event_coverage_pct", "nar_narrative_evidence_coverage_pct"))
+    # Pair score and coverage from the same evidence family.  A zero event-level
+    # coverage must not shadow broad narrative evidence when the event-level score
+    # itself is missing.
+    event_score = _first_num(row, ("nar_narrative_event_effective_score",))
+    if np.isfinite(event_score):
+        narrative = event_score
+        narrative_cov = _first_num(row, ("nar_narrative_event_coverage_pct",))
+    else:
+        narrative = _first_num(row, ("nar_narrative_effective_score",))
+        narrative_cov = _first_num(row, ("nar_narrative_evidence_coverage_pct",))
     flow, flow_cov = _flow_score_from_row(row)
     parts: list[tuple[float, float, float, str]] = []
     if np.isfinite(narrative):
