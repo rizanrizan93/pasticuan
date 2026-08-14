@@ -2,9 +2,12 @@ name: Super live 400 cold smoke
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/super-persistence-contract-20260814]
     paths:
       - '.github/workflows/live-400-smoke.yml'
+      - 'fast_scan_engine.py'
+      - 'persistence_contract_patch.py'
+      - 'tests/test_v9_8_10_persistence_contract.py'
   workflow_dispatch:
 
 permissions:
@@ -26,6 +29,8 @@ jobs:
           python-version: '3.13'
       - name: Install production dependencies
         run: pip install -r requirements.txt
+      - name: Run persistence contract regression
+        run: pytest -q tests/test_v9_8_10_persistence_contract.py
       - name: Run 400-name cold production engine
         run: python tools/live_scan_400_smoke.py | tee /tmp/live-scan.log
       - name: Upload scanner outputs
