@@ -68,6 +68,15 @@ def _safe_display(frame: pd.DataFrame | None, columns: Iterable[str] | None = No
     return out.reset_index(drop=True)
 
 
+def safe_dataframe(
+    frame: pd.DataFrame | None,
+    columns: Iterable[str] | None = None,
+    **kwargs: object,
+) -> None:
+    """Render a dataframe after applying the app's safe display normalization."""
+    st.dataframe(_safe_display(frame, columns), **kwargs)
+
+
 def _runtime_tokens(itick_token: str = "", twelve_token: str = "") -> dict[str, str]:
     def secret(name: str) -> str:
         try:
