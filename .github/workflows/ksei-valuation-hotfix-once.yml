@@ -1,0 +1,46 @@
+name: Super KSEI valuation provenance hotfix once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ksei-valuation-hotfix-once.yml'
+
+permissions:
+  contents: write
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+      - name: Apply KSEI valuation provenance fix
+        run: python tools/apply_ksei_valuation_provenance_fix.py
+      - name: Compile and focused regression
+        run: |
+          python -m py_compile scanner.py resumable_app_engine.py simple_focus.py
+          pytest -q tests/test_ksei_valuation_provenance_alias.py tests/test_narrative_coverage_precedence.py tests/test_official_evidence_guard.py tests/test_v9_8_10_persistence_contract.py
+      - name: Commit production patch
+        run: |
+          if git diff --quiet -- scanner.py; then
+            echo 'No production patch needed'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '4189824+github-actions[bot]@users.noreply.github.com'
+          git add scanner.py
+          git commit -m 'Accept verified KSEI source provenance for valuation share counts'
+          git push origin HEAD:main
