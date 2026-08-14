@@ -1,0 +1,46 @@
+name: Super silent confidence persistence hotfix once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/silent-confidence-hotfix-once.yml'
+
+permissions:
+  contents: write
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+      - name: Apply silent confidence output fix
+        run: python tools/apply_silent_confidence_output_fix.py
+      - name: Compile and focused regression
+        run: |
+          python -m py_compile simple_focus.py scanner_database.py persistence_contract_patch.py
+          pytest -q tests/test_silent_confidence_output_contract.py tests/test_narrative_coverage_precedence.py tests/test_v9_8_10_persistence_contract.py
+      - name: Commit production patch
+        run: |
+          if git diff --quiet -- simple_focus.py; then
+            echo 'No production patch needed'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '4189824+github-actions[bot]@users.noreply.github.com'
+          git add simple_focus.py
+          git commit -m 'Persist silent accumulation confidence from scoring output'
+          git push origin HEAD:main
