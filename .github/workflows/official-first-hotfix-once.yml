@@ -25,9 +25,11 @@ jobs:
       - name: Apply official-first guard
         run: python tools/apply_official_first_guard.py
       - name: Compile and regression
+        env:
+          PYTHONPATH: .
         run: |
           python -m py_compile official_evidence_guard.py resumable_app_engine.py
-          pytest -q tests/test_official_evidence_guard.py tests/test_v9_8_10_persistence_contract.py
+          python -m pytest -q tests/test_official_evidence_guard.py tests/test_v9_8_10_persistence_contract.py
       - name: Commit production patch
         run: |
           if git diff --quiet -- resumable_app_engine.py; then
