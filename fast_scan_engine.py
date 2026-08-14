@@ -18,6 +18,9 @@ import time
 
 import pandas as pd
 
+# Patch only the persistence schema/projection contract before the bridge class
+# is imported. Scoring/ranking code and weights are deliberately untouched.
+import persistence_contract_patch  # noqa: F401,E402
 from scanner_database import (
     DatabaseSettings,
     DatabaseTransportError,
@@ -172,7 +175,6 @@ def _outcomes_to_items(items: pd.DataFrame, outcomes: Mapping[str, Any]) -> pd.D
     return pd.DataFrame(rows)
 
 
-
 def _compact_scalar_mapping(value: Any, *, max_text: int = 500) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         return {}
@@ -213,6 +215,7 @@ def _compact_feature_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "completed_at": local.get("completed_at"),
     }
     return compact
+
 
 def run_fast_single_scan(
     tickers: Sequence[str],
