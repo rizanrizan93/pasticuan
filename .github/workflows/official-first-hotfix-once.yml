@@ -1,0 +1,41 @@
+name: Super official-first hotfix once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/official-first-hotfix-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: pip install pandas numpy pytest
+      - name: Apply official-first guard
+        run: python tools/apply_official_first_guard.py
+      - name: Compile and regression
+        run: |
+          python -m py_compile official_evidence_guard.py resumable_app_engine.py
+          pytest -q tests/test_official_evidence_guard.py tests/test_v9_8_10_persistence_contract.py
+      - name: Commit production patch
+        run: |
+          if git diff --quiet -- resumable_app_engine.py; then
+            echo 'No production patch needed'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add resumable_app_engine.py
+          git commit -m 'Preserve IDX official evidence during live refresh'
+          git push origin HEAD:main
