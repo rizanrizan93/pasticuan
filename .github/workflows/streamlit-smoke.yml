@@ -25,9 +25,9 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
       - name: Compile critical modules
-        run: python -m py_compile app.py fast_scan_engine.py persistence_contract_patch.py resumable_app_engine.py scanner_database.py scanner.py evidence_enrichment.py
-      - name: Persistence contract regression
-        run: pytest -q tests/test_v9_8_10_persistence_contract.py
+        run: python -m py_compile app.py fast_scan_engine.py persistence_contract_patch.py resumable_app_engine.py scanner_database.py scanner.py evidence_enrichment.py simple_focus.py
+      - name: Persistence and narrative coverage regressions
+        run: pytest -q tests/test_v9_8_10_persistence_contract.py tests/test_narrative_coverage_precedence.py
       - name: Start Streamlit and verify health
         run: |
           streamlit run app.py --server.headless true --server.address 127.0.0.1 --server.port 8501 > /tmp/super-streamlit.log 2>&1 &
