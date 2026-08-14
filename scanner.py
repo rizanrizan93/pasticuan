@@ -7221,9 +7221,18 @@ def enrich_fundamentals_with_valuation(
         )
         statement_shares = _num(row.get('history_shares_outstanding_latest'))
         ksei_shares = _num(row.get('ksei_total_shares'))
-        ksei_shares_verified = _truthy(row.get('ksei_shares_verified', False))
+        # KSEI profile ingestion historically persisted verification as
+        # ksei_source_verified, while valuation expected ksei_shares_verified.
+        # They describe the same parsed official profile lineage for the share
+        # count; accept either flag without relaxing the positive/freshness gates.
+        ksei_shares_verified = (
+            _truthy(row.get('ksei_shares_verified', False))
+            or _truthy(row.get('ksei_source_verified', False))
+        )
         ksei_shares_asof = _as_jakarta_naive_timestamp(
-            row.get('ksei_shares_observed_at') or row.get('ksei_shares_checked_at')
+            row.get('ksei_shares_observed_at')
+            or row.get('ksei_shares_checked_at')
+            or row.get('source_checked_at')
         )
         ksei_shares_age = (
             int((current.normalize() - ksei_shares_asof.normalize()).days)
