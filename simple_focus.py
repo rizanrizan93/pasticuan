@@ -72,6 +72,11 @@ NEXT_LEADER_MAX_STATEMENT_AGE_DAYS = 300.0
 SWING_MIN_COVERAGE_PCT = 65.0
 SWING_MIN_TECHNICAL_SCORE = 40.0
 
+DIRECT_FORWARD_SCORE_FIELDS = (
+    "nar_forward_project_pipeline_score",
+    "nar_forward_future_fundamental_impact_score",
+)
+
 
 def _ticker(value: Any) -> str:
     text = str(value or "").strip().upper()
@@ -199,6 +204,22 @@ def _positive_cash_score(value: float) -> float:
     return 15.0
 
 
+def _ownership_alignment_score(value: float) -> float:
+    fraction = _fraction(value)
+    if not np.isfinite(fraction):
+        return np.nan
+    pct = 100.0 * fraction
+    if pct <= 0.0:
+        return 40.0
+    if pct < 5.0:
+        return 50.0 + 4.0 * pct
+    if pct <= 60.0:
+        return 70.0 + 20.0 * (pct - 5.0) / 55.0
+    if pct <= 75.0:
+        return 90.0 - 2.0 * (pct - 60.0)
+    return max(25.0, 60.0 - 1.4 * (pct - 75.0))
+
+
 def _build_silent_profiles(prepared: Mapping[str, pd.DataFrame]) -> tuple[dict[str, dict[str, Any]], pd.DataFrame]:
     profiles: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
@@ -254,64 +275,29 @@ def _business_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
 
 
 def _future_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
-    # A normal compounder does not need a disclosed construction project to
-    # have measurable future-fundamental capacity.  Score the auditable
-    # financial-capacity lane first; direct project/guidance evidence is an
-    # optional overlay and remains mandatory for project-led classifications.
-    # Keep the future pillar orthogonal to BUSINESS_QUALITY. Realised revenue,
-    # earnings, margins and inflection are already scored there; including them
-    # again produced a 0.90 cross-sectional correlation and effectively counted
-    # the same fundamental surprise twice. This pillar now measures only the
-    # forward-capacity/runway contract plus the direct project overlay below.
-    base_specs = (
-        (("fund_forward_financial_capacity_score",), 0.38, lambda v: v),
-        (("fund_reinvestment_runway_pillar",), 0.32, lambda v: v),
-        (("fund_forward_growth_persistence_score",), 0.30, lambda v: v),
+    # This pillar is deliberately direct-only.  Realised growth, ROIC, margins,
+    # cash generation and their derived persistence/capacity proxies belong to
+    # Business Quality.  Reusing them here produced an observed 0.895
+    # cross-sectional correlation and double-counted the same financial facts.
+    if not _truthy(row.get("nar_forward_source_quorum_verified")):
+        return np.nan, 0.0, str(row.get("nar_forward_evidence_state", ""))
+    evidence_coverage = _first_num(row, ("nar_forward_project_data_coverage_pct",))
+    if not np.isfinite(evidence_coverage) or evidence_coverage <= 0.0:
+        return np.nan, 0.0, "DIRECT_FORWARD_COVERAGE_MISSING"
+    specs = (
+        (("nar_forward_future_fundamental_impact_score",), 0.55, lambda value: value),
+        (("nar_forward_project_pipeline_score",), 0.45, lambda value: value),
     )
-    score, _, evidence = _metric_score(row, base_specs)
-    coverage = 0.0
-    for names, weight, _ in base_specs:
-        value = _first_num(row, names)
-        if not np.isfinite(value):
-            continue
-        coverage_name = {
-            "fund_forward_financial_capacity_score": "fund_forward_financial_capacity_coverage_pct",
-            "fund_reinvestment_runway_pillar": "fund_reinvestment_runway_coverage_pct",
-            "fund_forward_growth_persistence_score": "fund_forward_growth_persistence_coverage_pct",
-            "fund_fundamental_inflection_score": "fund_fundamental_inflection_coverage_pct",
-        }.get(names[0])
-        evidence_coverage = _first_num(row, (coverage_name,)) if coverage_name else 100.0
-        coverage += 100.0 * weight * (
-            np.clip(evidence_coverage, 0.0, 100.0) / 100.0
-            if np.isfinite(evidence_coverage) else 0.0
-        )
-    direct_score, direct_coverage, direct_evidence = _metric_score(row, (
-        (("fund_future_fundamental_impact_score", "fund_future_impact_score"), 0.55, lambda v: v),
-        (("fund_project_pipeline_score",), 0.45, lambda v: v),
-    ))
-    if np.isfinite(direct_score):
-        if np.isfinite(score):
-            score = 0.75 * score + 0.25 * direct_score
-            coverage = min(100.0, coverage + 0.15 * direct_coverage)
-        else:
-            score = direct_score
-            coverage = 0.75 * direct_coverage
-        evidence.extend(direct_evidence)
-    # Sparse forward evidence may be directionally useful, but it should never
-    # appear as a 90-100 production pillar from one optimistic field.
-    if np.isfinite(score):
-        if coverage < 40.0:
-            score = min(score, 72.0)
-        elif coverage < 50.0:
-            score = min(score, 80.0)
-        elif coverage < 70.0:
-            score = min(score, 90.0)
-        age = _first_num(row, ("fund_statement_age_days",))
-        project_evidence = _first_num(row, ("fund_project_pipeline_score", "fund_future_fundamental_impact_score"))
-        if np.isfinite(age) and age > NEXT_LEADER_MAX_STATEMENT_AGE_DAYS and not np.isfinite(project_evidence):
-            score = min(score, 65.0)
-            coverage *= 0.70
-    return score, coverage, " | ".join(evidence)
+    score, observed_pct, evidence = _metric_score(row, specs)
+    if not np.isfinite(score):
+        return np.nan, 0.0, "DIRECT_FORWARD_SCORE_MISSING"
+    coverage = min(100.0, np.clip(evidence_coverage, 0.0, 100.0) * observed_pct / 100.0)
+    if coverage < 40.0:
+        score = min(score, 72.0)
+    elif coverage < 70.0:
+        score = min(score, 85.0)
+    basis = str(row.get("nar_forward_evidence_basis", "")).strip()
+    return score, coverage, " | ".join([*evidence, basis] if basis else evidence)
 
 
 def _valuation_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
@@ -349,12 +335,12 @@ def _valuation_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
 
 def _management_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
     specs = (
-        (("fund_management_quality_score", "fund_management_execution_proxy_score"), 0.32, lambda v: v),
-        (("fund_capital_allocation_score", "fund_capital_allocation_proxy_score"), 0.32, lambda v: v),
-        (("fund_history_roic_proxy", "fund_roic_proxy"), 0.16, lambda v: _ratio_score(_fraction(v), 0.04, 0.20)),
-        (("fund_history_share_dilution_yoy", "fund_share_dilution_yoy"), 0.12,
+        (("nar_issuer_action_alignment_effective_score",), 0.55, lambda v: v),
+        (("fund_insider_ownership_pct",), 0.15, _ownership_alignment_score),
+        (("fund_governance_overall_risk", "fund_governance_audit_risk"), 0.15,
+         lambda v: _inverse_ratio_score(v, 1.0, 10.0)),
+        (("fund_history_share_dilution_yoy", "fund_share_dilution_yoy"), 0.15,
          lambda v: _inverse_ratio_score(_fraction(v), 0.00, 0.15)),
-        (("nar_issuer_action_alignment_effective_score",), 0.08, lambda v: v),
     )
     score, _, evidence = _metric_score(row, specs)
     coverage = 0.0
@@ -364,8 +350,6 @@ def _management_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
             continue
         selected = next((name for name in names if np.isfinite(_finite(row.get(name), np.nan))), names[0])
         coverage_name = {
-            "fund_management_execution_proxy_score": "fund_management_execution_proxy_coverage_pct",
-            "fund_capital_allocation_proxy_score": "fund_capital_allocation_proxy_coverage_pct",
             "nar_issuer_action_alignment_effective_score": "nar_issuer_action_alignment_coverage_pct",
         }.get(selected)
         evidence_coverage = _first_num(row, (coverage_name,)) if coverage_name else 100.0
@@ -588,7 +572,7 @@ def _candidate_type(row: Mapping[str, Any], future_score: float, business_score:
     roe = _fraction(_first_num(row, ("fund_roe",)))
     debt_equity = _first_num(row, ("fund_debt_equity", "fund_history_debt_equity"))
     cash_conversion = _first_num(row, ("fund_history_cash_conversion", "fund_cash_conversion_ttm"))
-    project = _first_num(row, ("fund_project_pipeline_score", "fund_future_fundamental_impact_score"))
+    project = _first_num(row, DIRECT_FORWARD_SCORE_FIELDS)
     if np.isfinite(project) and project >= 65:
         return "CAPACITY_EXPANSION"
     if sector in {"ENERGY", "BASIC MATERIALS"} and np.isfinite(future_score) and future_score >= 50:
@@ -660,7 +644,7 @@ def _leader_production_gate(
     business_score = business[0]
     future_score = future[0]
     recovery_lane = candidate_type in {"TURNAROUND", "CYCLICAL_RECOVERY", "CAPACITY_EXPANSION"}
-    project_score = _first_num(row, ("fund_project_pipeline_score", "fund_future_fundamental_impact_score"))
+    project_score = _first_num(row, DIRECT_FORWARD_SCORE_FIELDS)
     if candidate_type in {"CAPACITY_EXPANSION", "EVENT_DRIVEN_RERATING"} and not np.isfinite(project_score):
         reasons.append("DIRECT_PROJECT_EVIDENCE_REQUIRED")
     if recovery_lane:

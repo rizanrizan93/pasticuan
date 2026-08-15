@@ -2019,6 +2019,108 @@ def _conversion_statistics(
     return output
 
 
+def _verified_forward_profile(
+    rows: Iterable[Mapping[str, Any]],
+    as_of: pd.Timestamp,
+) -> dict[str, Any]:
+    """Select one current, sourced forward record without synthesising a score.
+
+    A parser-produced management proxy or a realised financial trend is not
+    forward evidence.  The record must carry a project score/impact, a measured
+    project coverage, HTTPS lineage, an explicit source quorum, and a current
+    verification timestamp.  Otherwise the Future pillar remains missing.
+    """
+    candidates: list[tuple[float, int, pd.Timestamp, dict[str, Any]]] = []
+    saw_score = False
+    saw_lineage_failure = False
+    for raw in rows:
+        pipeline = _finite(
+            raw.get("project_pipeline_score_observed",
+                    raw.get("project_pipeline_score")),
+            np.nan,
+        )
+        impact = _finite(
+            raw.get("future_fundamental_impact_score_observed",
+                    raw.get("future_fundamental_impact_score")),
+            np.nan,
+        )
+        if not (np.isfinite(pipeline) or np.isfinite(impact)):
+            continue
+        saw_score = True
+        coverage = max(0.0, min(100.0, _finite(
+            raw.get("project_data_coverage",
+                    raw.get("project_data_coverage_effective")),
+            0.0,
+        )))
+        urls: list[str] = []
+        for value in (raw.get("project_source_urls"), raw.get("source_url")):
+            for url in _source_url_candidates(value):
+                if url not in urls:
+                    urls.append(url)
+        verified_at = pd.to_datetime(
+            raw.get("last_verified_at", raw.get("source_checked_at")),
+            errors="coerce",
+            utc=True,
+        )
+        age_days = (
+            float((as_of - verified_at).total_seconds() / 86400.0)
+            if pd.notna(verified_at) else np.nan
+        )
+        lineage_ok = bool(
+            _truthy(raw.get("project_source_quorum_verified"))
+            and coverage > 0.0
+            and urls
+            and np.isfinite(age_days)
+            and -1.0 <= age_days <= 450.0
+        )
+        if not lineage_ok:
+            saw_lineage_failure = True
+            continue
+        payload = {
+            "forward_project_pipeline_score": (
+                round(max(0.0, min(100.0, pipeline)), 1)
+                if np.isfinite(pipeline) else np.nan
+            ),
+            "forward_future_fundamental_impact_score": (
+                round(max(0.0, min(100.0, impact)), 1)
+                if np.isfinite(impact) else np.nan
+            ),
+            "forward_project_data_coverage_pct": round(coverage, 1),
+            "forward_source_quorum_verified": True,
+            "forward_source_urls": " | ".join(urls),
+            "forward_source_families": _text(raw.get("project_source_families")),
+            "forward_last_verified_at": pd.Timestamp(verified_at).isoformat(),
+            "forward_evidence_state": "VERIFIED_DIRECT_FORWARD_EVIDENCE",
+            "forward_evidence_basis": "PROJECT_PIPELINE_AND_IMPACT"
+            if np.isfinite(pipeline) and np.isfinite(impact)
+            else "PROJECT_PIPELINE" if np.isfinite(pipeline)
+            else "FUTURE_FUNDAMENTAL_IMPACT",
+        }
+        candidates.append((
+            coverage,
+            int(np.isfinite(pipeline)) + int(np.isfinite(impact)),
+            pd.Timestamp(verified_at),
+            payload,
+        ))
+    if candidates:
+        return max(candidates, key=lambda item: (item[0], item[1], item[2]))[3]
+    return {
+        "forward_project_pipeline_score": np.nan,
+        "forward_future_fundamental_impact_score": np.nan,
+        "forward_project_data_coverage_pct": 0.0,
+        "forward_source_quorum_verified": False,
+        "forward_source_urls": "",
+        "forward_source_families": "",
+        "forward_last_verified_at": "",
+        "forward_evidence_state": (
+            "NOT_SCORED_FORWARD_LINEAGE_INCOMPLETE"
+            if saw_score and saw_lineage_failure
+            else "NOT_SCORED_DIRECT_FORWARD_EVIDENCE_MISSING"
+        ),
+        "forward_evidence_basis": "",
+    }
+
+
 def build_narrative_profiles(
     tickers: Iterable[str],
     *,
@@ -2064,6 +2166,7 @@ def build_narrative_profiles(
     for ticker in names:
         fundamental = fundamental_map.get(ticker, {})
         pm_evidence = pm_map.get(ticker, [])
+        forward_evidence = _verified_forward_profile(pm_evidence, now)
         operating_proxy = _operating_narrative_proxy(
             fundamental, pm_evidence,
         )
@@ -3032,6 +3135,10 @@ def build_narrative_profiles(
                 flow["effective_silent"], 1,
             ),
         }
+        # Keep direct forward evidence as an explicit profile contract.  It is
+        # consumed by the Future pillar without borrowing realised growth,
+        # profitability, or management outcome proxies from Business Quality.
+        row.update(forward_evidence)
         row.update(emir_profile)
         row.update({
             f"narrative_conversion_rate_{horizon}d_pct":

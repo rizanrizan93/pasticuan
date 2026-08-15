@@ -1,0 +1,45 @@
+"""Keep Streamlit hot-reloads on one release contract.
+
+Streamlit re-executes ``app.py`` in a long-lived interpreter.  Normal Python
+imports can therefore leave already-imported scanner modules on the previous
+release while the UI itself shows the new release.  This helper reloads the
+small dependency chain only when a release marker proves that it is stale.
+"""
+
+from __future__ import annotations
+
+import importlib
+import sys
+from collections.abc import Mapping, Sequence
+
+
+def refresh_release_runtime(
+    *,
+    reload_order: Sequence[str],
+    version_markers: Mapping[str, str],
+) -> tuple[str, tuple[str, ...]]:
+    """Return the on-disk release and reload any stale loaded dependency chain."""
+    importlib.invalidate_caches()
+    contract = importlib.import_module("release_contract")
+    contract = importlib.reload(contract)
+    expected = str(contract.SCANNER_RELEASE_VERSION)
+
+    stale = any(
+        module_name in sys.modules
+        and str(getattr(sys.modules[module_name], attribute, "")) != expected
+        for module_name, attribute in version_markers.items()
+    )
+    if not stale:
+        return expected, ()
+
+    reloaded: list[str] = []
+    for module_name in reload_order:
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        importlib.reload(module)
+        reloaded.append(module_name)
+    return expected, tuple(reloaded)
+
+
+__all__ = ["refresh_release_runtime"]
