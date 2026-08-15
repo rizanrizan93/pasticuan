@@ -46,11 +46,13 @@ except ModuleNotFoundError:  # Deployment requirements install it; local core te
     requests = _RequestsUnavailable()
 
 from research_maintenance import MODEL_VERSIONS, semantic_refresh_reason, model_registry_frame
+from release_contract import SCANNER_RELEASE_VERSION
 from ihsg_direction import ihsg_snapshot_frame
 from selector_engine import selector_snapshot_frame
 
 DATABASE_BRIDGE_VERSION = "20.0.0-evidence-lineage-integrity"
 DATABASE_SCHEMA_VERSION = "scanner_schema_v20"
+SCANNER_VERSION = SCANNER_RELEASE_VERSION
 LEGACY_DATABASE_HEALTH_STATE_V14 = "HEALTHY_V14_GUARDED_REAL_MONEY"  # compatibility marker for v9.8.0 regression audit
 
 DATABASE_VERIFICATION_TABLES: tuple[str, ...] = (
@@ -3735,7 +3737,7 @@ class ScannerDatabaseBridge:
 
 
 __all__ = [
-    "DATABASE_BRIDGE_VERSION", "DATABASE_SCHEMA_VERSION", "DATABASE_VERIFICATION_TABLES", "DatabaseSettings",
+    "DATABASE_BRIDGE_VERSION", "DATABASE_SCHEMA_VERSION", "SCANNER_VERSION", "DATABASE_VERIFICATION_TABLES", "DatabaseSettings",
     "DatabaseWriteError", "DatabaseReadError", "DatabaseTransportError", "ScannerDatabaseBridge",
     "TABLE_FIELD_TYPES", "TABLE_CONFLICT_TARGETS", "_normalise_record",
     "_snapshot_id", "_provider_health_frame", "_freshness_state", "_semantic_hash",
