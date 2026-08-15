@@ -62,8 +62,24 @@ from idx_trading_calendar import idx_session_lag, is_idx_session, previous_idx_s
 from simple_focus import build_simple_focus, build_silent_profiles
 from two_stage_pipeline import ShortlistConfig, build_enrichment_shortlist
 from fundamental_calibration import maintenance_refresh_priority, reporting_refresh_profile
+from release_contract import SCANNER_RELEASE_VERSION
 
-ENGINE_VERSION = "9.8.3"
+ENGINE_VERSION = SCANNER_RELEASE_VERSION
+
+LEAN_FINAL_PERSISTENCE_TABLES = (
+    "fundamental_cache", "fundamental_snapshots",
+    "multibagger_snapshots", "technical_snapshots",
+    "ihsg_direction_snapshots", "narrative_snapshots", "scan_runs",
+)
+FULL_FINAL_PERSISTENCE_TABLES = (
+    "fundamental_cache", "fundamental_snapshots",
+    "multibagger_snapshots", "technical_snapshots",
+    "ihsg_direction_snapshots", "provider_health",
+    "scan_runs", "scan_checkpoints",
+    "narrative_events", "narrative_event_outcomes",
+    "narrative_snapshots", "selector_snapshots",
+    "selector_outcomes", "selector_model_evaluations",
+)
 
 
 def _finite(value: Any, default: float = np.nan) -> float:
@@ -1707,17 +1723,9 @@ def finalize_daily_scan_job(
             # must also persist valuation and derived-evidence fields computed
             # from the complete chunk set.
             final_tables = (
-                "fundamental_cache",
-                "multibagger_snapshots", "technical_snapshots",
-                "ihsg_direction_snapshots", "narrative_snapshots", "scan_runs",
-            ) if bool(config.get("lean_persistence", False)) else (
-                "fundamental_cache",
-                "multibagger_snapshots", "technical_snapshots",
-                "ihsg_direction_snapshots", "provider_health",
-                "scan_runs", "scan_checkpoints",
-                "narrative_events", "narrative_event_outcomes",
-                "narrative_snapshots", "selector_snapshots",
-                "selector_outcomes", "selector_model_evaluations",
+                LEAN_FINAL_PERSISTENCE_TABLES
+                if bool(config.get("lean_persistence", False))
+                else FULL_FINAL_PERSISTENCE_TABLES
             )
             result["database_sync_report"] = bridge.persist_scan_result(result, tables=final_tables)
         except Exception as exc:
@@ -1836,6 +1844,7 @@ def finalize_daily_scan_job(
 
 __all__ = [
     "ENGINE_VERSION",
+    "LEAN_FINAL_PERSISTENCE_TABLES", "FULL_FINAL_PERSISTENCE_TABLES",
     "process_daily_scan_chunk",
     "finalize_daily_scan_job",
 ]
