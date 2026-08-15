@@ -9,6 +9,7 @@ on:
       - 'tools/idx_400_production_universe_2026-07.txt'
       - 'live_forward_evidence.py'
       - 'live_forward_runtime_patch.py'
+      - 'future_fundamental_ui_patch.py'
       - 'evidence_governance.py'
       - 'official_evidence_bridge.py'
       - 'runtime_integrity_patch.py'
@@ -28,6 +29,7 @@ on:
       - 'tools/idx_400_production_universe_2026-07.txt'
       - 'live_forward_evidence.py'
       - 'live_forward_runtime_patch.py'
+      - 'future_fundamental_ui_patch.py'
       - 'evidence_governance.py'
       - 'official_evidence_bridge.py'
       - 'runtime_integrity_patch.py'
@@ -47,7 +49,7 @@ permissions:
 env:
   PYTHONPATH: ${{ github.workspace }}
   SCANNER_DATABASE_ENABLED: '0'
-  SMOKE_RELEASE: 'v9.8.20-live-forward-evidence'
+  SMOKE_RELEASE: 'v9.8.21-future-evidence-status-ui'
 
 jobs:
   cold-scan:

@@ -26,6 +26,13 @@ def _install_integrity_patch(expected: str) -> None:
             installer()
     except Exception:
         pass
+    try:
+        future_ui = importlib.import_module("future_fundamental_ui_patch")
+        installer = getattr(future_ui, "install", None)
+        if callable(installer):
+            installer()
+    except Exception:
+        pass
 
 
 def refresh_release_runtime(
