@@ -1,0 +1,53 @@
+name: Super full forward collection coverage
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  forward-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Check full 400 live forward source coverage
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from live_forward_evidence import collect_live_forward_evidence, collection_coverage
+
+          text = Path('tools/idx_400_production_universe_2026-07.txt').read_text()
+          line = next(line for line in text.splitlines() if line.strip() and not line.startswith('#'))
+          tickers = [item.strip() for item in line.split(',') if item.strip()]
+          assert len(tickers) == 400, len(tickers)
+          frame = collect_live_forward_evidence(
+              tickers,
+              lookback_days=180,
+              max_workers=16,
+              timeout=6.0,
+          )
+          report = collection_coverage(frame, tickers)
+          states = frame.groupby('forward_collection_state')['ticker'].nunique().sort_values(ascending=False).to_dict()
+          material = frame.loc[frame['forward_collection_state'].eq('MATERIAL_FORWARD_RESEARCH_EVIDENCE_FOUND')]
+          failed = frame.loc[frame['forward_collection_state'].eq('FORWARD_CHECK_FAILED_RETRYABLE')]
+          print('FULL_FORWARD_REPORT', report)
+          print('STATE_COUNTS', states)
+          print('MATERIAL_TICKERS', material['ticker'].nunique() if not material.empty else 0)
+          print('FAILED_TICKERS', failed['ticker'].nunique() if not failed.empty else 0)
+          if report['coverage_pct'] < 90.0:
+              raise SystemExit(f"full-universe forward collection coverage too low: {report}")
+          PY
