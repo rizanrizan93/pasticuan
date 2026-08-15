@@ -1,0 +1,82 @@
+name: Super scoped forward DB persistence probe
+
+on:
+  push:
+    branches: ['test/forward-db-persistence-20260815']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  persistence-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Persist and read back forward evidence through scanner bridge
+        env:
+          PROBE_URL: 'https://mbtsvflwszcgdtijdgas.supabase.co'
+          PROBE_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1idHN2Zmx3c3pjZ2R0aWpkZ2FzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUwNzQ4MTEsImV4cCI6MjEwMDY1MDgxMX0.zOmZdWbaTlL_JLanD1bUj7861KCz50MyEIaM47CUnBk'
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          from scanner_database import DatabaseSettings, ScannerDatabaseBridge
+          from runtime_integrity_patch import _persist_live_forward
+
+          settings = DatabaseSettings(
+              enabled=True,
+              mode='SUPABASE_REST',
+              supabase_url=__import__('os').environ['PROBE_URL'],
+              supabase_key=__import__('os').environ['PROBE_KEY'],
+              supabase_key_type='ANON',
+              read_enabled=True,
+          )
+          bridge = ScannerDatabaseBridge(settings)
+          now = pd.Timestamp.now(tz='UTC').isoformat()
+          frame = pd.DataFrame([{
+              'ticker': 'ZZTESTFF.JK',
+              'project_name': 'SCANNER_FORWARD_PERSISTENCE_PROBE',
+              'project_stage': 'PROJECT_OR_CONTRACT',
+              'project_pipeline_score_observed': 68.0,
+              'future_fundamental_impact_score_observed': 70.0,
+              'project_data_coverage': 48.0,
+              'review_origin': 'SCOPED_REAL_DATABASE_PROBE',
+              'project_source_families': 'TEST_PROBE',
+              'project_source_quorum_verified': False,
+              'source_quorum_count': 0,
+              'entity_match_verified': True,
+              'source_checked_at': now,
+              'last_verified_at': now,
+              'forward_research_only': True,
+              'forward_collection_coverage_pct': 100.0,
+              'forward_collection_state': 'MATERIAL_FORWARD_RESEARCH_EVIDENCE_FOUND',
+              'project_execution_flags': 'SCOPED_TEST_NOT_PRODUCTION_EVIDENCE',
+          }])
+          report = _persist_live_forward(bridge, frame)
+          print('WRITE_REPORT')
+          print(report.to_string(index=False))
+          readback, audit = bridge.read_forward_quality_cache(['ZZTESTFF.JK'])
+          print('READBACK')
+          print(readback.to_string(index=False))
+          print('READ_AUDIT')
+          print(audit.to_string(index=False))
+          if readback.empty:
+              raise SystemExit('forward_quality_cache readback empty')
+          row = readback.iloc[0]
+          if str(row.get('forward_collection_state')) != 'MATERIAL_FORWARD_RESEARCH_EVIDENCE_FOUND':
+              raise SystemExit(f"collection state mismatch: {row.get('forward_collection_state')}")
+          if float(row.get('forward_collection_coverage_pct') or 0) != 100.0:
+              raise SystemExit('collection coverage did not survive persistence/readback')
+          if str(row.get('review_origin')) != 'SCOPED_REAL_DATABASE_PROBE':
+              raise SystemExit('payload lineage did not survive persistence/readback')
+          print('SUPER_REAL_DB_FORWARD_PERSISTENCE=PASS')
+          PY
