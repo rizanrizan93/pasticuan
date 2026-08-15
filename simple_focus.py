@@ -26,9 +26,10 @@ from scanner import ScanConfig, safe_number, silent_accumulation_profile, round_
 from decision_overlay import apply_methodology_guardrails, enrich_silent_profile
 from real_money_guard import apply_real_money_authorization, fundamental_conviction_profile
 from fundamental_calibration import reporting_refresh_profile, latest_growth_profile, classify_thesis_archetype
+from release_contract import SCANNER_RELEASE_VERSION
 
 
-SIMPLE_FOCUS_VERSION = "9.8.10-swing-production-gate"
+SIMPLE_FOCUS_VERSION = SCANNER_RELEASE_VERSION
 
 
 @dataclass(frozen=True)
@@ -257,13 +258,15 @@ def _future_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
     # have measurable future-fundamental capacity.  Score the auditable
     # financial-capacity lane first; direct project/guidance evidence is an
     # optional overlay and remains mandatory for project-led classifications.
+    # Keep the future pillar orthogonal to BUSINESS_QUALITY. Realised revenue,
+    # earnings, margins and inflection are already scored there; including them
+    # again produced a 0.90 cross-sectional correlation and effectively counted
+    # the same fundamental surprise twice. This pillar now measures only the
+    # forward-capacity/runway contract plus the direct project overlay below.
     base_specs = (
-        (("fund_forward_financial_capacity_score",), 0.30, lambda v: v),
-        (("fund_reinvestment_runway_pillar",), 0.22, lambda v: v),
-        (("fund_forward_growth_persistence_score",), 0.18, lambda v: v),
-        (("fund_fundamental_inflection_score",), 0.10, lambda v: v),
-        (("fund_revenue_growth", "fund_history_revenue_growth"), 0.10, _growth_score),
-        (("fund_earnings_growth", "fund_history_earnings_growth"), 0.10, _growth_score),
+        (("fund_forward_financial_capacity_score",), 0.38, lambda v: v),
+        (("fund_reinvestment_runway_pillar",), 0.32, lambda v: v),
+        (("fund_forward_growth_persistence_score",), 0.30, lambda v: v),
     )
     score, _, evidence = _metric_score(row, base_specs)
     coverage = 0.0

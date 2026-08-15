@@ -49,8 +49,8 @@ from research_maintenance import MODEL_VERSIONS, semantic_refresh_reason, model_
 from ihsg_direction import ihsg_snapshot_frame
 from selector_engine import selector_snapshot_frame
 
-DATABASE_BRIDGE_VERSION = "16.0.0-persistence-integrity"
-DATABASE_SCHEMA_VERSION = "scanner_schema_v16"
+DATABASE_BRIDGE_VERSION = "20.0.0-evidence-lineage-integrity"
+DATABASE_SCHEMA_VERSION = "scanner_schema_v20"
 LEGACY_DATABASE_HEALTH_STATE_V14 = "HEALTHY_V14_GUARDED_REAL_MONEY"  # compatibility marker for v9.8.0 regression audit
 
 DATABASE_VERIFICATION_TABLES: tuple[str, ...] = (
@@ -92,6 +92,22 @@ TABLE_CONFLICT_TARGETS: dict[str, str] = {
     "narrative_event_outcomes": "narrative_outcome_id",
 }
 
+# These fields are part of the v9 ranking lineage, not an optional runtime
+# monkeypatch. Keeping them in the canonical serializer prevents a valid score
+# from losing its component evidence when written to Postgres.
+V9_RANKING_NUMERIC_FIELDS = {
+    "ranking_score", "research_score", "score_coverage_pct",
+    "business_quality_score", "business_quality_coverage_pct",
+    "future_fundamental_score", "future_fundamental_coverage_pct",
+    "valuation_mos_score", "valuation_mos_coverage_pct",
+    "management_capital_score", "management_capital_coverage_pct",
+    "issuer_macro_alignment_score", "issuer_macro_alignment_coverage_pct",
+    "narrative_flow_score", "narrative_flow_coverage_pct",
+    "technical_readiness_score", "technical_readiness_coverage_pct",
+}
+V9_RANKING_TEXT_FIELDS = {"ranking_score_state"}
+V9_RANKING_INTEGER_FIELDS = {"real_money_risk_lots_cap"}
+
 TABLE_FIELD_TYPES: dict[str, dict[str, set[str]]] = {
     "fundamental_snapshots": {
         "text": {
@@ -130,7 +146,7 @@ TABLE_FIELD_TYPES: dict[str, dict[str, set[str]]] = {
             "real_money_authorization_state", "real_money_authorization_blockers", "real_money_manual_checks",
             "fundamental_score_cap_reason", "fundamental_cashflow_state", "fundamental_leverage_risk_state",
             "fundamental_official_state", "market_regime", "market_context_provenance_state",
-        },
+        } | V9_RANKING_TEXT_FIELDS,
         "numeric": {
             "multibagger_quality_score", "execution_readiness_score",
             "economic_earnings_score", "economic_earnings_confidence",
@@ -166,12 +182,12 @@ TABLE_FIELD_TYPES: dict[str, dict[str, set[str]]] = {
             "market_context_score", "market_context_coverage_pct", "real_money_risk_budget_cap_pct",
             "real_money_risk_budget_idr", "real_money_risk_per_share",
             "inventory_multi_horizon_score", "distribution_risk_score", "reaccumulation_quality_score",
-        },
+        } | V9_RANKING_NUMERIC_FIELDS,
         "integer": {
             "accumulation_longest_run", "absorption_confirmed_days20",
             "failed_absorption_days20", "effort_result_absorption20",
             "effort_result_distribution20", "turnaround_recovery_signals",
-        },
+        } | V9_RANKING_INTEGER_FIELDS,
         "boolean": {
             "research_eligible", "portfolio_allocation_eligible",
             "critical_research_flags", "operational_recovery_flags",
@@ -2614,6 +2630,14 @@ class ScannerDatabaseBridge:
             "multibagger_snapshots": _frame_records(multibagger, (
                 "ticker", "multibagger_status", "multibagger_quality_score", "execution_readiness_score",
                 "v9_next_leader_score", "final_score", "real_money_authorization_state",
+                "ranking_score", "research_score", "ranking_score_state", "score_coverage_pct",
+                "business_quality_score", "business_quality_coverage_pct",
+                "future_fundamental_score", "future_fundamental_coverage_pct",
+                "valuation_mos_score", "valuation_mos_coverage_pct",
+                "management_capital_score", "management_capital_coverage_pct",
+                "issuer_macro_alignment_score", "issuer_macro_alignment_coverage_pct",
+                "narrative_flow_score", "narrative_flow_coverage_pct",
+                "technical_readiness_score", "technical_readiness_coverage_pct",
                 "real_money_authorization_pass", "real_money_authorization_blockers", "real_money_manual_checks",
                 "real_money_risk_budget_cap_pct", "real_money_risk_budget_idr", "real_money_risk_per_share", "real_money_risk_lots_cap",
                 "fundamental_conviction_cap", "fundamental_score_cap_reason",

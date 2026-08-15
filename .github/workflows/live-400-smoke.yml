@@ -2,13 +2,15 @@ name: Super live 400 cold smoke
 
 on:
   push:
-    branches: [main, fix/super-persistence-contract-20260814]
+    branches: [main]
     paths:
       - '.github/workflows/live-400-smoke.yml'
       - 'fast_scan_engine.py'
       - 'scanner.py'
       - 'simple_focus.py'
-      - 'persistence_contract_patch.py'
+      - 'release_contract.py'
+      - 'resumable_app_engine.py'
+      - 'scanner_database.py'
       - 'tests/test_v9_8_10_persistence_contract.py'
       - 'tests/test_narrative_coverage_precedence.py'
       - 'tests/test_ksei_valuation_provenance_alias.py'
@@ -21,7 +23,7 @@ permissions:
 env:
   PYTHONPATH: ${{ github.workspace }}
   SCANNER_DATABASE_ENABLED: '0'
-  SMOKE_RELEASE: 'v9.8.10-swing-production-gate'
+  SMOKE_RELEASE: 'v9.8.11-evidence-lineage-integrity'
 
 jobs:
   cold-scan:
@@ -36,9 +38,8 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install pytest
-      - name: Run evidence and persistence regressions
-        run: |
-          pytest -q tests/test_v9_8_10_persistence_contract.py tests/test_narrative_coverage_precedence.py tests/test_ksei_valuation_provenance_alias.py tests/test_silent_confidence_output_contract.py
+      - name: Run full offline regression suite
+        run: pytest -q
       - name: Run 400-name cold production engine
         run: python tools/live_scan_400_smoke.py | tee /tmp/live-scan.log
       - name: Upload scanner outputs

@@ -18,9 +18,7 @@ import time
 
 import pandas as pd
 
-# Patch only the persistence schema/projection contract before the bridge class
-# is imported. Scoring/ranking code and weights are deliberately untouched.
-import persistence_contract_patch  # noqa: F401,E402
+from release_contract import SCANNER_RELEASE_VERSION
 from scanner_database import (
     DatabaseSettings,
     DatabaseTransportError,
@@ -28,7 +26,7 @@ from scanner_database import (
 )
 from resumable_app_engine import process_daily_scan_chunk, finalize_daily_scan_job, _expected_completed_session
 
-FAST_SCAN_VERSION = "9.8.10-swing-production-gate"
+FAST_SCAN_VERSION = SCANNER_RELEASE_VERSION
 
 
 class FastDatabaseBridge(ScannerDatabaseBridge):
