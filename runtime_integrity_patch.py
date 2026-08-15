@@ -2,13 +2,14 @@ from __future__ import annotations
 
 """Hot-reload-safe integrity patch installed by runtime_release.
 
-Only public ranking labels and failure-cache behaviour are changed here.  Score
-formulae remain owned by their native modules.  Provider failures are cached in
-process for a short TTL; successful/partial responses are never cached here.
+Production hooks keep ranking labels consistent, cache provider failures, and
+bridge governed official evidence into the same inputs consumed by the scanner.
+Raw evidence tables remain factual stores; scoring is performed by
+``official_evidence_bridge`` and is explicitly labelled scanner-derived.
 """
 
 from functools import wraps
-from typing import Any
+from typing import Any, Iterable
 import copy
 import hashlib
 import time
@@ -16,9 +17,11 @@ import time
 import pandas as pd
 
 from evidence_governance import apply_three_rank_contract
+from official_evidence_bridge import combine_project_management, corporate_events_to_narrative
 
-PATCH_VERSION = "1.0.0"
+PATCH_VERSION = "1.1.0"
 _NEGATIVE_RESULTS: dict[tuple[str, str], tuple[float, Any, BaseException | None]] = {}
+_GOVERNED_EVIDENCE_CACHE: dict[tuple[int, tuple[str, ...]], tuple[float, dict[str, pd.DataFrame], pd.DataFrame]] = {}
 _PROVIDER_TTLS = {
     "fetch_resilient_fundamentals": 1800,
     "fetch_idx_fundamental_history": 3600,
@@ -26,6 +29,11 @@ _PROVIDER_TTLS = {
     "fetch_resilient_market_status": 900,
     "fetch_resilient_news_review": 900,
 }
+
+
+def _ticker(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    return text if text.endswith(".JK") else f"{text}.JK" if text else ""
 
 
 def _clone(value: Any) -> Any:
@@ -131,9 +139,122 @@ def _wrap_focus_builder(owner: Any, name: str, *, swing: bool = False) -> None:
     setattr(owner, name, wrapped)
 
 
+def _read_governed_evidence(bridge: Any, tickers: Iterable[Any]) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    names = tuple(sorted(dict.fromkeys(_ticker(value) for value in tickers if _ticker(value))))
+    key = (id(bridge), names)
+    now = time.monotonic()
+    cached = _GOVERNED_EVIDENCE_CACHE.get(key)
+    if cached and cached[0] > now:
+        return ({name: frame.copy() for name, frame in cached[1].items()}, cached[2].copy())
+    if not names or getattr(getattr(bridge, "settings", None), "mode", "") != "SUPABASE_REST":
+        return ({name: pd.DataFrame() for name in ("project_events", "management_roles", "ownership_events", "corporate_events")}, pd.DataFrame())
+    universe = set(names)
+    specs = {
+        "project_events": {"project_source_quorum_verified": "eq.true", "entity_match_verified": "eq.true", "order": "evidence_date.desc"},
+        "management_roles": {"verified": "eq.true", "source_quorum_verified": "eq.true", "entity_match_verified": "eq.true", "order": "updated_at.desc"},
+        "ownership_events": {"verified": "eq.true", "source_quorum_verified": "eq.true", "entity_match_verified": "eq.true", "order": "report_date.desc"},
+        "corporate_events": {"verified": "eq.true", "source_quorum_verified": "eq.true", "entity_match_verified": "eq.true", "order": "event_date.desc"},
+    }
+    frames: dict[str, pd.DataFrame] = {}
+    audits: list[dict[str, Any]] = []
+    for table, filters in specs.items():
+        params = {"select": "*", "limit": str(max(500, min(5000, len(names) * 8))), **filters}
+        try:
+            rows = bridge._get_rows(table, params)
+            frame = pd.DataFrame(rows)
+            if not frame.empty and "ticker" in frame.columns:
+                frame = frame.loc[frame["ticker"].map(_ticker).isin(universe)].copy()
+                frame["ticker"] = frame["ticker"].map(_ticker)
+            frames[table] = frame
+            audits.append({
+                "provider": "SUPABASE_GOVERNED_OFFICIAL_EVIDENCE",
+                "scope": table,
+                "status": "DATABASE_CURRENT" if len(frame) else "NO_ITEMS",
+                "rows": len(frame),
+                "bridge_version": PATCH_VERSION,
+            })
+        except Exception as exc:
+            frames[table] = pd.DataFrame()
+            audits.append({
+                "provider": "SUPABASE_GOVERNED_OFFICIAL_EVIDENCE",
+                "scope": table,
+                "status": "READ_FAIL_SOFT",
+                "rows": 0,
+                "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                "bridge_version": PATCH_VERSION,
+            })
+    audit = pd.DataFrame(audits)
+    _GOVERNED_EVIDENCE_CACHE[key] = (
+        now + 300.0,
+        {name: frame.copy() for name, frame in frames.items()},
+        audit.copy(),
+    )
+    while len(_GOVERNED_EVIDENCE_CACHE) > 8:
+        oldest = next(iter(_GOVERNED_EVIDENCE_CACHE))
+        _GOVERNED_EVIDENCE_CACHE.pop(oldest, None)
+    return frames, audit
+
+
+def _wrap_forward_quality_reader(database_cls: Any) -> None:
+    original = getattr(database_cls, "read_forward_quality_cache", None)
+    if not callable(original) or getattr(original, "__governed_evidence_bridge_v1__", False):
+        return
+
+    @wraps(original)
+    def wrapped(self: Any, tickers: Iterable[Any]):
+        cached_forward, cache_audit = original(self, tickers)
+        governed, governed_audit = _read_governed_evidence(self, tickers)
+        combined = combine_project_management(
+            cached_forward,
+            governed.get("project_events"),
+            governed.get("management_roles"),
+            governed.get("ownership_events"),
+            governed.get("corporate_events"),
+        )
+        audits = [frame for frame in (cache_audit, governed_audit) if isinstance(frame, pd.DataFrame) and not frame.empty]
+        audit = pd.concat(audits, ignore_index=True, sort=False) if audits else pd.DataFrame()
+        if not combined.empty:
+            audit = pd.concat([audit, pd.DataFrame([{
+                "provider": "OFFICIAL_EVIDENCE_BRIDGE",
+                "scope": "FORWARD_AND_MANAGEMENT",
+                "status": "BRIDGED",
+                "rows": len(combined),
+                "detail": "Cached forward evidence plus strict project/management/ownership/capital facts.",
+            }])], ignore_index=True, sort=False)
+        return combined, audit
+
+    wrapped.__governed_evidence_bridge_v1__ = True
+    wrapped.__governed_evidence_bridge_original__ = original
+    setattr(database_cls, "read_forward_quality_cache", wrapped)
+
+
+def _wrap_narrative_event_reader(database_cls: Any) -> None:
+    original = getattr(database_cls, "read_narrative_events", None)
+    if not callable(original) or getattr(original, "__governed_event_bridge_v1__", False):
+        return
+
+    @wraps(original)
+    def wrapped(self: Any, tickers: Iterable[Any], *, limit: int = 10000):
+        existing = original(self, tickers, limit=limit)
+        governed, _ = _read_governed_evidence(self, tickers)
+        direct = corporate_events_to_narrative(governed.get("corporate_events"))
+        frames = [frame for frame in (existing, direct) if isinstance(frame, pd.DataFrame) and not frame.empty]
+        if not frames:
+            return pd.DataFrame()
+        out = pd.concat(frames, ignore_index=True, sort=False)
+        if "narrative_event_id" in out.columns:
+            out = out.drop_duplicates("narrative_event_id", keep="last")
+        return out.reset_index(drop=True)
+
+    wrapped.__governed_event_bridge_v1__ = True
+    wrapped.__governed_event_bridge_original__ = original
+    setattr(database_cls, "read_narrative_events", wrapped)
+
+
 def install(expected_release: str = "") -> dict[str, Any]:
     import simple_focus
     import resumable_app_engine
+    import scanner_database
 
     _wrap_focus_builder(simple_focus, "build_next_leaders", swing=False)
     _wrap_focus_builder(simple_focus, "build_swing_ready", swing=True)
@@ -141,11 +262,14 @@ def install(expected_release: str = "") -> dict[str, Any]:
         # resumable_app_engine imports provider callables into module globals;
         # patching those references avoids touching technical/OHLCV code paths.
         _wrap_negative_cache(resumable_app_engine, name)
+    _wrap_forward_quality_reader(scanner_database.ScannerDatabaseBridge)
+    _wrap_narrative_event_reader(scanner_database.ScannerDatabaseBridge)
     return {
         "patch_version": PATCH_VERSION,
         "release": expected_release,
         "negative_cache_entries": len(_NEGATIVE_RESULTS),
         "ranking_contract": "RAW_RESEARCH|GUARDED_DECISION_PRIORITY|PRODUCTION_REAL_MONEY",
+        "official_evidence_bridge": "PROJECT|MANAGEMENT|OWNERSHIP|CAPITAL_ACTION",
     }
 
 
