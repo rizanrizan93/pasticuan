@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-LIVE_FORWARD_EVIDENCE_VERSION = "1.0.0"
+LIVE_FORWARD_EVIDENCE_VERSION = "1.0.1-dashboard-placement"
 
 _FORWARD_RULES: tuple[tuple[str, tuple[str, ...], float, float], ...] = (
     ("PROJECT_OR_CONTRACT", ("KONTRAK", "CONTRACT", "BACKLOG", "ORDER BOOK", "ORDERBOOK", "OFFTAKE", "TENDER"), 68.0, 70.0),
@@ -138,8 +138,6 @@ def _one(ticker: str, *, lookback_days: int, timeout: float) -> list[dict[str, A
             "forward_research_publisher": publisher,
         })
     if items:
-        # Multiple independent publishers improve research confidence, but do not
-        # become production quorum. Production quorum remains governed separately.
         publisher_count = max(1, len(publishers))
         coverage = min(72.0, 48.0 + 8.0 * min(3, publisher_count - 1))
         for row in items:
@@ -161,11 +159,7 @@ def _one(ticker: str, *, lookback_days: int, timeout: float) -> list[dict[str, A
 
 
 def collect_live_forward_evidence(
-    tickers: Iterable[Any],
-    *,
-    lookback_days: int = 120,
-    max_workers: int = 12,
-    timeout: float = 4.0,
+    tickers: Iterable[Any], *, lookback_days: int = 120, max_workers: int = 12, timeout: float = 4.0,
 ) -> pd.DataFrame:
     names = list(dict.fromkeys(_ticker(value) for value in tickers if _ticker(value)))
     if not names:
@@ -209,11 +203,50 @@ def collection_coverage(frame: pd.DataFrame | None, tickers: Iterable[Any] | Non
     coverage = pd.to_numeric(local.get("forward_collection_coverage_pct", 0.0), errors="coerce").fillna(0.0)
     checked = local.loc[coverage.gt(0), "ticker"].nunique()
     total = len(names) if names else local["ticker"].nunique()
-    return {
-        "tickers": float(total),
-        "checked": float(checked),
-        "coverage_pct": round(100.0 * checked / max(total, 1), 1),
-    }
+    return {"tickers": float(total), "checked": float(checked), "coverage_pct": round(100.0 * checked / max(total, 1), 1)}
 
 
-__all__ = ["LIVE_FORWARD_EVIDENCE_VERSION", "collect_live_forward_evidence", "collection_coverage"]
+def install_dashboard_cost_integrity() -> None:
+    """Redistribute legacy Smart Money Cost blocks one-per-card.
+
+    The legacy renderer used replace(marker, replacement, 1) while replacement
+    contained the same marker, so every subsequent block was inserted into card
+    one. Preserve the existing calculated blocks and only repair placement.
+    """
+    try:
+        import v9_dashboard as dashboard
+    except Exception:
+        return
+    original = getattr(dashboard, "render_dashboard_html", None)
+    if not callable(original) or getattr(original, "__smart_money_cost_placement_v2__", False):
+        return
+
+    def fixed(top: pd.DataFrame, *args: Any, **kwargs: Any) -> str:
+        html = original(top, *args, **kwargs)
+        blocks = re.findall(r'<div class="v9-cost-basis">.*?</div>', html, flags=re.DOTALL)
+        if not blocks:
+            return html
+        html = re.sub(r'<div class="v9-cost-basis">.*?</div>', "", html, flags=re.DOTALL)
+        marker = "</div><p>Multi-horizon OHLCV proxy 20/60/120/252/504/756D — bukan identitas broker.</p>"
+        cursor = 0
+        for block in blocks:
+            index = html.find(marker, cursor)
+            if index < 0:
+                break
+            replacement = "</div>" + block + "<p>Multi-horizon OHLCV proxy 20/60/120/252/504/756D — bukan identitas broker.</p>"
+            html = html[:index] + replacement + html[index + len(marker):]
+            cursor = index + len(replacement)
+        return html
+
+    fixed.__smart_money_cost_placement_v2__ = True
+    fixed.__name__ = getattr(original, "__name__", "render_dashboard_html")
+    fixed.__doc__ = getattr(original, "__doc__", None)
+    setattr(dashboard, "render_dashboard_html", fixed)
+
+
+install_dashboard_cost_integrity()
+
+__all__ = [
+    "LIVE_FORWARD_EVIDENCE_VERSION", "collect_live_forward_evidence", "collection_coverage",
+    "install_dashboard_cost_integrity",
+]
