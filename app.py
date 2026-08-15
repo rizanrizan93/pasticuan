@@ -19,6 +19,8 @@ SCANNER_RELEASE_VERSION, RUNTIME_RELOADED_MODULES = refresh_release_runtime(
         "scanner_database",
         "official_evidence_guard",
         "simple_focus",
+        "v9_dashboard_legacy",
+        "v9_dashboard",
         "resumable_app_engine",
         "fast_scan_engine",
     ),
@@ -28,6 +30,8 @@ SCANNER_RELEASE_VERSION, RUNTIME_RELOADED_MODULES = refresh_release_runtime(
         "scanner_database": "SCANNER_VERSION",
         "official_evidence_guard": "SCANNER_VERSION",
         "simple_focus": "SIMPLE_FOCUS_VERSION",
+        "v9_dashboard_legacy": "SCANNER_VERSION",
+        "v9_dashboard": "SCANNER_VERSION",
         "resumable_app_engine": "ENGINE_VERSION",
         "fast_scan_engine": "FAST_SCAN_VERSION",
     },
@@ -62,7 +66,7 @@ from research_maintenance import SCANNER_VERSION as RESEARCH_SCANNER_VERSION  # 
 from macro_engine import MACRO_ENGINE_VERSION  # noqa: E402
 from simple_focus import SIMPLE_FOCUS_VERSION  # noqa: E402
 from decision_overlay import DECISION_OVERLAY_VERSION  # noqa: E402
-from v9_dashboard import V9_DASHBOARD_VERSION, render_dashboard_html, select_top_candidates  # noqa: E402
+from v9_dashboard import SCANNER_VERSION as DASHBOARD_SCANNER_VERSION, V9_DASHBOARD_VERSION, render_dashboard_html, select_top_candidates  # noqa: E402
 from fast_scan_engine import FAST_SCAN_VERSION, run_fast_single_scan  # noqa: E402
 from fundamental_calibration import CALIBRATION_VERSION  # noqa: E402
 from resumable_app_engine import ENGINE_VERSION as RESUMABLE_ENGINE_VERSION  # noqa: E402
@@ -75,6 +79,7 @@ runtime_versions = {
     "research": RESEARCH_SCANNER_VERSION,
     "fast": FAST_SCAN_VERSION,
     "decision": SIMPLE_FOCUS_VERSION,
+    "dashboard": DASHBOARD_SCANNER_VERSION,
     "resumable": RESUMABLE_ENGINE_VERSION,
 }
 if any(version != APP_VERSION for version in runtime_versions.values()):
