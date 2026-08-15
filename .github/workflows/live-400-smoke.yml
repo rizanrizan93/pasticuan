@@ -7,6 +7,7 @@ on:
       - '.github/workflows/live-400-smoke.yml'
       - 'tools/live_scan_400_smoke.py'
       - 'tools/idx_400_production_universe_2026-07.txt'
+      - 'live_forward_evidence.py'
       - 'evidence_governance.py'
       - 'official_evidence_bridge.py'
       - 'runtime_integrity_patch.py'
@@ -23,6 +24,7 @@ on:
       - '.github/workflows/live-400-smoke.yml'
       - 'tools/live_scan_400_smoke.py'
       - 'tools/idx_400_production_universe_2026-07.txt'
+      - 'live_forward_evidence.py'
       - 'evidence_governance.py'
       - 'official_evidence_bridge.py'
       - 'runtime_integrity_patch.py'
@@ -41,7 +43,7 @@ permissions:
 env:
   PYTHONPATH: ${{ github.workspace }}
   SCANNER_DATABASE_ENABLED: '0'
-  SMOKE_RELEASE: 'v9.8.19-official-evidence-consumption'
+  SMOKE_RELEASE: 'v9.8.20-live-forward-evidence'
 
 jobs:
   cold-scan:
@@ -58,6 +60,18 @@ jobs:
           pip install pytest
       - name: Run full offline regression suite
         run: pytest -q
+      - name: Live Future Fundamental network acquisition
+        run: |
+          python - <<'PY'
+          from live_forward_evidence import collect_live_forward_evidence, collection_coverage
+          names = ['MARK.JK','OMED.JK','TSPC.JK','MAHA.JK','ELSA.JK','TOTL.JK','DGWG.JK','AYAM.JK']
+          frame = collect_live_forward_evidence(names, max_workers=8, timeout=6.0)
+          report = collection_coverage(frame, names)
+          print(frame[['ticker','forward_collection_state','forward_collection_coverage_pct']].to_string(index=False))
+          print('LIVE_FORWARD_REPORT', report)
+          if report['coverage_pct'] < 75.0:
+              raise SystemExit(f"live forward collection coverage too low: {report}")
+          PY
       - name: Run canonical 400-name cold production engine
         run: python tools/live_scan_400_smoke.py | tee /tmp/live-scan.log
       - name: Upload scanner outputs
