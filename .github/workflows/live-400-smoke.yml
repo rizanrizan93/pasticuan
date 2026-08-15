@@ -23,7 +23,7 @@ permissions:
 env:
   PYTHONPATH: ${{ github.workspace }}
   SCANNER_DATABASE_ENABLED: '0'
-  SMOKE_RELEASE: 'v9.8.11-evidence-lineage-integrity'
+  SMOKE_RELEASE: 'v9.8.12-runtime-scoring-integrity'
 
 jobs:
   cold-scan:

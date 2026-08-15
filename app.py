@@ -9,25 +9,40 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from release_contract import SCANNER_RELEASE_VERSION
+from runtime_release import refresh_release_runtime
+
+SCANNER_RELEASE_VERSION, RUNTIME_RELOADED_MODULES = refresh_release_runtime(
+    reload_order=(
+        "narrative_engine",
+        "simple_focus",
+        "resumable_app_engine",
+        "fast_scan_engine",
+    ),
+    version_markers={
+        "simple_focus": "SIMPLE_FOCUS_VERSION",
+        "resumable_app_engine": "ENGINE_VERSION",
+        "fast_scan_engine": "FAST_SCAN_VERSION",
+    },
+)
 
 APP_VERSION = SCANNER_RELEASE_VERSION
+APP_RELEASE_NUMBER = APP_VERSION.split("-", 1)[0]
 APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-st.set_page_config(page_title="IDX Scanner v9.8.11", page_icon="📊", layout="wide")
+st.set_page_config(page_title=f"IDX Scanner v{APP_RELEASE_NUMBER}", page_icon="📊", layout="wide")
 
 REQUIRED_FILES = (
     "scanner.py", "scanner_database.py", "narrative_engine.py", "macro_engine.py",
     "simple_focus.py", "free_data_providers.py", "ihsg_direction.py",
     "decision_overlay.py", "real_money_guard.py", "fundamental_calibration.py", "v9_dashboard.py",
     "resumable_app_engine.py", "fast_scan_engine.py", "evidence_enrichment.py",
-    "release_contract.py",
+    "release_contract.py", "runtime_release.py",
 )
 missing = [name for name in REQUIRED_FILES if not (APP_ROOT / name).is_file()]
 if missing:
-    st.error("Deployment v9.8.11 tidak lengkap.")
+    st.error(f"Deployment v{APP_RELEASE_NUMBER} tidak lengkap.")
     st.code("\n".join(missing), language="text")
     st.stop()
 
@@ -38,6 +53,18 @@ from decision_overlay import DECISION_OVERLAY_VERSION  # noqa: E402
 from v9_dashboard import V9_DASHBOARD_VERSION, render_dashboard_html, select_top_candidates  # noqa: E402
 from fast_scan_engine import FAST_SCAN_VERSION, run_fast_single_scan  # noqa: E402
 from fundamental_calibration import CALIBRATION_VERSION  # noqa: E402
+from resumable_app_engine import ENGINE_VERSION as RESUMABLE_ENGINE_VERSION  # noqa: E402
+
+runtime_versions = {
+    "app": APP_VERSION,
+    "fast": FAST_SCAN_VERSION,
+    "decision": SIMPLE_FOCUS_VERSION,
+    "resumable": RESUMABLE_ENGINE_VERSION,
+}
+if any(version != APP_VERSION for version in runtime_versions.values()):
+    st.error("Deployment memuat modul dari release yang berbeda; scan dihentikan agar hasil tidak inkonsisten.")
+    st.json(runtime_versions)
+    st.stop()
 
 st.markdown(
     """
@@ -92,11 +119,13 @@ def _runtime_tokens(itick_token: str = "", twelve_token: str = "") -> dict[str, 
     }
 
 
-st.title("IDX Super Scanner v9.8.11 — Evidence Lineage Integrity")
+st.title(f"IDX Super Scanner v{APP_RELEASE_NUMBER} — Runtime & Scoring Integrity")
 st.caption(
     f"{APP_VERSION} • fast {FAST_SCAN_VERSION} • macro {MACRO_ENGINE_VERSION} • "
     f"decision {SIMPLE_FOCUS_VERSION} • calibration {CALIBRATION_VERSION} • inventory {DECISION_OVERLAY_VERSION} • dashboard {V9_DASHBOARD_VERSION}"
 )
+if RUNTIME_RELOADED_MODULES:
+    st.caption("Runtime hot-reload diselaraskan ke satu release contract.")
 st.markdown(
     """
     <div class="v9-note">
