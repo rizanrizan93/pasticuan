@@ -77,6 +77,21 @@ DIRECT_FORWARD_SCORE_FIELDS = (
     "nar_forward_future_fundamental_impact_score",
 )
 
+# Research quality and decision priority are deliberately separate.  These
+# bounded penalties only affect which names deserve attention first; they never
+# rewrite the underlying business/future-fundamental thesis score.
+DECISION_PRIORITY_ANTI_CHASE_PENALTY = 3.0
+DECISION_PRIORITY_TECHNICAL_FLOOR = 50.0
+DECISION_PRIORITY_TECHNICAL_SLOPE = 0.08
+DECISION_PRIORITY_TECHNICAL_MAX_PENALTY = 4.0
+DECISION_PRIORITY_FLOW_FLOOR = 40.0
+DECISION_PRIORITY_FLOW_SLOPE = 0.06
+DECISION_PRIORITY_FLOW_MAX_PENALTY = 2.4
+DECISION_PRIORITY_DISTRIBUTION_FLOOR = 45.0
+DECISION_PRIORITY_DISTRIBUTION_SLOPE = 0.08
+DECISION_PRIORITY_DISTRIBUTION_MAX_PENALTY = 2.0
+DECISION_PRIORITY_DISTRIBUTION_BLOCK_PENALTY = 8.0
+
 
 def _ticker(value: Any) -> str:
     text = str(value or "").strip().upper()
@@ -554,6 +569,135 @@ def _weighted_final(components: Mapping[str, tuple[float, float]], weights: Mapp
     return _clip(raw_sum), _clip(coverage_sum)
 
 
+def _coverage_gap_profile(
+    components: Mapping[str, tuple[float, float]],
+    weights: Mapping[str, float],
+) -> dict[str, Any]:
+    """Explain fixed-denominator coverage without manufacturing evidence."""
+    gaps: list[tuple[str, float]] = []
+    for name, weight in weights.items():
+        component_score, component_coverage = components[name]
+        observed_coverage = (
+            float(np.clip(component_coverage, 0.0, 100.0))
+            if np.isfinite(component_score) and np.isfinite(component_coverage) and component_coverage > 0.0
+            else 0.0
+        )
+        gaps.append((name, float(weight) * (100.0 - observed_coverage)))
+    gaps.sort(key=lambda item: (-item[1], item[0]))
+    total_gap = sum(points for _, points in gaps)
+    material = [
+        f"{name.upper()}:{points:.1f}"
+        for name, points in gaps
+        if points >= 0.5
+    ]
+    return {
+        "coverage_gap_pct": round(total_gap, 1),
+        "coverage_primary_gap": material[0] if material else "NONE",
+        "coverage_recovery_priority": " | ".join(material[:3]),
+    }
+
+
+def _append_reason(existing: Any, reasons: Sequence[str]) -> str:
+    existing_text = (
+        "" if existing is None
+        or (isinstance(existing, (float, np.floating)) and np.isnan(existing))
+        else str(existing)
+    )
+    values = [part.strip() for part in existing_text.split("|") if part.strip()]
+    values.extend(reason for reason in reasons if reason)
+    return " | ".join(dict.fromkeys(values))
+
+
+def _apply_decision_priority_guardrail(frame: pd.DataFrame) -> pd.DataFrame:
+    """Downrank execution contradictions while preserving raw thesis scores.
+
+    Missing technical/flow confidence is UNKNOWN and receives no penalty.  A
+    penalty is only allowed when the corresponding evidence coverage is high
+    enough to support a negative conclusion.
+    """
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+
+    out = frame.copy()
+    out["raw_ranking_score"] = pd.to_numeric(out.get("ranking_score"), errors="coerce")
+    for index, row in out.iterrows():
+        raw_score = _finite(row.get("raw_ranking_score"), np.nan)
+        if not np.isfinite(raw_score):
+            continue
+
+        penalty = 0.0
+        distribution_penalty = 0.0
+        reasons: list[str] = []
+
+        methodology_pass = _truthy(row.get("methodology_gate_pass", True))
+        distribution_risk = _finite(row.get("distribution_risk_score"), np.nan)
+        if not methodology_pass or (np.isfinite(distribution_risk) and distribution_risk >= 68.0):
+            distribution_penalty = DECISION_PRIORITY_DISTRIBUTION_BLOCK_PENALTY
+            reasons.append("DISTRIBUTION_BLOCK")
+        elif np.isfinite(distribution_risk) and distribution_risk >= DECISION_PRIORITY_DISTRIBUTION_FLOOR:
+            distribution_penalty = min(
+                DECISION_PRIORITY_DISTRIBUTION_MAX_PENALTY,
+                (distribution_risk - DECISION_PRIORITY_DISTRIBUTION_FLOOR)
+                * DECISION_PRIORITY_DISTRIBUTION_SLOPE,
+            )
+            if distribution_penalty > 0.0:
+                reasons.append("ELEVATED_DISTRIBUTION_RISK")
+        penalty += distribution_penalty
+
+        if _truthy(row.get("anti_chase_gate")):
+            penalty += DECISION_PRIORITY_ANTI_CHASE_PENALTY
+            reasons.append("ANTI_CHASE_WAIT_REACCUMULATION")
+
+        technical_score = _finite(row.get("technical_readiness_score"), np.nan)
+        technical_coverage = _finite(row.get("technical_readiness_coverage_pct"), 0.0)
+        if technical_coverage >= 50.0 and np.isfinite(technical_score) and technical_score < DECISION_PRIORITY_TECHNICAL_FLOOR:
+            penalty += min(
+                DECISION_PRIORITY_TECHNICAL_MAX_PENALTY,
+                (DECISION_PRIORITY_TECHNICAL_FLOOR - technical_score)
+                * DECISION_PRIORITY_TECHNICAL_SLOPE,
+            )
+            reasons.append("WEAK_TECHNICAL_CONFIRMATION")
+
+        flow_score = _finite(row.get("silent_accumulation_score"), np.nan)
+        flow_confidence = _finite(row.get("silent_accumulation_confidence"), 0.0)
+        if flow_confidence >= 50.0 and np.isfinite(flow_score) and flow_score < DECISION_PRIORITY_FLOW_FLOOR:
+            penalty += min(
+                DECISION_PRIORITY_FLOW_MAX_PENALTY,
+                (DECISION_PRIORITY_FLOW_FLOOR - flow_score)
+                * DECISION_PRIORITY_FLOW_SLOPE,
+            )
+            reasons.append("WEAK_SMART_MONEY_CONFIRMATION")
+
+        penalty = round(float(penalty), 2)
+        guarded_score = max(0.0, min(100.0, raw_score - penalty))
+        out.at[index, "ranking_score"] = round(guarded_score, 1)
+        out.at[index, "ranking_guardrail_penalty_points"] = penalty
+        out.at[index, "ranking_guardrail_state"] = "DOWNRANKED" if penalty > 0.0 else "CLEAN"
+        out.at[index, "ranking_guardrail_reasons"] = " | ".join(reasons)
+        out.at[index, "distribution_penalty_points"] = round(distribution_penalty, 2)
+        out.at[index, "distribution_evidence_state"] = (
+            "DISTRIBUTION_BLOCK" if "DISTRIBUTION_BLOCK" in reasons
+            else "ELEVATED_DISTRIBUTION_RISK" if distribution_penalty > 0.0
+            else "NO_DISTRIBUTION_PENALTY"
+        )
+        if penalty > 0.0:
+            state = str(row.get("ranking_score_state") or "RANKING_SCORE")
+            out.at[index, "ranking_score_state"] = (
+                state if state.endswith("_GUARDED") else state + "_GUARDED"
+            )
+            out.at[index, "scoring_reason_codes"] = _append_reason(
+                row.get("scoring_reason_codes"), reasons,
+            )
+            out.at[index, "top_negative_drivers"] = _append_reason(
+                row.get("top_negative_drivers"), reasons,
+            )
+            out.at[index, "primary_risk"] = _append_reason(
+                row.get("primary_risk"),
+                [f"DECISION_PRIORITY_PENALTY:{penalty:.2f}", *reasons],
+            )
+    return out
+
+
 def _hard_block(row: Mapping[str, Any], cfg: ScanConfig | None = None) -> tuple[bool, str]:
     reasons: list[str] = []
     if _truthy(row.get("nar_narrative_hard_block")):
@@ -729,6 +873,7 @@ def build_next_leaders(universe: pd.DataFrame, config: ScanConfig | None = None)
             "narrative_flow": narrative_flow[:2],
             "technical_readiness": technical[:2],
         }
+        coverage_gap = _coverage_gap_profile(components, weights)
         research_score, coverage = _weighted_final(components, weights, min_coverage=35.0)
         final_score, coverage = _weighted_final(components, weights, min_coverage=NEXT_LEADER_MIN_COVERAGE_PCT)
         fundamental_guard = fundamental_conviction_profile(row)
@@ -820,6 +965,7 @@ def build_next_leaders(universe: pd.DataFrame, config: ScanConfig | None = None)
             "ranking_score": round(ranking_score, 1) if np.isfinite(ranking_score) else np.nan,
             "ranking_score_state": ranking_score_state,
             "score_coverage_pct": round(coverage, 1),
+            **coverage_gap,
             "production_gate_pass": bool(production_gate_pass),
             "production_gate_reason": production_gate_reason,
             "fundamental_freshness_state": _fundamental_freshness_state(row),
@@ -899,6 +1045,7 @@ def build_next_leaders(universe: pd.DataFrame, config: ScanConfig | None = None)
     if out.empty:
         return out
     out = apply_methodology_guardrails(out, model="NEXT_LEADER")
+    out = _apply_decision_priority_guardrail(out)
     out = apply_real_money_authorization(out, model="NEXT_LEADER", account_size_idr=_finite(getattr(cfg, "account_size_idr", np.nan), np.nan), requested_risk_budget_pct=100.0 * _finite(getattr(cfg, "risk_per_trade_pct", 0.005), 0.005))
     # Research, portfolio suitability and executable-order authorization are separate contracts.
     # Incomplete evidence may rank, but can never become production/order-ready
