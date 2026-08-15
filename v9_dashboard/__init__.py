@@ -15,6 +15,8 @@ from typing import Any
 
 import pandas as pd
 
+from release_contract import SCANNER_RELEASE_VERSION
+
 
 _IMPL_PATH = Path(__file__).resolve().parents[1] / "v9_dashboard.py"
 _SPEC = importlib.util.spec_from_file_location("_v9_dashboard_impl", _IMPL_PATH)
@@ -23,7 +25,8 @@ if _SPEC is None or _SPEC.loader is None:
 _IMPL = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_IMPL)
 
-V9_DASHBOARD_VERSION = "1.3.1-completeness-note-contract"
+V9_DASHBOARD_VERSION = "1.5.0-research-rank-integrity"
+SCANNER_VERSION = SCANNER_RELEASE_VERSION
 select_top_candidates = _IMPL.select_top_candidates
 recommendation_meta = _IMPL.recommendation_meta
 authorization_meta = _IMPL.authorization_meta
@@ -59,6 +62,7 @@ def render_dashboard_html(
 
 __all__ = [
     "V9_DASHBOARD_VERSION",
+    "SCANNER_VERSION",
     "select_top_candidates",
     "recommendation_meta",
     "authorization_meta",
