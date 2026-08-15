@@ -9,6 +9,8 @@ def test_stale_loaded_modules_are_reloaded_in_dependency_order(monkeypatch):
     database = types.SimpleNamespace(SCANNER_VERSION="old")
     official_guard = types.SimpleNamespace(SCANNER_VERSION="old")
     focus = types.SimpleNamespace(SIMPLE_FOCUS_VERSION="old")
+    dashboard_legacy = types.SimpleNamespace(SCANNER_VERSION="old")
+    dashboard = types.SimpleNamespace(SCANNER_VERSION="old")
     downstream = types.SimpleNamespace(ENGINE_VERSION="old")
     fast = types.SimpleNamespace(FAST_SCAN_VERSION="old")
     modules = {
@@ -17,6 +19,8 @@ def test_stale_loaded_modules_are_reloaded_in_dependency_order(monkeypatch):
         "scanner_database": database,
         "official_evidence_guard": official_guard,
         "simple_focus": focus,
+        "v9_dashboard_legacy": dashboard_legacy,
+        "v9_dashboard": dashboard,
         "resumable_app_engine": downstream,
         "fast_scan_engine": fast,
     }
@@ -42,11 +46,13 @@ def test_stale_loaded_modules_are_reloaded_in_dependency_order(monkeypatch):
             "scanner_database": "SCANNER_VERSION",
             "official_evidence_guard": "SCANNER_VERSION",
             "simple_focus": "SIMPLE_FOCUS_VERSION",
+            "v9_dashboard_legacy": "SCANNER_VERSION",
+            "v9_dashboard": "SCANNER_VERSION",
             "resumable_app_engine": "ENGINE_VERSION",
             "fast_scan_engine": "FAST_SCAN_VERSION",
         },
     )
 
-    assert expected.startswith("9.8.16-")
+    assert expected.startswith("9.8.17-")
     assert calls == list(modules)
     assert reloaded == tuple(calls)

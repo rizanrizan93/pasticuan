@@ -7,10 +7,13 @@ import numpy as np
 import pandas as pd
 import v9_dashboard_legacy as _legacy
 
+from release_contract import SCANNER_RELEASE_VERSION
+
 from v9_dashboard_legacy import *  # noqa: F401,F403
 
-V9_DASHBOARD_VERSION = "1.4.0-smart-money-cost-basis"
+V9_DASHBOARD_VERSION = "1.5.0-research-rank-integrity"
 SMART_MONEY_COST_BASIS_VERSION = "1.0.0"
+SCANNER_VERSION = SCANNER_RELEASE_VERSION
 
 
 def _num(value: Any, default: float = np.nan) -> float:
@@ -184,6 +187,6 @@ def render_dashboard_html(
 
 
 __all__ = list(getattr(_legacy, "__all__", []))
-for _name in ("V9_DASHBOARD_VERSION", "SMART_MONEY_COST_BASIS_VERSION", "select_top_candidates", "render_dashboard_html"):
+for _name in ("V9_DASHBOARD_VERSION", "SMART_MONEY_COST_BASIS_VERSION", "SCANNER_VERSION", "select_top_candidates", "render_dashboard_html"):
     if _name not in __all__:
         __all__.append(_name)

@@ -13,8 +13,10 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
+from release_contract import SCANNER_RELEASE_VERSION
 
-V9_DASHBOARD_VERSION = "1.3.0-actionability-gates"
+
+V9_DASHBOARD_VERSION = "1.5.0-research-rank-integrity"
 
 LEADER_FACTORS = {
     "Business": "business_quality_score",
@@ -38,6 +40,7 @@ SWING_FACTORS = {
 
 LEADER_STATUS_PRIORITY = {"BUY_ZONE": 0, "WATCH": 1, "WAIT": 2, "RESEARCH_ONLY": 4}
 SWING_STATUS_PRIORITY = {"EXECUTION_READY": 0, "ENTRY_PLAN_READY": 1, "WATCHLIST": 2, "WAIT": 3, "RESEARCH_ONLY": 5}
+SCANNER_VERSION = SCANNER_RELEASE_VERSION
 
 
 def _num(value: Any, default: float = np.nan) -> float:
@@ -135,10 +138,20 @@ def select_top_candidates(frame: pd.DataFrame, *, model: str, limit: int = 3, la
     local["_coverage"] = pd.to_numeric(coverage_source, errors="coerce")
     local["_accum"] = pd.to_numeric(accum_source, errors="coerce")
     local["_method_priority"] = pd.to_numeric(method_source, errors="coerce").fillna(7)
+    if lane_name == "RESEARCH":
+        # Research cards must reflect the guarded research ranking.  Status is
+        # an execution/production state and may not resurrect a lower-scored
+        # anti-chase candidate ahead of a stronger research thesis.
+        sort_columns = ["_score", "_method_priority", "_coverage", "_accum", "_status_priority", "ticker"]
+        ascending = [False, True, False, False, True, True]
+    else:
+        sort_columns = ["_status_priority", "_score", "_method_priority", "_coverage", "_accum", "ticker"]
+        ascending = [True, False, True, False, False, True]
     local = local.sort_values(
-        ["_status_priority", "_score", "_method_priority", "_coverage", "_accum", "ticker"],
-        ascending=[True, False, True, False, False, True], na_position="last", kind="stable",
-    ).head(max(0, int(limit))).drop(columns=["_status_priority", "_score", "_coverage", "_accum", "_method_priority"])
+        sort_columns, ascending=ascending, na_position="last", kind="stable",
+    ).head(max(0, int(limit))).drop(
+        columns=["_status_priority", "_score", "_coverage", "_accum", "_method_priority"],
+    )
     local = local.reset_index(drop=True)
     local.insert(0, "dashboard_rank", np.arange(1, len(local) + 1))
     return local
@@ -428,6 +441,7 @@ def render_dashboard_html(
 
 __all__ = [
     "V9_DASHBOARD_VERSION",
+    "SCANNER_VERSION",
     "select_top_candidates",
     "recommendation_meta",
     "authorization_meta",
