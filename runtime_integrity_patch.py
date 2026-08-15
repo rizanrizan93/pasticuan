@@ -1,14 +1,6 @@
 from __future__ import annotations
 
-"""Hot-reload-safe production integrity hooks for Super Scanner.
-
-Besides ranking/provider guards this module makes Future Fundamental acquisition
-an actual scan-time activity: strict governed evidence is read first, stale or
-missing tickers receive a bounded live forward search, collection results are
-persisted immediately to ``forward_quality_cache``, and final scan persistence
-keeps that cache durable. Research discovery never upgrades itself to official
-production quorum.
-"""
+"""Hot-reload-safe production integrity hooks for Super Scanner."""
 
 from functools import wraps
 from typing import Any, Iterable
@@ -22,7 +14,7 @@ from evidence_governance import apply_three_rank_contract
 from official_evidence_bridge import combine_project_management, corporate_events_to_narrative
 from live_forward_evidence import collect_live_forward_evidence, collection_coverage
 
-PATCH_VERSION = "1.2.0-live-forward"
+PATCH_VERSION = "1.2.1-live-forward"
 _NEGATIVE_RESULTS: dict[tuple[str, str], tuple[float, Any, BaseException | None]] = {}
 _GOVERNED_EVIDENCE_CACHE: dict[tuple[int, tuple[str, ...]], tuple[float, dict[str, pd.DataFrame], pd.DataFrame]] = {}
 _PROVIDER_TTLS = {
@@ -110,7 +102,6 @@ def _wrap_negative_cache(owner: Any, name: str) -> None:
         return result
 
     wrapped.__provider_negative_cache_v1__ = True
-    wrapped.__provider_negative_cache_original__ = original
     setattr(owner, name, wrapped)
 
 
@@ -205,21 +196,12 @@ def _persist_live_forward(bridge: Any, frame: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         report = bridge.persist_scan_result(
-            {
-                "mode": "live_forward_evidence_refresh",
-                "scanner_version": getattr(bridge, "scanner_version", ""),
-                "as_of": pd.Timestamp.now(tz="UTC"),
-                "project_management_review": frame,
-            },
+            {"mode": "live_forward_evidence_refresh", "scanner_version": getattr(bridge, "scanner_version", ""), "as_of": pd.Timestamp.now(tz="UTC"), "project_management_review": frame},
             tables=("forward_quality_cache",),
         )
         return report if isinstance(report, pd.DataFrame) else pd.DataFrame()
     except Exception as exc:
-        return pd.DataFrame([{
-            "provider": "LIVE_FORWARD_EVIDENCE_PERSIST",
-            "state": "FAIL_SOFT",
-            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
-        }])
+        return pd.DataFrame([{"provider": "LIVE_FORWARD_EVIDENCE_PERSIST", "state": "FAIL_SOFT", "error": f"{type(exc).__name__}: {str(exc)[:240]}"}])
 
 
 def _wrap_forward_quality_reader(database_cls: Any) -> None:
@@ -232,13 +214,8 @@ def _wrap_forward_quality_reader(database_cls: Any) -> None:
         names = list(dict.fromkeys(_ticker(value) for value in tickers if _ticker(value)))
         cached_forward, cache_audit = original(self, names)
         governed, governed_audit = _read_governed_evidence(self, names)
-        combined = combine_project_management(
-            cached_forward,
-            governed.get("project_events"),
-            governed.get("management_roles"),
-            governed.get("ownership_events"),
-            governed.get("corporate_events"),
-        )
+        combined = combine_project_management(cached_forward, governed.get("project_events"), governed.get("management_roles"), governed.get("ownership_events"), governed.get("corporate_events"))
+        bridge_rows = sum(len(frame) for frame in governed.values() if isinstance(frame, pd.DataFrame))
 
         recent = _recent_collection_tickers(cached_forward)
         missing = [ticker for ticker in names if ticker not in recent]
@@ -252,15 +229,16 @@ def _wrap_forward_quality_reader(database_cls: Any) -> None:
 
         audits = [frame for frame in (cache_audit, governed_audit, persist_report) if isinstance(frame, pd.DataFrame) and not frame.empty]
         audit = pd.concat(audits, ignore_index=True, sort=False) if audits else pd.DataFrame()
+        if bridge_rows:
+            audit = pd.concat([audit, pd.DataFrame([{
+                "provider": "OFFICIAL_EVIDENCE_BRIDGE", "scope": "PROJECT_MANAGEMENT_OWNERSHIP_CAPITAL", "status": "BRIDGED", "rows": bridge_rows,
+                "detail": "Strict governed raw facts converted to scanner-consumable evidence without relaxing production quorum.",
+            }])], ignore_index=True, sort=False)
         cov = collection_coverage(combined, names)
         audit = pd.concat([audit, pd.DataFrame([{
-            "provider": "LIVE_FORWARD_EVIDENCE",
-            "scope": "FULL_SCAN_UNIVERSE",
+            "provider": "LIVE_FORWARD_EVIDENCE", "scope": "FULL_SCAN_UNIVERSE",
             "status": "COLLECTED_AND_PERSISTED" if not missing or not live.empty else "COLLECTION_UNAVAILABLE",
-            "rows": len(combined),
-            "requested_tickers": len(names),
-            "refresh_tickers": len(missing),
-            "collection_coverage_pct": cov["coverage_pct"],
+            "rows": len(combined), "requested_tickers": len(names), "refresh_tickers": len(missing), "collection_coverage_pct": cov["coverage_pct"],
             "detail": "Research collection coverage is separate from strict official scoring coverage.",
         }])], ignore_index=True, sort=False)
         return combined.reset_index(drop=True), audit
