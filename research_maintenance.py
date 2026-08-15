@@ -26,14 +26,14 @@ import pandas as pd
 RESEARCH_MAINTENANCE_VERSION = "9.6.0-quality-integrity"
 RESEARCH_OUTCOME_SCHEMA_VERSION = "research_outcomes_v1.2"
 
-MODEL_RELEASED_AT = "2026-08-09T00:00:00+00:00"
+MODEL_RELEASED_AT = "2026-08-15T00:00:00+00:00"
 
 MODEL_VERSIONS: dict[str, str] = {
     "scanner": "9.6.0",
     "ranking": "9.6.0",
     "production_scoring": "9.6.0",
     "fundamental": "7.6.0",
-    "fundamental_parser": "1.2.0",
+    "fundamental_parser": "1.3.0",
     "eoff": "0.0.0-removed-from-production",
     "time_cycle": "0.0.0-removed-from-production",
     "silent_accumulation": "5.0.0",

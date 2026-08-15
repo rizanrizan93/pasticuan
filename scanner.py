@@ -4945,12 +4945,33 @@ _FUNDAMENTAL_VALUE_ALIASES: dict[str, tuple[str, ...]] = {
     'operating_cash_flow': (
         'operatingcashflow', 'cashflowfromoperations',
         'cashflowsfromusedinoperatingactivities', 'netcashflowsfromusedinoperatingactivities',
+        'netcashflowsreceivedfromusedinoperatingactivities',
+        'netcashflowsprovidedbyusedinoperatingactivities',
         'ocf', 'aruskasoperasi',
     ),
     'capex': (
         'capex', 'capitalexpenditure', 'capitalexpenditures',
         'paymentstoacquirepropertyplantandequipment',
         'acquisitionofpropertyplantandequipment', 'purchaseoffixedassets',
+        # IDX Taxonomy 2020 uses both ``PropertyPlantAndEquipment`` and
+        # ``PropertyAndEquipment`` depending on the issuer entry point.  The
+        # latter is common in infrastructure/securities filings and was
+        # previously missed even though the official fact was present.
+        'paymentsforacquisitionofpropertyplantandequipment',
+        'paymentsforacquisitionofpropertyandequipment',
+        'paymentsforadvancesforpurchaseofpropertyplantandequipment',
+        'paymentsforadvancesforpurchaseofpropertyandequipment',
+        'paymentsforacquisitionofintangibleassets',
+        'paymentsforacquisitionofoilandgasassets',
+        'paymentsforacquisitionofminingproperties',
+        'paymentsforacquisitionofinvestmentproperties',
+        'paymentsforacquisitionofexplorationandevaluationassets',
+        'paymentsforacquisitionofindustrialtimberplantations',
+        'paymentsforacquisitionofplantationassets',
+        'paymentsforacquisitionofplasmaplantations',
+        'paymentsforacquisitionoflivestockproduction',
+        'paymentsforacquisitionoftollroadconcessionrights',
+        'paymentsforacquisitionofothernonfinancialassets',
         'belanjamodal',
     ),
     'total_assets': ('totalassets', 'assets', 'totalaset', 'aset'),
@@ -5924,6 +5945,7 @@ def parse_idx_xbrl_attachment(
     source_url: str,
     filename: str='',
     max_uncompressed_bytes: int=60_000_000,
+    defer_ytd_conversion: bool=False,
 ) -> pd.DataFrame:
     """Extract a conservative canonical row from an official XBRL/iXBRL file.
 
@@ -6026,7 +6048,7 @@ def parse_idx_xbrl_attachment(
     selected: dict[str, float] = {}
     selected_units: list[str] = []
     for canonical, aliases in _FUNDAMENTAL_VALUE_ALIASES.items():
-        candidates: list[tuple[float, float, str]] = []
+        candidates: list[tuple[float, float, str, str]] = []
         for fact in facts:
             concept_score = _xbrl_concept_score(fact['concept'], (canonical, *aliases))
             if concept_score <= 0:
@@ -6056,9 +6078,34 @@ def parse_idx_xbrl_attachment(
                     score -= 20
             elif pd.notna(context.get('instant', pd.NaT)):
                 score += 12
-            candidates.append((score, float(fact['value']), _safe_text(fact.get('unit'))))
+            candidates.append((
+                score, float(fact['value']), _safe_text(fact.get('unit')),
+                _safe_text(fact.get('concept')),
+            ))
         if candidates:
-            _, value, unit = max(candidates, key=lambda item: item[0])
+            if canonical == 'capex':
+                # IDX filings can expose several distinct productive-asset cash
+                # outflows.  Selecting one best tag understated capex whenever,
+                # for example, PPE and intangible purchases were both present.
+                # Sum one best current-period fact per official payment concept;
+                # generic aggregate ``Capex`` aliases remain a single fallback
+                # so aggregate and component facts are never double-counted.
+                payment_candidates: dict[str, tuple[float, float, str, str]] = {}
+                for candidate in candidates:
+                    concept_key = _fundamental_column_key(candidate[3])
+                    if not (
+                        concept_key.startswith('paymentsforacquisitionof')
+                        or concept_key.startswith('paymentsforadvancesforpurchaseof')
+                    ):
+                        continue
+                    current = payment_candidates.get(concept_key)
+                    if current is None or candidate[0] > current[0]:
+                        payment_candidates[concept_key] = candidate
+                if payment_candidates:
+                    selected[canonical] = float(sum(abs(item[1]) for item in payment_candidates.values()))
+                    selected_units.extend(item[2] for item in payment_candidates.values() if item[2])
+                    continue
+            _, value, unit, _ = max(candidates, key=lambda item: item[0])
             selected[canonical] = value
             if unit:
                 selected_units.append(unit)
@@ -6077,7 +6124,17 @@ def parse_idx_xbrl_attachment(
         'source_verified': True, 'validation_flags': '',
         **selected,
     }
-    return normalize_fundamental_history(pd.DataFrame([row]))
+    raw = pd.DataFrame([row])
+    if defer_ytd_conversion:
+        # A single Q2/Q3 attachment contains a cumulative YTD fact.  Converting
+        # it here loses the value when Q1/Q2 has not yet been assembled.  The
+        # fetcher requests all periods concurrently and normalises only after
+        # combining them, so preserve the raw canonical row on that path.
+        for column in FUNDAMENTAL_HISTORY_COLUMNS:
+            if column not in raw:
+                raw[column] = False if column == 'source_verified' else np.nan
+        return raw[list(FUNDAMENTAL_HISTORY_COLUMNS)].reset_index(drop=True)
+    return normalize_fundamental_history(raw)
 
 
 def fetch_idx_fundamental_history(
@@ -6160,6 +6217,7 @@ def fetch_idx_fundamental_history(
                 content, ticker=ticker, period_end=record.get('period_end'),
                 period_type=_safe_text(record.get('period_type')),
                 source_url=final_url, filename=_safe_text(record.get('filename')),
+                defer_ytd_conversion=True,
             )
             if frame.empty:
                 raise RuntimeError('tidak ada fact canonical yang lolos context validation')
@@ -6876,6 +6934,25 @@ def _history_business_score(row: Mapping[str, Any], is_financial: bool=False) ->
     return (round(float(score), 1) if np.isfinite(score) else np.nan, round(coverage, 1), ' • '.join(flags))
 
 
+def _stable_unique_delimited(values: Iterable[object], split_pattern: str) -> list[str]:
+    """Flatten and de-duplicate already-composed cache labels in stable order.
+
+    Fundamental cache rows are re-enriched on every scan. Treating the prior
+    composed string as one new value recursively appended the same provider and
+    red-flag labels even though the underlying evidence had not changed.
+    """
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for token in re.split(split_pattern, _safe_text(value)):
+            cleaned = token.strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            unique.append(cleaned)
+    return unique
+
+
 def enrich_fundamentals_with_history(fundamentals: pd.DataFrame, history: pd.DataFrame, now: Any | None=None) -> pd.DataFrame:
     """Merge snapshot and historical evidence without rewarding missing data."""
     base = fundamentals.copy() if fundamentals is not None else pd.DataFrame()
@@ -7012,7 +7089,10 @@ def enrich_fundamentals_with_history(fundamentals: pd.DataFrame, history: pd.Dat
             if pd.notna(current) and pd.notna(latest_statement)
             else np.nan
         )
-        red_flags = [part for part in (_safe_text(row.get('fundamental_red_flags')), history_flags) if part]
+        red_flags = _stable_unique_delimited(
+            (_safe_text(row.get('fundamental_red_flags')), history_flags),
+            r'\s*•\s*',
+        )
         if conflicts:
             red_flags.append('Konflik data historis')
         overrides = {
@@ -7038,8 +7118,11 @@ def enrich_fundamentals_with_history(fundamentals: pd.DataFrame, history: pd.Dat
         out.at[index, 'latest_statement_date'] = latest_statement
         out.at[index, 'statement_age_days'] = age
         out.at[index, 'fundamental_score_model'] = 'MULTI_SOURCE_HISTORY_V1'
-        providers = [_safe_text(row.get('fundamental_provider')), _safe_text(row.get('fundamental_source_families'))]
-        out.at[index, 'fundamental_provider'] = ' + '.join(dict.fromkeys(value for value in providers if value))
+        providers = _stable_unique_delimited(
+            (_safe_text(row.get('fundamental_provider')), _safe_text(row.get('fundamental_source_families'))),
+            r'\s+\+\s+',
+        )
+        out.at[index, 'fundamental_provider'] = ' + '.join(providers)
     return out
 
 
