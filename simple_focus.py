@@ -357,6 +357,14 @@ def _management_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
             np.clip(evidence_coverage, 0.0, 100.0) / 100.0
             if np.isfinite(evidence_coverage) else 0.0
         )
+    # "No dilution" alone is useful capital-structure evidence, but it cannot
+    # establish management quality.  Require either sourced issuer-action
+    # alignment or at least two independent management/capital observations.
+    direct_alignment = "nar_issuer_action_alignment_effective_score" in evidence
+    if not direct_alignment and len(evidence) < 2:
+        return np.nan, 0.0, "MANAGEMENT_EVIDENCE_INSUFFICIENT"
+    if coverage <= 0.0:
+        return np.nan, 0.0, "MANAGEMENT_COVERAGE_MISSING"
     return score, coverage, " | ".join(evidence)
 
 
@@ -534,14 +542,16 @@ def _weighted_final(components: Mapping[str, tuple[float, float]], weights: Mapp
     for name, weight in weights.items():
         score, coverage = components[name]
         observed = np.isfinite(score) and coverage > 0
-        effective = score if observed else 50.0
+        reliability = np.clip(coverage, 0.0, 100.0) / 100.0 if observed else 0.0
+        # Shrink each evidence family independently.  Applying one aggregate
+        # shrink after mixing scores let a 15%-covered Management=100 influence
+        # ranking as strongly as a fully covered component.
+        effective = 50.0 + reliability * (score - 50.0) if observed else 50.0
         raw_sum += weight * effective
-        coverage_sum += weight * (coverage if observed else 0.0)
+        coverage_sum += weight * (100.0 * reliability)
     if coverage_sum < min_coverage:
         return np.nan, coverage_sum
-    # Coverage shrinkage is internal only. Component display remains NaN when missing.
-    final = 50.0 + coverage_sum / 100.0 * (raw_sum - 50.0)
-    return _clip(final), _clip(coverage_sum)
+    return _clip(raw_sum), _clip(coverage_sum)
 
 
 def _hard_block(row: Mapping[str, Any], cfg: ScanConfig | None = None) -> tuple[bool, str]:

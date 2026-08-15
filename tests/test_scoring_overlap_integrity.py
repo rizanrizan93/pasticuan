@@ -2,7 +2,12 @@ import numpy as np
 import pandas as pd
 
 from narrative_engine import _verified_forward_profile
-from simple_focus import _business_component, _future_component, _management_component
+from simple_focus import (
+    _business_component,
+    _future_component,
+    _management_component,
+    _weighted_final,
+)
 
 
 def _realised_row(revenue_growth: float, earnings_growth: float) -> dict[str, float]:
@@ -74,3 +79,24 @@ def test_realised_growth_does_not_move_management_capital_pillar():
     strong = {**direct, **_realised_row(0.35, 0.50)}
 
     assert _management_component(strong)[:2] == _management_component(weak)[:2]
+
+
+def test_no_dilution_alone_cannot_claim_perfect_management_quality():
+    score, coverage, state = _management_component({
+        "fund_history_share_dilution_yoy": 0.0,
+    })
+
+    assert np.isnan(score)
+    assert coverage == 0.0
+    assert state == "MANAGEMENT_EVIDENCE_INSUFFICIENT"
+
+
+def test_weighted_final_shrinks_each_component_by_its_own_coverage():
+    score, coverage = _weighted_final(
+        {"thin": (100.0, 10.0), "complete": (50.0, 100.0)},
+        {"thin": 0.5, "complete": 0.5},
+        min_coverage=50.0,
+    )
+
+    assert score == 52.5
+    assert coverage == 55.0

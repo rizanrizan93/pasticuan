@@ -28,6 +28,6 @@ def test_stale_loaded_modules_are_reloaded_in_dependency_order(monkeypatch):
         },
     )
 
-    assert expected.startswith("9.8.12-")
+    assert expected.startswith("9.8.13-")
     assert calls == ["simple_focus", "resumable_app_engine"]
     assert reloaded == tuple(calls)
