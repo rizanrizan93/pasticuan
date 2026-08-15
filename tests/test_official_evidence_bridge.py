@@ -101,4 +101,4 @@ def test_strict_capital_action_enters_narrative_alignment_contract():
     assert len(events) == 1
     assert events.iloc[0]["event_type"] == "DIVIDEND_OR_CAPITAL_RETURN"
     assert int(events.iloc[0]["impact_sign"]) == 1
-    assert events.iloc[0]["official_verified"] is True
+    assert bool(events.iloc[0]["official_verified"]) is True
