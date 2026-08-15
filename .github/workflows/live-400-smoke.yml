@@ -7,9 +7,12 @@ on:
       - '.github/workflows/live-400-smoke.yml'
       - 'tools/live_scan_400_smoke.py'
       - 'tools/idx_400_production_universe_2026-07.txt'
+      - 'live_forward_evidence.py'
+      - 'live_forward_runtime_patch.py'
       - 'evidence_governance.py'
       - 'official_evidence_bridge.py'
       - 'runtime_integrity_patch.py'
+      - 'runtime_release.py'
       - 'fast_scan_engine.py'
       - 'scanner.py'
       - 'simple_focus.py'
@@ -23,9 +26,12 @@ on:
       - '.github/workflows/live-400-smoke.yml'
       - 'tools/live_scan_400_smoke.py'
       - 'tools/idx_400_production_universe_2026-07.txt'
+      - 'live_forward_evidence.py'
+      - 'live_forward_runtime_patch.py'
       - 'evidence_governance.py'
       - 'official_evidence_bridge.py'
       - 'runtime_integrity_patch.py'
+      - 'runtime_release.py'
       - 'fast_scan_engine.py'
       - 'scanner.py'
       - 'simple_focus.py'
@@ -41,7 +47,7 @@ permissions:
 env:
   PYTHONPATH: ${{ github.workspace }}
   SCANNER_DATABASE_ENABLED: '0'
-  SMOKE_RELEASE: 'v9.8.19-official-evidence-consumption'
+  SMOKE_RELEASE: 'v9.8.20-live-forward-evidence'
 
 jobs:
   cold-scan:
@@ -58,6 +64,31 @@ jobs:
           pip install pytest
       - name: Run full offline regression suite
         run: pytest -q
+      - name: Live Future Fundamental network acquisition
+        run: |
+          python - <<'PY'
+          from live_forward_evidence import collect_live_forward_evidence, collection_coverage
+          names = ['MARK.JK','OMED.JK','TSPC.JK','MAHA.JK','ELSA.JK','TOTL.JK','DGWG.JK','AYAM.JK']
+          companies = {
+              'MARK.JK':'MARK DYNAMICS INDONESIA Tbk, PT',
+              'OMED.JK':'JAYAMAS MEDICA INDUSTRI Tbk, PT',
+              'TSPC.JK':'Tempo Scan Pacific Tbk, PT',
+              'MAHA.JK':'MANDIRI HERINDO ADIPERKASA Tbk, PT',
+              'ELSA.JK':'Elnusa Tbk, PT',
+              'TOTL.JK':'Total Bangun Persada Tbk, PT',
+              'DGWG.JK':'DELTA GIRI WACANA Tbk, PT',
+              'AYAM.JK':'JANU PUTRA SEJAHTERA Tbk, PT',
+          }
+          frame = collect_live_forward_evidence(names, company_names=companies, lookback_days=180, max_workers=8, timeout=6.0)
+          report = collection_coverage(frame, names)
+          material = frame.loc[frame.get('forward_collection_state','').eq('MATERIAL_FORWARD_RESEARCH_EVIDENCE_FOUND')]
+          print(frame[['ticker','company_name','forward_collection_state','forward_collection_coverage_pct']].to_string(index=False))
+          print('LIVE_FORWARD_REPORT', report, 'MATERIAL_EVENTS', len(material), 'MATERIAL_TICKERS', material['ticker'].nunique() if len(material) else 0)
+          if report['coverage_pct'] < 90.0:
+              raise SystemExit(f"live forward collection coverage too low: {report}")
+          if material.empty:
+              raise SystemExit('live forward acquisition returned no material evidence for known-evidence test issuers')
+          PY
       - name: Run canonical 400-name cold production engine
         run: python tools/live_scan_400_smoke.py | tee /tmp/live-scan.log
       - name: Upload scanner outputs
