@@ -5,16 +5,30 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/live-400-smoke.yml'
+      - 'tools/live_scan_400_smoke.py'
+      - 'tools/idx_400_production_universe_2026-07.txt'
+      - 'evidence_governance.py'
       - 'fast_scan_engine.py'
       - 'scanner.py'
       - 'simple_focus.py'
       - 'release_contract.py'
       - 'resumable_app_engine.py'
       - 'scanner_database.py'
-      - 'tests/test_v9_8_10_persistence_contract.py'
-      - 'tests/test_narrative_coverage_precedence.py'
-      - 'tests/test_ksei_valuation_provenance_alias.py'
-      - 'tests/test_silent_confidence_output_contract.py'
+      - 'tests/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/live-400-smoke.yml'
+      - 'tools/live_scan_400_smoke.py'
+      - 'tools/idx_400_production_universe_2026-07.txt'
+      - 'evidence_governance.py'
+      - 'fast_scan_engine.py'
+      - 'scanner.py'
+      - 'simple_focus.py'
+      - 'release_contract.py'
+      - 'resumable_app_engine.py'
+      - 'scanner_database.py'
+      - 'tests/**'
   workflow_dispatch:
 
 permissions:
@@ -23,7 +37,7 @@ permissions:
 env:
   PYTHONPATH: ${{ github.workspace }}
   SCANNER_DATABASE_ENABLED: '0'
-  SMOKE_RELEASE: 'v9.8.13-component-coverage-integrity'
+  SMOKE_RELEASE: 'v9.8.18-evidence-oos-runtime'
 
 jobs:
   cold-scan:
@@ -40,7 +54,7 @@ jobs:
           pip install pytest
       - name: Run full offline regression suite
         run: pytest -q
-      - name: Run 400-name cold production engine
+      - name: Run canonical 400-name cold production engine
         run: python tools/live_scan_400_smoke.py | tee /tmp/live-scan.log
       - name: Upload scanner outputs
         if: always()
