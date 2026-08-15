@@ -13,12 +13,20 @@ from runtime_release import refresh_release_runtime
 
 SCANNER_RELEASE_VERSION, RUNTIME_RELOADED_MODULES = refresh_release_runtime(
     reload_order=(
+        "research_maintenance",
         "narrative_engine",
+        "scanner",
+        "scanner_database",
+        "official_evidence_guard",
         "simple_focus",
         "resumable_app_engine",
         "fast_scan_engine",
     ),
     version_markers={
+        "research_maintenance": "SCANNER_VERSION",
+        "scanner": "SCANNER_VERSION",
+        "scanner_database": "SCANNER_VERSION",
+        "official_evidence_guard": "SCANNER_VERSION",
         "simple_focus": "SIMPLE_FOCUS_VERSION",
         "resumable_app_engine": "ENGINE_VERSION",
         "fast_scan_engine": "FAST_SCAN_VERSION",
@@ -38,6 +46,7 @@ REQUIRED_FILES = (
     "simple_focus.py", "free_data_providers.py", "ihsg_direction.py",
     "decision_overlay.py", "real_money_guard.py", "fundamental_calibration.py", "v9_dashboard.py",
     "resumable_app_engine.py", "fast_scan_engine.py", "evidence_enrichment.py",
+    "official_evidence_guard.py",
     "release_contract.py", "runtime_release.py",
 )
 missing = [name for name in REQUIRED_FILES if not (APP_ROOT / name).is_file()]
@@ -46,7 +55,10 @@ if missing:
     st.code("\n".join(missing), language="text")
     st.stop()
 
-from scanner import parse_portfolio_csv, parse_universe_csv  # noqa: E402
+from scanner import SCANNER_VERSION as CORE_SCANNER_VERSION, parse_portfolio_csv, parse_universe_csv  # noqa: E402
+from scanner_database import SCANNER_VERSION as DATABASE_SCANNER_VERSION  # noqa: E402
+from official_evidence_guard import SCANNER_VERSION as OFFICIAL_GUARD_SCANNER_VERSION  # noqa: E402
+from research_maintenance import SCANNER_VERSION as RESEARCH_SCANNER_VERSION  # noqa: E402
 from macro_engine import MACRO_ENGINE_VERSION  # noqa: E402
 from simple_focus import SIMPLE_FOCUS_VERSION  # noqa: E402
 from decision_overlay import DECISION_OVERLAY_VERSION  # noqa: E402
@@ -57,6 +69,10 @@ from resumable_app_engine import ENGINE_VERSION as RESUMABLE_ENGINE_VERSION  # n
 
 runtime_versions = {
     "app": APP_VERSION,
+    "core": CORE_SCANNER_VERSION,
+    "database": DATABASE_SCANNER_VERSION,
+    "official_guard": OFFICIAL_GUARD_SCANNER_VERSION,
+    "research": RESEARCH_SCANNER_VERSION,
     "fast": FAST_SCAN_VERSION,
     "decision": SIMPLE_FOCUS_VERSION,
     "resumable": RESUMABLE_ENGINE_VERSION,

@@ -13,7 +13,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from release_contract import SCANNER_RELEASE_VERSION
+
 OFFICIAL_EVIDENCE_GUARD_VERSION = "1.0.0-official-first"
+SCANNER_VERSION = SCANNER_RELEASE_VERSION
 
 
 def _present(series: pd.Series) -> pd.Series:
@@ -105,4 +108,8 @@ def canonicalize_official_fundamental_evidence(frame: pd.DataFrame | None) -> pd
     return out
 
 
-__all__ = ["OFFICIAL_EVIDENCE_GUARD_VERSION", "canonicalize_official_fundamental_evidence"]
+__all__ = [
+    "OFFICIAL_EVIDENCE_GUARD_VERSION",
+    "SCANNER_VERSION",
+    "canonicalize_official_fundamental_evidence",
+]

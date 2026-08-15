@@ -23,6 +23,7 @@ warnings.filterwarnings(
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 from research_maintenance import calibrate_silent_accumulation
+from release_contract import SCANNER_RELEASE_VERSION
 from idx_trading_calendar import (
     CALENDAR_VERSION as IDX_CALENDAR_VERSION,
     filter_known_nontrading_dates, previous_idx_session, idx_session_lag, sanitize_idx_histories,
@@ -36,6 +37,7 @@ from incremental_store import (
 )
 
 CORE_PIPELINE_CACHE_VERSION = '9.6.0-quality-integrity'
+SCANNER_VERSION = SCANNER_RELEASE_VERSION
 
 @dataclass
 class MarketContext:

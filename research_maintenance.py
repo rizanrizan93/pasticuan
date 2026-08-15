@@ -23,8 +23,11 @@ import re
 import numpy as np
 import pandas as pd
 
+from release_contract import SCANNER_RELEASE_VERSION
+
 RESEARCH_MAINTENANCE_VERSION = "9.6.0-quality-integrity"
 RESEARCH_OUTCOME_SCHEMA_VERSION = "research_outcomes_v1.2"
+SCANNER_VERSION = SCANNER_RELEASE_VERSION
 
 MODEL_RELEASED_AT = "2026-08-15T00:00:00+00:00"
 
@@ -698,7 +701,7 @@ def research_outcome_summary(outcomes: pd.DataFrame | None) -> pd.DataFrame:
 
 
 __all__ = [
-    "RESEARCH_MAINTENANCE_VERSION", "RESEARCH_OUTCOME_SCHEMA_VERSION", "MODEL_VERSIONS",
+    "RESEARCH_MAINTENANCE_VERSION", "RESEARCH_OUTCOME_SCHEMA_VERSION", "SCANNER_VERSION", "MODEL_VERSIONS",
     "parse_semver", "semantic_refresh_reason", "model_registry_frame", "liquidity_bucket",
     "SilentAccumulationCalibration", "calibrate_silent_accumulation", "stable_cohort", "active_cohort",
     "select_round_robin_backfill", "adjust_to_idx_trading_day", "update_research_outcomes",
