@@ -9,6 +9,11 @@ from official_evidence_bridge import (
     bridge_project_events,
     corporate_events_to_narrative,
 )
+from runtime_integrity_patch import (
+    _GOVERNED_EVIDENCE_CACHE,
+    _wrap_forward_quality_reader,
+    _wrap_narrative_event_reader,
+)
 
 
 def _project(**updates):
@@ -101,4 +106,70 @@ def test_strict_capital_action_enters_narrative_alignment_contract():
     assert len(events) == 1
     assert events.iloc[0]["event_type"] == "DIVIDEND_OR_CAPITAL_RETURN"
     assert int(events.iloc[0]["impact_sign"]) == 1
+    assert bool(events.iloc[0]["official_verified"]) is True
+
+
+class _FakeSettings:
+    mode = "SUPABASE_REST"
+
+
+class _FakeBridge:
+    settings = _FakeSettings()
+
+    def read_forward_quality_cache(self, tickers):
+        return pd.DataFrame(), pd.DataFrame([{
+            "ticker": "AAA.JK", "provider": "FORWARD_QUALITY_CACHE", "database_read_state": "DATABASE_MISSING",
+        }])
+
+    def read_narrative_events(self, tickers, *, limit=10000):
+        return pd.DataFrame()
+
+    def _get_rows(self, table, params):
+        tables = {
+            "project_events": [_project()],
+            "management_roles": [{
+                "ticker": "AAA.JK", "person_name": "Director A", "role": "PRESIDENT_DIRECTOR",
+                "updated_at": "2026-08-10T00:00:00Z", "source_url": "https://issuer.example/board",
+                "verified": True, "source_quorum_verified": True, "source_quorum_count": 2,
+                "entity_match_verified": True,
+            }],
+            "ownership_events": [{
+                "ticker": "AAA.JK", "holder_name": "Director A", "holder_type": "INSIDER",
+                "ownership_pct_after": 4.0, "report_date": "2026-07-31",
+                "source_url": "https://issuer.example/ownership.pdf", "verified": True,
+                "source_quorum_verified": True, "source_quorum_count": 2,
+                "entity_match_verified": True,
+            }],
+            "corporate_events": [{
+                "ticker": "AAA.JK", "event_type": "CASH_DIVIDEND", "event_date": "2026-07-01",
+                "published_at": "2026-07-01T00:00:00Z", "materiality": 70,
+                "source_url": "https://issuer.example/dividend.pdf", "verified": True,
+                "source_quorum_verified": True, "source_quorum_count": 2,
+                "entity_match_verified": True, "source_family": "ISSUER|KSEI",
+                "metadata": {"title": "Cash dividend 2026"},
+            }],
+        }
+        return tables.get(table, [])
+
+
+def test_runtime_reader_consumes_raw_governed_tables_end_to_end():
+    _GOVERNED_EVIDENCE_CACHE.clear()
+    bridge_cls = type("RuntimeBridge", (_FakeBridge,), {})
+    _wrap_forward_quality_reader(bridge_cls)
+    _wrap_narrative_event_reader(bridge_cls)
+    bridge = bridge_cls()
+
+    forward, audit = bridge.read_forward_quality_cache(["AAA.JK"])
+    project = forward.loc[forward.get("project_name", pd.Series(index=forward.index, dtype=object)).notna()]
+    assert len(project) == 1
+    assert np.isfinite(pd.to_numeric(project.iloc[0]["project_pipeline_score_observed"], errors="coerce"))
+    assert bool(project.iloc[0]["project_source_quorum_verified"]) is True
+    management = forward.loc[forward.get("management_evidence_state", pd.Series(index=forward.index, dtype=object)).notna()]
+    assert len(management) == 1
+    assert float(management.iloc[0]["insider_ownership_pct"]) == 4.0
+    assert (audit.get("status", pd.Series(dtype=str)).astype(str) == "BRIDGED").any()
+
+    events = bridge.read_narrative_events(["AAA.JK"])
+    assert len(events) == 1
+    assert events.iloc[0]["event_type"] == "DIVIDEND_OR_CAPITAL_RETURN"
     assert bool(events.iloc[0]["official_verified"]) is True
