@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-"""Lightweight forward-evidence acquisition used during production scans.
+"""Scan-time Future Fundamental research collection for Super Scanner.
 
-This module deliberately separates *collection coverage* from *scoring coverage*.
-A successful source check with no material forward event is recorded as a valid
-check, but never receives a positive Future Fundamental score. Google News RSS
-is research evidence only; strict production evidence still requires the
-existing HTTPS/entity/quorum governed-evidence path.
+Collection coverage is not scoring coverage. A source check can be complete even
+when no material forward event exists. Google News RSS discoveries stay
+research-only; strict production scoring still requires the governed official
+HTTPS/entity/date/quorum path.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,11 +16,10 @@ from urllib.parse import quote_plus
 import re
 import xml.etree.ElementTree as ET
 
-import numpy as np
 import pandas as pd
 import requests
 
-LIVE_FORWARD_EVIDENCE_VERSION = "1.0.1-dashboard-placement"
+LIVE_FORWARD_EVIDENCE_VERSION = "1.0.2-collection-separation"
 
 _FORWARD_RULES: tuple[tuple[str, tuple[str, ...], float, float], ...] = (
     ("PROJECT_OR_CONTRACT", ("KONTRAK", "CONTRACT", "BACKLOG", "ORDER BOOK", "ORDERBOOK", "OFFTAKE", "TENDER"), 68.0, 70.0),
@@ -42,9 +40,14 @@ def _ticker(value: Any) -> str:
     return text if text.endswith(".JK") else f"{text}.JK" if text else ""
 
 
-def _clean_title(value: Any) -> str:
+def _clean(value: Any) -> str:
     text = unescape(re.sub(r"<[^>]+>", " ", str(value or "")))
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _mentions_ticker(title: str, bare: str) -> bool:
+    # Prevent ambiguous short IDX symbols from matching unrelated generic news.
+    return bool(re.search(rf"(?<![A-Z0-9]){re.escape(bare.upper())}(?![A-Z0-9])", str(title or "").upper()))
 
 
 def _classify(text: str) -> tuple[str, float, float] | None:
@@ -68,60 +71,63 @@ def _published(value: Any) -> pd.Timestamp | pd.NaT:
     return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
 
 
-def _one(ticker: str, *, lookback_days: int, timeout: float) -> list[dict[str, Any]]:
-    symbol = _ticker(ticker)
-    bare = symbol.removesuffix(".JK")
-    checked = pd.Timestamp.now(tz="UTC")
-    query = quote_plus(f'"{bare}" IDX saham')
-    url = f"https://news.google.com/rss/search?q={query}&hl=id&gl=ID&ceid=ID:id"
-    base = {
+def _audit_row(symbol: str, checked: pd.Timestamp, state: str, coverage: float, detail: str = "") -> dict[str, Any]:
+    return {
         "ticker": symbol,
+        "collection_record_type": "FORWARD_EVIDENCE_CHECK",
         "review_origin": "LIVE_GOOGLE_NEWS_FORWARD_RESEARCH",
         "project_source_families": "GOOGLE_NEWS_RSS",
         "project_source_quorum_verified": False,
         "source_quorum_count": 0,
         "entity_match_verified": True,
         "source_checked_at": checked.isoformat(),
+        "last_verified_at": checked.isoformat(),
         "forward_collection_provider": "GOOGLE_NEWS_RSS",
         "forward_collection_version": LIVE_FORWARD_EVIDENCE_VERSION,
         "forward_research_only": True,
+        "forward_collection_coverage_pct": float(coverage),
+        "forward_collection_state": state,
+        "project_data_coverage": 0.0,
+        "project_execution_flags": detail,
     }
+
+
+def _one(ticker: str, *, lookback_days: int, timeout: float) -> list[dict[str, Any]]:
+    symbol = _ticker(ticker)
+    bare = symbol.removesuffix(".JK")
+    checked = pd.Timestamp.now(tz="UTC")
+    url = f"https://news.google.com/rss/search?q={quote_plus(f'\"{bare}\" IDX saham')}&hl=id&gl=ID&ceid=ID:id"
     try:
         response = requests.get(url, timeout=max(1.0, float(timeout)), headers={"User-Agent": "Mozilla/5.0 IDXScanner/1.0"})
         response.raise_for_status()
         root = ET.fromstring(response.content)
     except Exception as exc:
-        return [{
-            **base,
-            "project_name": "FORWARD_EVIDENCE_CHECK",
-            "project_stage": "COLLECTION_FAILED",
-            "project_data_coverage": 0.0,
-            "forward_collection_coverage_pct": 0.0,
-            "forward_collection_state": "FORWARD_CHECK_FAILED_RETRYABLE",
-            "project_execution_flags": f"{type(exc).__name__}: {str(exc)[:180]}",
-        }]
+        return [_audit_row(symbol, checked, "FORWARD_CHECK_FAILED_RETRYABLE", 0.0, f"{type(exc).__name__}: {str(exc)[:180]}")]
 
     cutoff = checked - pd.Timedelta(days=max(7, int(lookback_days)))
     items: list[dict[str, Any]] = []
     publishers: set[str] = set()
-    scanned = 0
+    scanned = matched = 0
     for item in root.findall(".//item")[:20]:
-        title = _clean_title(item.findtext("title"))
-        link = str(item.findtext("link") or "").strip()
-        source_node = item.find("source")
-        publisher = _clean_title(source_node.text if source_node is not None else "")
+        title = _clean(item.findtext("title"))
         published = _published(item.findtext("pubDate"))
         if pd.notna(published) and published < cutoff:
             continue
         scanned += 1
+        if not _mentions_ticker(title, bare):
+            continue
+        matched += 1
         classified = _classify(title)
         if classified is None:
             continue
         category, pipeline, impact = classified
+        source_node = item.find("source")
+        publisher = _clean(source_node.text if source_node is not None else "")
+        link = str(item.findtext("link") or "").strip()
         if publisher:
             publishers.add(publisher.upper())
         items.append({
-            **base,
+            "ticker": symbol,
             "project_name": title[:500] or f"{bare} forward event",
             "project_names": title[:500],
             "project_stage": category,
@@ -129,9 +135,18 @@ def _one(ticker: str, *, lookback_days: int, timeout: float) -> list[dict[str, A
             "future_fundamental_impact_score_observed": impact,
             "project_data_coverage": 48.0,
             "project_source_urls": link,
+            "project_source_families": "GOOGLE_NEWS_RSS",
+            "project_source_quorum_verified": False,
+            "source_quorum_count": 0,
+            "entity_match_verified": True,
+            "source_checked_at": checked.isoformat(),
             "last_verified_at": published.isoformat() if pd.notna(published) else checked.isoformat(),
             "event_date": published.date().isoformat() if pd.notna(published) else checked.date().isoformat(),
             "project_execution_flags": "RESEARCH_DISCOVERY_NOT_STRICT_OFFICIAL_EVIDENCE",
+            "review_origin": "LIVE_GOOGLE_NEWS_FORWARD_RESEARCH",
+            "forward_collection_provider": "GOOGLE_NEWS_RSS",
+            "forward_collection_version": LIVE_FORWARD_EVIDENCE_VERSION,
+            "forward_research_only": True,
             "forward_collection_coverage_pct": 100.0,
             "forward_collection_state": "MATERIAL_FORWARD_RESEARCH_EVIDENCE_FOUND",
             "forward_research_category": category,
@@ -144,18 +159,7 @@ def _one(ticker: str, *, lookback_days: int, timeout: float) -> list[dict[str, A
             row["project_data_coverage"] = coverage
             row["source_quorum_count"] = publisher_count
         return items
-
-    return [{
-        **base,
-        "project_name": "FORWARD_EVIDENCE_CHECK",
-        "project_stage": "NO_MATERIAL_FORWARD_EVENT_FOUND",
-        "project_data_coverage": 0.0,
-        "last_verified_at": checked.isoformat(),
-        "event_date": checked.date().isoformat(),
-        "project_execution_flags": f"RSS_CHECK_OK_ITEMS_SCANNED={scanned}",
-        "forward_collection_coverage_pct": 100.0,
-        "forward_collection_state": "FORWARD_CHECK_COMPLETED_NO_MATERIAL_EVENT",
-    }]
+    return [_audit_row(symbol, checked, "FORWARD_CHECK_COMPLETED_NO_MATERIAL_EVENT", 100.0, f"RSS_CHECK_OK_ITEMS_SCANNED={scanned};ENTITY_MATCHED={matched}")]
 
 
 def collect_live_forward_evidence(
@@ -169,23 +173,11 @@ def collect_live_forward_evidence(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_one, ticker, lookback_days=lookback_days, timeout=timeout): ticker for ticker in names}
         for future in as_completed(futures):
+            ticker = futures[future]
             try:
                 rows.extend(future.result())
             except Exception as exc:
-                ticker = futures[future]
-                rows.append({
-                    "ticker": ticker,
-                    "project_name": "FORWARD_EVIDENCE_CHECK",
-                    "project_stage": "COLLECTION_FAILED",
-                    "project_data_coverage": 0.0,
-                    "forward_collection_coverage_pct": 0.0,
-                    "forward_collection_state": "FORWARD_CHECK_FAILED_RETRYABLE",
-                    "project_execution_flags": f"{type(exc).__name__}: {str(exc)[:180]}",
-                    "review_origin": "LIVE_GOOGLE_NEWS_FORWARD_RESEARCH",
-                    "project_source_families": "GOOGLE_NEWS_RSS",
-                    "project_source_quorum_verified": False,
-                    "forward_research_only": True,
-                })
+                rows.append(_audit_row(ticker, pd.Timestamp.now(tz="UTC"), "FORWARD_CHECK_FAILED_RETRYABLE", 0.0, f"{type(exc).__name__}: {str(exc)[:180]}"))
     frame = pd.DataFrame(rows)
     if not frame.empty:
         frame["ticker"] = frame["ticker"].map(_ticker)
@@ -207,12 +199,7 @@ def collection_coverage(frame: pd.DataFrame | None, tickers: Iterable[Any] | Non
 
 
 def install_dashboard_cost_integrity() -> None:
-    """Redistribute legacy Smart Money Cost blocks one-per-card.
-
-    The legacy renderer used replace(marker, replacement, 1) while replacement
-    contained the same marker, so every subsequent block was inserted into card
-    one. Preserve the existing calculated blocks and only repair placement.
-    """
+    """Redistribute calculated Smart Money Cost blocks one-per-card."""
     try:
         import v9_dashboard as dashboard
     except Exception:
@@ -233,7 +220,7 @@ def install_dashboard_cost_integrity() -> None:
             index = html.find(marker, cursor)
             if index < 0:
                 break
-            replacement = "</div>" + block + "<p>Multi-horizon OHLCV proxy 20/60/120/252/504/756D — bukan identitas broker.</p>"
+            replacement = "</div>" + block + marker[len("</div>"):]
             html = html[:index] + replacement + html[index + len(marker):]
             cursor = index + len(replacement)
         return html
@@ -246,7 +233,4 @@ def install_dashboard_cost_integrity() -> None:
 
 install_dashboard_cost_integrity()
 
-__all__ = [
-    "LIVE_FORWARD_EVIDENCE_VERSION", "collect_live_forward_evidence", "collection_coverage",
-    "install_dashboard_cost_integrity",
-]
+__all__ = ["LIVE_FORWARD_EVIDENCE_VERSION", "collect_live_forward_evidence", "collection_coverage", "install_dashboard_cost_integrity"]
