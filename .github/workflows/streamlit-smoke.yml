@@ -27,9 +27,11 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
       - name: Compile critical modules
-        run: python -m py_compile app.py release_contract.py fast_scan_engine.py resumable_app_engine.py scanner_database.py scanner.py evidence_enrichment.py simple_focus.py
-      - name: Full offline regression suite
-        run: pytest -q
+        run: python -m py_compile app.py release_contract.py runtime_release.py runtime_integrity_patch.py evidence_governance.py fast_scan_engine.py resumable_app_engine.py scanner_database.py scanner.py evidence_enrichment.py simple_focus.py
+      - name: Evidence governance regression
+        run: pytest -q tests/test_evidence_governance.py
+      - name: Core offline regression suite
+        run: pytest -q --ignore=tests/test_evidence_governance.py
       - name: Start Streamlit and verify health
         run: |
           streamlit run app.py --server.headless true --server.address 127.0.0.1 --server.port 8501 > /tmp/super-streamlit.log 2>&1 &

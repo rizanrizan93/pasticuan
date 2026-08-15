@@ -1,6 +1,7 @@
 import types
 
 import runtime_release
+from release_contract import SCANNER_RELEASE_VERSION
 
 
 def test_stale_loaded_modules_are_reloaded_in_dependency_order(monkeypatch):
@@ -53,6 +54,6 @@ def test_stale_loaded_modules_are_reloaded_in_dependency_order(monkeypatch):
         },
     )
 
-    assert expected.startswith("9.8.17-")
+    assert expected == SCANNER_RELEASE_VERSION
     assert calls == list(modules)
     assert reloaded == tuple(calls)

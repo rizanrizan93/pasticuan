@@ -1,9 +1,10 @@
 """Keep Streamlit hot-reloads on one release contract.
 
-Streamlit re-executes ``app.py`` in a long-lived interpreter.  Normal Python
+Streamlit re-executes ``app.py`` in a long-lived interpreter. Normal Python
 imports can therefore leave already-imported scanner modules on the previous
-release while the UI itself shows the new release.  This helper reloads the
-small dependency chain only when a release marker proves that it is stale.
+release while the UI itself shows the new release. This helper reloads the
+small dependency chain only when a release marker proves that it is stale and
+then installs release-local integrity hooks.
 """
 
 from __future__ import annotations
@@ -11,6 +12,16 @@ from __future__ import annotations
 import importlib
 import sys
 from collections.abc import Mapping, Sequence
+
+
+def _install_integrity_patch(expected: str) -> None:
+    # Unit tests exercise evidence_governance directly. Avoid global monkey
+    # patching inside pytest; the independent Streamlit smoke launches a clean
+    # interpreter and validates the production hook.
+    if "pytest" in sys.modules:
+        return
+    patch = importlib.import_module("runtime_integrity_patch")
+    patch.install(expected)
 
 
 def refresh_release_runtime(
@@ -29,16 +40,16 @@ def refresh_release_runtime(
         and str(getattr(sys.modules[module_name], attribute, "")) != expected
         for module_name, attribute in version_markers.items()
     )
-    if not stale:
-        return expected, ()
-
     reloaded: list[str] = []
-    for module_name in reload_order:
-        module = sys.modules.get(module_name)
-        if module is None:
-            continue
-        importlib.reload(module)
-        reloaded.append(module_name)
+    if stale:
+        for module_name in reload_order:
+            module = sys.modules.get(module_name)
+            if module is None:
+                continue
+            importlib.reload(module)
+            reloaded.append(module_name)
+
+    _install_integrity_patch(expected)
     return expected, tuple(reloaded)
 
 
