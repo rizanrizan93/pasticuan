@@ -31,6 +31,9 @@ def test_embedded_idx_xbrl_cannot_be_downgraded_by_yahoo_flags():
     assert row["fundamental_source_families"] == "IDX_OFFICIAL_XBRL • YAHOO"
     assert row["fundamental_reconciliation_state"] == "OFFICIAL_PLUS_PUBLIC_CROSSCHECK"
     assert float(row["fundamental_source_count"]) >= 2.0
+    assert row["operating_cash_flow"] == 231_667_847_175
+    assert row["free_cash_flow"] == 215_742_296_161
+    assert row["official_cashflow_consumption_state"] == "OFFICIAL_IDX_CASHFLOW_PROMOTED_TO_CANONICAL_MISSING_FIELDS"
 
 
 def test_partial_official_statement_gets_partial_not_fabricated_coverage():

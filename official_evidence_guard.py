@@ -78,6 +78,30 @@ def canonicalize_official_fundamental_evidence(frame: pd.DataFrame | None) -> pd
         out.loc[valid, field] = np.maximum(existing.loc[valid], np.where(has_yahoo.loc[valid], 2.0, 1.0))
     out.loc[valid, "fundamental_snapshot_source_count"] = 1
     out.loc[valid, "official_evidence_guard_version"] = OFFICIAL_EVIDENCE_GUARD_VERSION
+
+    # A database backfill can legitimately add official OCF/FCF after an older
+    # snapshot was cached.  Coverage alone is not enough: downstream business
+    # and real-money guards read the canonical generic fields.  Promote only
+    # into missing slots, never overwrite a separately observed historical/TTM
+    # value, and leave an explicit lineage marker proving the uploaded fact was
+    # actually consumed.
+    promoted = pd.Series(False, index=out.index)
+    for official_field, canonical_fields in (
+        ("idx_official_ocf", ("operating_cash_flow", "operating_cash_flow_latest")),
+        ("idx_official_fcf_proxy", ("free_cash_flow", "free_cash_flow_proxy_latest")),
+    ):
+        official_value = pd.to_numeric(col(official_field), errors="coerce")
+        for canonical_field in canonical_fields:
+            existing = pd.to_numeric(col(canonical_field), errors="coerce")
+            mask = valid & official_value.notna() & existing.isna()
+            if mask.any():
+                out.loc[mask, canonical_field] = official_value.loc[mask]
+                promoted |= mask
+    out.loc[valid, "official_cashflow_consumption_state"] = np.where(
+        promoted.loc[valid],
+        "OFFICIAL_IDX_CASHFLOW_PROMOTED_TO_CANONICAL_MISSING_FIELDS",
+        "OFFICIAL_IDX_CASHFLOW_ALREADY_PRESENT_OR_NOT_REPORTED",
+    )
     return out
 
 
