@@ -7,3 +7,4 @@ requests==2.34.2
 yfinance==0.2.66
 beautifulsoup4==4.15.0
 pypdf==6.14.2
+curl-cffi>=0.16,<1
