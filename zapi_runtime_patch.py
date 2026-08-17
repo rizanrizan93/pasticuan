@@ -1,9 +1,17 @@
 from __future__ import annotations
 
-"""Runtime hook: bounded ZAPI confirmation for Super Scanner final decision flow."""
+"""Runtime hook: bounded ZAPI confirmation for Super Scanner final decision flow.
+
+This patch also injects a standalone CSV download link into every Top 3 HTML
+dashboard. The CSV contains the complete selected rows, including ZAPI audit
+columns when they are present, so the HTML report is self-contained.
+"""
 
 from functools import wraps
+from html import escape
 from typing import Any
+import base64
+import re
 
 import pandas as pd
 
@@ -12,7 +20,7 @@ from zapi_flow_enrichment import (
     enrich_super_universe,
 )
 
-PATCH_VERSION = "1.0.0-super-zapi-flow"
+PATCH_VERSION = "1.1.0-super-zapi-flow-top3-csv"
 
 
 def _canonical(value: Any) -> str:
@@ -81,18 +89,89 @@ def _wrap_focus_builder(owner: Any, name: str) -> None:
     setattr(owner, name, wrapped)
 
 
+def _safe_filename_token(value: Any, default: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or "").strip()).strip("_")
+    return token[:80] or default
+
+
+def _top3_csv_download_block(top: pd.DataFrame, *, model: str = "", scan_id: str = "") -> str:
+    """Return an in-HTML data-URI download control for the selected Top 3 rows."""
+    if not isinstance(top, pd.DataFrame) or top.empty:
+        return ""
+    csv_bytes = top.to_csv(index=False).encode("utf-8-sig")
+    payload = base64.b64encode(csv_bytes).decode("ascii")
+    model_token = _safe_filename_token(model, "TOP3").lower()
+    scan_token = _safe_filename_token(scan_id, "latest")
+    filename = f"idx_super_top3_{model_token}_{scan_token}.csv"
+    zapi_present = any(column.startswith("zapi_") for column in top.columns)
+    audit_note = (
+        "Full Top 3 row export • ZAPI audit fields included."
+        if zapi_present
+        else "Full Top 3 row export • ZAPI fields unavailable in this rendered frame."
+    )
+    return (
+        '<div class="v9-csv-download">'
+        f'<a href="data:text/csv;charset=utf-8;base64,{payload}" '
+        f'download="{escape(filename)}">⬇ Download Top 3 CSV</a>'
+        f'<small>{escape(audit_note)}</small>'
+        "</div>"
+    )
+
+
+def _wrap_dashboard_renderer(owner: Any) -> None:
+    original = getattr(owner, "render_dashboard_html", None)
+    if not callable(original) or getattr(original, "__top3_csv_download_v1__", False):
+        return
+
+    @wraps(original)
+    def wrapped(top: pd.DataFrame, *args: Any, **kwargs: Any) -> str:
+        html = original(top, *args, **kwargs)
+        if not isinstance(html, str) or not html:
+            return html
+        block = _top3_csv_download_block(
+            top,
+            model=str(kwargs.get("model") or ""),
+            scan_id=str(kwargs.get("scan_id") or ""),
+        )
+        if not block:
+            return html
+        css = """
+        .v9-csv-download{margin:10px 0 12px;padding:10px 12px;border:1px solid #315a70;border-radius:9px;background:#071a25;text-align:left}
+        .v9-csv-download a{display:inline-block;padding:7px 11px;border-radius:7px;background:#0b7a75;color:#ecfeff!important;text-decoration:none;font-size:11px;font-weight:800;letter-spacing:.2px}
+        .v9-csv-download a:hover{filter:brightness(1.12)}
+        .v9-csv-download small{display:block;margin-top:6px;color:#8fb3c4;font-size:8px;line-height:1.35}
+        """
+        if "</style>" in html:
+            html = html.replace("</style>", css + "</style>", 1)
+        if '<div class="v9-footer">' in html:
+            return html.replace('<div class="v9-footer">', block + '<div class="v9-footer">', 1)
+        if "</body>" in html:
+            return html.replace("</body>", block + "</body>", 1)
+        return html + block
+
+    wrapped.__top3_csv_download_v1__ = True
+    setattr(owner, "render_dashboard_html", wrapped)
+
+
 def install() -> dict[str, str]:
     import simple_focus
+    import v9_dashboard
 
     _wrap_focus_builder(simple_focus, "build_next_leaders")
     _wrap_focus_builder(simple_focus, "build_swing_ready")
+    _wrap_dashboard_renderer(v9_dashboard)
     return {
         "patch_version": PATCH_VERSION,
         "zapi_version": ZAPI_FLOW_ENRICHMENT_VERSION,
         "policy": "BOUNDED_CONFIRMATION_INSIDE_EXISTING_NARRATIVE_FLOW_PILLAR",
         "smc_policy": "PRICE_STRUCTURE_PRIMARY_ZAPI_FLOW_CONFIRMATION_ONLY",
         "identity_policy": "FOREIGN_FLOW_IS_NOT_BROKER_OR_BENEFICIAL_OWNER_IDENTITY",
+        "top3_csv_policy": "SELF_CONTAINED_HTML_DATA_URI_FULL_ROW_EXPORT_WITH_ZAPI_AUDIT_WHEN_AVAILABLE",
     }
 
 
-__all__ = ["PATCH_VERSION", "install"]
+__all__ = [
+    "PATCH_VERSION",
+    "install",
+    "_top3_csv_download_block",
+]
