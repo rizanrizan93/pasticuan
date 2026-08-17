@@ -2,15 +2,17 @@ from __future__ import annotations
 
 """Runtime hook: bounded ZAPI confirmation for Super Scanner final decision flow.
 
-This patch also injects a standalone CSV download link into every Top 3 HTML
-dashboard. The CSV contains the complete selected rows, including ZAPI audit
-columns when they are present, so the HTML report is self-contained.
+This patch adds a native Streamlit CSV download button for every Top 3 dashboard
+and also keeps a self-contained fallback download link inside the rendered HTML.
+The CSV contains complete selected rows, including ZAPI audit columns when they
+are present.
 """
 
 from functools import wraps
 from html import escape
 from typing import Any
 import base64
+import hashlib
 import re
 
 import pandas as pd
@@ -20,7 +22,7 @@ from zapi_flow_enrichment import (
     enrich_super_universe,
 )
 
-PATCH_VERSION = "1.1.0-super-zapi-flow-top3-csv"
+PATCH_VERSION = "1.2.0-super-zapi-flow-native-top3-csv"
 
 
 def _canonical(value: Any) -> str:
@@ -94,15 +96,21 @@ def _safe_filename_token(value: Any, default: str) -> str:
     return token[:80] or default
 
 
-def _top3_csv_download_block(top: pd.DataFrame, *, model: str = "", scan_id: str = "") -> str:
-    """Return an in-HTML data-URI download control for the selected Top 3 rows."""
+def _top3_csv_payload(top: pd.DataFrame, *, model: str = "", scan_id: str = "") -> tuple[bytes, str]:
     if not isinstance(top, pd.DataFrame) or top.empty:
-        return ""
+        return b"", ""
     csv_bytes = top.to_csv(index=False).encode("utf-8-sig")
-    payload = base64.b64encode(csv_bytes).decode("ascii")
     model_token = _safe_filename_token(model, "TOP3").lower()
     scan_token = _safe_filename_token(scan_id, "latest")
-    filename = f"idx_super_top3_{model_token}_{scan_token}.csv"
+    return csv_bytes, f"idx_super_top3_{model_token}_{scan_token}.csv"
+
+
+def _top3_csv_download_block(top: pd.DataFrame, *, model: str = "", scan_id: str = "") -> str:
+    """Return an in-HTML data-URI fallback download control for selected Top 3 rows."""
+    csv_bytes, filename = _top3_csv_payload(top, model=model, scan_id=scan_id)
+    if not csv_bytes:
+        return ""
+    payload = base64.b64encode(csv_bytes).decode("ascii")
     zapi_present = any(column.startswith("zapi_") for column in top.columns)
     audit_note = (
         "Full Top 3 row export • ZAPI audit fields included."
@@ -118,8 +126,41 @@ def _top3_csv_download_block(top: pd.DataFrame, *, model: str = "", scan_id: str
     )
 
 
+def _emit_native_top3_download(
+    top: pd.DataFrame,
+    *,
+    model: str = "",
+    scan_id: str = "",
+    context_hint: str = "",
+) -> bool:
+    """Render a native Streamlit download button when running inside Streamlit."""
+    csv_bytes, filename = _top3_csv_payload(top, model=model, scan_id=scan_id)
+    if not csv_bytes:
+        return False
+    try:
+        import streamlit as st
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx() is None:
+            return False
+        digest = hashlib.sha256(
+            csv_bytes + str(context_hint or "").encode("utf-8")
+        ).hexdigest()[:12]
+        model_token = _safe_filename_token(model, "TOP3").lower()
+        st.download_button(
+            "⬇ Download Top 3 CSV",
+            data=csv_bytes,
+            file_name=filename,
+            mime="text/csv",
+            key=f"super_top3_csv_{model_token}_{digest}",
+            width="stretch",
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _actionable_selector_input(frame: pd.DataFrame, *, model: str, lane: str) -> pd.DataFrame:
-    """Prevent a blocked/order-builder-ineligible swing from entering the ACTIONABLE Top 3."""
+    """Prevent blocked/order-builder-ineligible swings from entering ACTIONABLE Top 3."""
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         return frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
     model_name = str(model or "").upper()
@@ -153,19 +194,24 @@ def _wrap_top_selector(owner: Any) -> None:
 
 def _wrap_dashboard_renderer(owner: Any) -> None:
     original = getattr(owner, "render_dashboard_html", None)
-    if not callable(original) or getattr(original, "__top3_csv_download_v1__", False):
+    if not callable(original) or getattr(original, "__top3_csv_download_v2__", False):
         return
 
     @wraps(original)
     def wrapped(top: pd.DataFrame, *args: Any, **kwargs: Any) -> str:
+        model = str(kwargs.get("model") or "")
+        scan_id = str(kwargs.get("scan_id") or "")
+        completeness_note = str(kwargs.get("completeness_note") or "")
+        _emit_native_top3_download(
+            top,
+            model=model,
+            scan_id=scan_id,
+            context_hint=completeness_note,
+        )
         html = original(top, *args, **kwargs)
         if not isinstance(html, str) or not html:
             return html
-        block = _top3_csv_download_block(
-            top,
-            model=str(kwargs.get("model") or ""),
-            scan_id=str(kwargs.get("scan_id") or ""),
-        )
+        block = _top3_csv_download_block(top, model=model, scan_id=scan_id)
         if not block:
             return html
         css = """
@@ -182,7 +228,7 @@ def _wrap_dashboard_renderer(owner: Any) -> None:
             return html.replace("</body>", block + "</body>", 1)
         return html + block
 
-    wrapped.__top3_csv_download_v1__ = True
+    wrapped.__top3_csv_download_v2__ = True
     setattr(owner, "render_dashboard_html", wrapped)
 
 
@@ -200,7 +246,7 @@ def install() -> dict[str, str]:
         "policy": "BOUNDED_CONFIRMATION_INSIDE_EXISTING_NARRATIVE_FLOW_PILLAR",
         "smc_policy": "PRICE_STRUCTURE_PRIMARY_ZAPI_FLOW_CONFIRMATION_ONLY",
         "identity_policy": "FOREIGN_FLOW_IS_NOT_BROKER_OR_BENEFICIAL_OWNER_IDENTITY",
-        "top3_csv_policy": "SELF_CONTAINED_HTML_DATA_URI_FULL_ROW_EXPORT_WITH_ZAPI_AUDIT_WHEN_AVAILABLE",
+        "top3_csv_policy": "NATIVE_STREAMLIT_DOWNLOAD_PLUS_SELF_CONTAINED_HTML_FALLBACK_WITH_ZAPI_AUDIT",
         "actionable_top3_policy": "ORDER_BUILDER_ELIGIBLE_AND_NOT_REAL_MONEY_BLOCKED",
     }
 
@@ -208,6 +254,8 @@ def install() -> dict[str, str]:
 __all__ = [
     "PATCH_VERSION",
     "install",
+    "_top3_csv_payload",
     "_top3_csv_download_block",
+    "_emit_native_top3_download",
     "_actionable_selector_input",
 ]
