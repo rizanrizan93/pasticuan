@@ -93,8 +93,7 @@ def discover_trade_detail_url(trade_date: date, timeout: int = 20) -> str:
 
 def download_trade_detail(trade_date: date, timeout: int = 45) -> tuple[str, str]:
     url = discover_trade_detail_url(trade_date, timeout=timeout)
-    suffix = ".csv"
-    handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    handle = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
     path = handle.name
     handle.close()
     response = requests.get(url, headers=_headers(), timeout=timeout, stream=True)
@@ -107,7 +106,7 @@ def download_trade_detail(trade_date: date, timeout: int = 45) -> tuple[str, str
 
 
 def _read_trade_chunks(path: str, universe: set[str] | None = None, chunksize: int = 250_000):
-    usecols = ["asset", "participant_buy", "participant_sell", "volume", "value", "tradingdate"]
+    usecols = {"asset", "participant_buy", "participant_sell", "volume", "value", "tradingdate"}
     for sep in ("|", ","):
         try:
             iterator = pd.read_csv(
@@ -118,18 +117,14 @@ def _read_trade_chunks(path: str, universe: set[str] | None = None, chunksize: i
                 low_memory=False,
                 dtype=str,
             )
+            yielded = False
             for chunk in iterator:
                 chunk.columns = [str(c).strip().lower() for c in chunk.columns]
                 renames = {
-                    "seccode": "asset",
-                    "code": "asset",
-                    "ticker": "asset",
-                    "brokersellid": "participant_sell",
-                    "brokerbuyid": "participant_buy",
-                    "sellbrokerid": "participant_sell",
-                    "buybrokerid": "participant_buy",
-                    "quantity": "volume",
-                    "tradedate": "tradingdate",
+                    "seccode": "asset", "code": "asset", "ticker": "asset",
+                    "brokersellid": "participant_sell", "brokerbuyid": "participant_buy",
+                    "sellbrokerid": "participant_sell", "buybrokerid": "participant_buy",
+                    "quantity": "volume", "tradedate": "tradingdate",
                 }
                 for old, new in renames.items():
                     if old in chunk.columns and new not in chunk.columns:
@@ -146,8 +141,10 @@ def _read_trade_chunks(path: str, universe: set[str] | None = None, chunksize: i
                 chunk["participant_sell"] = chunk["participant_sell"].astype(str).str.strip().str.upper()
                 chunk["volume"] = pd.to_numeric(chunk["volume"], errors="coerce").fillna(0.0)
                 chunk["value"] = pd.to_numeric(chunk["value"], errors="coerce").fillna(0.0)
+                yielded = True
                 yield chunk
-            return
+            if yielded:
+                return
         except Exception:
             continue
     raise RuntimeError("IDX_TRADE_DETAIL_PARSE_FAILED")
@@ -198,7 +195,6 @@ def trim_daily_top_flow(daily: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     if not isinstance(daily, pd.DataFrame) or daily.empty:
         return pd.DataFrame()
     frame = daily.copy()
-    frame["abs_net"] = pd.to_numeric(frame["net_value"], errors="coerce").abs()
     positive = frame[frame["net_value"] > 0].copy()
     negative = frame[frame["net_value"] < 0].copy()
     positive["side"] = "TOP_NET_BUYER"
@@ -227,8 +223,13 @@ def load_public_cache() -> pd.DataFrame:
 
 
 def _normalize_cache(frame: pd.DataFrame | None) -> pd.DataFrame:
+    columns = [
+        "trade_date", "ticker", "broker_code", "buy_value", "sell_value", "buy_volume", "sell_volume",
+        "buy_avg", "sell_avg", "net_value", "net_volume", "gross_value", "source", "source_verified",
+        "provenance_state", "side", "net_rank",
+    ]
     if not isinstance(frame, pd.DataFrame) or frame.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=columns)
     out = frame.copy()
     out["ticker"] = out["ticker"].map(_canon)
     out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce").dt.normalize()
@@ -255,10 +256,10 @@ def score_broker_history(history: pd.DataFrame, universe: Iterable[Any]) -> pd.D
     frame = _normalize_cache(history)
     names = sorted({_canon(value) for value in universe if _canon(value)})
     rows: list[dict[str, Any]] = []
-    if not frame.empty:
+    if "ticker" in frame.columns and not frame.empty:
         frame = frame[frame["ticker"].isin(names)]
     for ticker in names:
-        local = frame[frame["ticker"].eq(ticker)].copy()
+        local = frame[frame["ticker"].eq(ticker)].copy() if "ticker" in frame.columns else pd.DataFrame()
         if local.empty:
             rows.append({"ticker": ticker})
             continue
@@ -298,6 +299,8 @@ def score_broker_history(history: pd.DataFrame, universe: Iterable[Any]) -> pd.D
             "broker_flow_provenance": "OFFICIAL_IDX_PUBLIC_EOD_TRADE_DETAIL_PARTICIPANT_FLOW_NOT_BENEFICIAL_OWNER",
         })
     out = pd.DataFrame(rows)
+    if out.empty:
+        return out
     out["broker_net_score"] = _cross_section(out["broker_top_buyer_net_value_20d"])
     persistence = pd.to_numeric(out["broker_top3_buyer_persistence_20d_pct"], errors="coerce").clip(0, 100)
     concentration = pd.to_numeric(out["broker_buyer_concentration_pct"], errors="coerce").clip(0, 100)
@@ -384,44 +387,8 @@ def enrich_super_broker(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def enrich_emir_broker(frame: pd.DataFrame) -> pd.DataFrame:
-    if not isinstance(frame, pd.DataFrame) or frame.empty or "ticker" not in frame.columns:
-        return frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
-    features, _ = get_broker_features(frame["ticker"].tolist())
-    if features.empty:
-        return frame.copy()
-    out = frame.copy()
-    right = features.copy()
-    out["_key"] = out["ticker"].map(_canon)
-    right["_key"] = right["ticker"].map(_canon)
-    right = right.drop(columns=["ticker"]).drop_duplicates("_key")
-    duplicate = [c for c in right.columns if c != "_key" and c in out.columns]
-    if duplicate:
-        out = out.drop(columns=duplicate)
-    out = out.merge(right, on="_key", how="left").drop(columns=["_key"])
-    base = pd.to_numeric(out.get("smart_money_score", pd.Series(np.nan, index=out.index)), errors="coerce")
-    broker = pd.to_numeric(out.get("broker_smart_money_confirmation_score"), errors="coerce")
-    coverage = pd.to_numeric(out.get("broker_flow_coverage_pct"), errors="coerce").clip(0, 100)
-    weight = 0.20 * coverage.fillna(0.0) / 100.0
-    blended = ((1.0 - weight) * base + weight * broker).where(base.notna() & broker.notna(), base).clip(0, 100)
-    out["broker_confirmation_weight_pct"] = (100.0 * weight).round(1)
-    out["broker_pre_confirmation_smart_money_score"] = base
-    out["broker_post_confirmation_smart_money_score"] = blended.round(1)
-    out["smart_money_score"] = blended.round(1)
-    pre_conviction = pd.to_numeric(out.get("emir_conviction_score", pd.Series(np.nan, index=out.index)), errors="coerce")
-    directional = ((broker.fillna(50.0) - 50.0) / 50.0).clip(-1.0, 1.0)
-    delta = (1.5 * directional * coverage.fillna(0.0) / 100.0).clip(-1.5, 1.5)
-    out["broker_emir_conviction_delta"] = delta.round(3)
-    if "emir_conviction_score" in out.columns:
-        out["emir_conviction_score"] = (pre_conviction + delta).clip(0, 100).round(3)
-    if "emir_final_score" in out.columns:
-        out["emir_final_score"] = (pd.to_numeric(out["emir_final_score"], errors="coerce") + delta).clip(0, 100).round(3)
-    out["broker_flow_identity_policy"] = "PARTICIPANT_FLOW_NOT_BENEFICIAL_OWNER_IDENTITY"
-    return out
-
-
 __all__ = [
     "VERSION", "PUBLIC_CACHE_URL", "discover_trade_detail_url", "download_trade_detail",
     "aggregate_trade_detail", "trim_daily_top_flow", "load_public_cache", "score_broker_history",
-    "get_broker_features", "enrich_super_broker", "enrich_emir_broker",
+    "get_broker_features", "enrich_super_broker",
 ]
