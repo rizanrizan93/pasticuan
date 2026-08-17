@@ -2,10 +2,11 @@ from __future__ import annotations
 
 """Runtime hook: bounded ZAPI confirmation for Super Scanner final decision flow.
 
-This patch adds a native Streamlit CSV download button for every Top 3 dashboard
-and also keeps a self-contained fallback download link inside the rendered HTML.
-The CSV contains complete selected rows, including ZAPI audit columns when they
-are present.
+This patch adds a native Streamlit CSV download button for every Top 3 dashboard,
+keeps a self-contained fallback download link inside the rendered HTML, exposes
+full ZAPI audit lineage, and applies a post-authorization foreign-flow shock
+guard to Swing execution only. ZAPI can delay/de-authorize an entry but can
+never promote READY or rewrite the underlying research thesis.
 """
 
 from functools import wraps
@@ -15,14 +16,20 @@ import base64
 import hashlib
 import re
 
+import numpy as np
 import pandas as pd
 
 from zapi_flow_enrichment import (
     ZAPI_FLOW_ENRICHMENT_VERSION,
     enrich_super_universe,
 )
+from zapi_post_calibration import (
+    POST_CALIBRATION_VERSION,
+    apply_super_foreign_shock_guard,
+    enrich_super_shadow,
+)
 
-PATCH_VERSION = "1.2.0-super-zapi-flow-native-top3-csv"
+PATCH_VERSION = "1.3.0-super-zapi-post-calibration"
 
 
 def _canonical(value: Any) -> str:
@@ -35,27 +42,56 @@ def _merge_audit_fields(out: pd.DataFrame, enriched: pd.DataFrame) -> pd.DataFra
         return out
     if "ticker" not in out.columns or "ticker" not in enriched.columns:
         return out
+
+    audit_source = enriched.copy()
+    if "flow_silent_accumulation_score" in audit_source.columns:
+        audit_source["zapi_super_post_silent_score"] = pd.to_numeric(
+            audit_source["flow_silent_accumulation_score"], errors="coerce"
+        )
+        original = pd.to_numeric(
+            audit_source.get("zapi_super_original_silent_score", pd.Series(np.nan, index=audit_source.index)),
+            errors="coerce",
+        )
+        audit_source["zapi_super_silent_score_delta"] = (
+            audit_source["zapi_super_post_silent_score"] - original
+        )
+
     wanted = [
         "ticker",
+        "zapi_foreign_latest_trade_date",
+        "zapi_foreign_observed_days",
+        "zapi_foreign_net_shares_1d",
+        "zapi_foreign_net_shares_5d",
+        "zapi_foreign_net_shares_20d",
         "zapi_foreign_flow_score",
         "zapi_foreign_flow_coverage_pct",
         "zapi_foreign_net_participation_1d",
         "zapi_foreign_net_participation_5d",
         "zapi_foreign_net_participation_20d",
+        "zapi_foreign_positive_days_ratio_5d",
         "zapi_foreign_positive_days_ratio_20d",
+        "zapi_foreign_buy_ratio_5d",
+        "zapi_foreign_buy_ratio_20d",
         "zapi_foreign_state",
         "zapi_accumulation_confirmation_score",
         "zapi_smart_money_confirmation_score",
         "zapi_smc_flow_confirmation_score",
+        "zapi_flow_source",
+        "zapi_flow_unit",
         "zapi_flow_evidence_type",
+        "zapi_flow_enrichment_version",
         "zapi_confirmation_weight_pct",
         "zapi_super_original_silent_score",
         "zapi_super_original_silent_coverage_pct",
+        "zapi_super_post_silent_score",
+        "zapi_super_silent_score_delta",
         "zapi_super_flow_basis",
         "zapi_flow_meta_state",
+        "zapi_shared_cache_state",
+        "zapi_direct_state",
     ]
-    cols = [column for column in wanted if column in enriched.columns]
-    audit = enriched[cols].copy()
+    cols = [column for column in wanted if column in audit_source.columns]
+    audit = audit_source[cols].copy()
     audit["_zapi_key"] = audit["ticker"].map(_canonical)
     audit = audit.drop(columns=["ticker"]).drop_duplicates("_zapi_key", keep="last")
     result = out.copy()
@@ -68,7 +104,7 @@ def _merge_audit_fields(out: pd.DataFrame, enriched: pd.DataFrame) -> pd.DataFra
 
 def _wrap_focus_builder(owner: Any, name: str) -> None:
     original = getattr(owner, name, None)
-    if not callable(original) or getattr(original, "__zapi_flow_confirmation_v1__", False):
+    if not callable(original) or getattr(original, "__zapi_flow_confirmation_v2__", False):
         return
 
     @wraps(original)
@@ -83,11 +119,14 @@ def _wrap_focus_builder(owner: Any, name: str) -> None:
         if isinstance(out, pd.DataFrame):
             try:
                 out = _merge_audit_fields(out, enriched)
+                out = enrich_super_shadow(out)
+                if name == "build_swing_ready":
+                    out = apply_super_foreign_shock_guard(out)
             except Exception:
                 pass
         return out
 
-    wrapped.__zapi_flow_confirmation_v1__ = True
+    wrapped.__zapi_flow_confirmation_v2__ = True
     setattr(owner, name, wrapped)
 
 
@@ -173,12 +212,15 @@ def _actionable_selector_input(frame: pd.DataFrame, *, model: str, lane: str) ->
     if "real_money_authorization_state" in local.columns:
         state = local["real_money_authorization_state"].fillna("").astype(str).str.upper()
         local = local.loc[state.ne("REAL_MONEY_BLOCKED")].copy()
+    if "zapi_execution_flow_guard_state" in local.columns:
+        guard = local["zapi_execution_flow_guard_state"].fillna("").astype(str).str.upper()
+        local = local.loc[~guard.isin({"WAIT_FLOW_STABILIZATION_AND_RECLAIM", "REQUIRE_ABSORPTION_OR_RECLAIM_BEFORE_ENTRY"})].copy()
     return local
 
 
 def _wrap_top_selector(owner: Any) -> None:
     original = getattr(owner, "select_top_candidates", None)
-    if not callable(original) or getattr(original, "__actionable_contract_v1__", False):
+    if not callable(original) or getattr(original, "__actionable_contract_v2__", False):
         return
 
     @wraps(original)
@@ -188,7 +230,7 @@ def _wrap_top_selector(owner: Any) -> None:
         source = _actionable_selector_input(frame, model=model, lane=lane)
         return original(source, *args, **kwargs)
 
-    wrapped.__actionable_contract_v1__ = True
+    wrapped.__actionable_contract_v2__ = True
     setattr(owner, "select_top_candidates", wrapped)
 
 
@@ -243,11 +285,14 @@ def install() -> dict[str, str]:
     return {
         "patch_version": PATCH_VERSION,
         "zapi_version": ZAPI_FLOW_ENRICHMENT_VERSION,
+        "post_calibration_version": POST_CALIBRATION_VERSION,
         "policy": "BOUNDED_CONFIRMATION_INSIDE_EXISTING_NARRATIVE_FLOW_PILLAR",
         "smc_policy": "PRICE_STRUCTURE_PRIMARY_ZAPI_FLOW_CONFIRMATION_ONLY",
         "identity_policy": "FOREIGN_FLOW_IS_NOT_BROKER_OR_BENEFICIAL_OWNER_IDENTITY",
         "top3_csv_policy": "NATIVE_STREAMLIT_DOWNLOAD_PLUS_SELF_CONTAINED_HTML_FALLBACK_WITH_ZAPI_AUDIT",
-        "actionable_top3_policy": "ORDER_BUILDER_ELIGIBLE_AND_NOT_REAL_MONEY_BLOCKED",
+        "actionable_top3_policy": "ORDER_BUILDER_ELIGIBLE_NOT_REAL_MONEY_BLOCKED_AND_NO_ZAPI_SELL_SHOCK_WAIT",
+        "execution_guard_policy": "ZAPI_SELL_SHOCK_CAN_ONLY_DELAY_OR_DEAUTHORIZE_NEVER_PROMOTE_READY",
+        "shadow_policy": "CAPTURE_PRE_POST_ZAPI_SILENT_SCORE_FOR_5D_20D_60D_FORWARD_OOS",
     }
 
 
