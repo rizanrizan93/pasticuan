@@ -118,6 +118,39 @@ def _top3_csv_download_block(top: pd.DataFrame, *, model: str = "", scan_id: str
     )
 
 
+def _actionable_selector_input(frame: pd.DataFrame, *, model: str, lane: str) -> pd.DataFrame:
+    """Prevent a blocked/order-builder-ineligible swing from entering the ACTIONABLE Top 3."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    model_name = str(model or "").upper()
+    lane_name = str(lane or "RESEARCH").upper()
+    if model_name == "NEXT_LEADER" or lane_name not in {"ACTIONABLE", "EXECUTION"}:
+        return frame
+    local = frame.copy()
+    if "order_builder_eligible" in local.columns:
+        local = local.loc[local["order_builder_eligible"].fillna(False).astype(bool)].copy()
+    if "real_money_authorization_state" in local.columns:
+        state = local["real_money_authorization_state"].fillna("").astype(str).str.upper()
+        local = local.loc[state.ne("REAL_MONEY_BLOCKED")].copy()
+    return local
+
+
+def _wrap_top_selector(owner: Any) -> None:
+    original = getattr(owner, "select_top_candidates", None)
+    if not callable(original) or getattr(original, "__actionable_contract_v1__", False):
+        return
+
+    @wraps(original)
+    def wrapped(frame: pd.DataFrame, *args: Any, **kwargs: Any) -> pd.DataFrame:
+        model = str(kwargs.get("model") or "")
+        lane = str(kwargs.get("lane") or "RESEARCH")
+        source = _actionable_selector_input(frame, model=model, lane=lane)
+        return original(source, *args, **kwargs)
+
+    wrapped.__actionable_contract_v1__ = True
+    setattr(owner, "select_top_candidates", wrapped)
+
+
 def _wrap_dashboard_renderer(owner: Any) -> None:
     original = getattr(owner, "render_dashboard_html", None)
     if not callable(original) or getattr(original, "__top3_csv_download_v1__", False):
@@ -159,6 +192,7 @@ def install() -> dict[str, str]:
 
     _wrap_focus_builder(simple_focus, "build_next_leaders")
     _wrap_focus_builder(simple_focus, "build_swing_ready")
+    _wrap_top_selector(v9_dashboard)
     _wrap_dashboard_renderer(v9_dashboard)
     return {
         "patch_version": PATCH_VERSION,
@@ -167,6 +201,7 @@ def install() -> dict[str, str]:
         "smc_policy": "PRICE_STRUCTURE_PRIMARY_ZAPI_FLOW_CONFIRMATION_ONLY",
         "identity_policy": "FOREIGN_FLOW_IS_NOT_BROKER_OR_BENEFICIAL_OWNER_IDENTITY",
         "top3_csv_policy": "SELF_CONTAINED_HTML_DATA_URI_FULL_ROW_EXPORT_WITH_ZAPI_AUDIT_WHEN_AVAILABLE",
+        "actionable_top3_policy": "ORDER_BUILDER_ELIGIBLE_AND_NOT_REAL_MONEY_BLOCKED",
     }
 
 
@@ -174,4 +209,5 @@ __all__ = [
     "PATCH_VERSION",
     "install",
     "_top3_csv_download_block",
+    "_actionable_selector_input",
 ]
