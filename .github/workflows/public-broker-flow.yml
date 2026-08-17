@@ -1,0 +1,40 @@
+name: Public IDX broker flow cache
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 10 * * 1-5"
+  push:
+    branches: [main]
+    paths:
+      - "public_idx_broker_flow.py"
+      - "scripts/update_public_broker_flow.py"
+      - ".github/workflows/public-broker-flow.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install lightweight collector dependencies
+        run: python -m pip install --disable-pip-version-check --no-cache-dir pandas==2.3.3 requests==2.34.2
+      - name: Refresh rolling broker cache
+        run: python scripts/update_public_broker_flow.py
+      - name: Commit updated cache
+        run: |
+          if git diff --quiet -- data/public_broker_flow_30d.csv.gz; then
+            echo "No cache update; likely market holiday or source unavailable."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/public_broker_flow_30d.csv.gz
+          git commit -m "data: refresh public IDX broker flow cache"
+          git push
