@@ -17,6 +17,13 @@ def _install_integrity_patch(expected: str) -> None:
             installer()
     except Exception:
         pass
+    try:
+        broker_patch = importlib.import_module("broker_runtime_patch")
+        installer = getattr(broker_patch, "install", None)
+        if callable(installer):
+            installer()
+    except Exception:
+        pass
     patch = importlib.import_module("runtime_integrity_patch")
     patch.install(expected)
     try:
