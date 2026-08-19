@@ -1,0 +1,48 @@
+name: Super canonical IDX participant flow verify
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '45 13 * * 1-5'
+  push:
+    paths:
+      - '.github/workflows/verify-canonical-participant-flow.yml'
+      - 'broker_runtime_patch.py'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install pandas requests
+      - name: Verify canonical 400-ticker participant cache
+        run: |
+          python - <<'PY'
+          from io import BytesIO
+          import gzip
+          import pandas as pd
+          import requests
+
+          url = 'https://raw.githubusercontent.com/rizanrizan93/idx-flow-scanner/main/data/cache/idx_public_participant_30d.csv.gz'
+          r = requests.get(url, timeout=20, headers={'User-Agent':'Super-Canonical-Participant-Verify/1.0'})
+          r.raise_for_status()
+          df = pd.read_csv(BytesIO(gzip.decompress(r.content)))
+          required = {'ticker','trade_date','participant','buy_value','sell_value','buy_volume','sell_volume','participant_flow_source'}
+          missing = required - set(df.columns)
+          if missing:
+              raise SystemExit(f'MISSING_COLUMNS:{sorted(missing)}')
+          df['ticker'] = df['ticker'].astype(str).str.upper().str.replace('.JK','', regex=False)
+          df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce').dt.normalize()
+          latest = df['trade_date'].max()
+          tickers = int(df.loc[df['trade_date'].eq(latest),'ticker'].nunique()) if pd.notna(latest) else 0
+          print({'latest_trade_date': str(latest.date()) if pd.notna(latest) else None, 'latest_tickers': tickers, 'rows': len(df), 'days': int(df['trade_date'].nunique())})
+          if tickers < 360:
+              raise SystemExit(f'LATEST_PARTICIPANT_COVERAGE_TOO_LOW:{tickers}/400')
+          PY
