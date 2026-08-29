@@ -6,6 +6,7 @@ from simple_focus import (
     _business_component,
     _future_component,
     _management_component,
+    _technical_component,
     _weighted_final,
 )
 
@@ -100,3 +101,19 @@ def test_weighted_final_shrinks_each_component_by_its_own_coverage():
 
     assert score == 52.5
     assert coverage == 55.0
+
+
+
+def test_setup_state_caps_technical_score_instead_of_becoming_a_second_vote():
+    base = {
+        "sig_quality_score": 90.0,
+        "sig_momentum_score": 9.0,
+        "sig_rr1": 2.0,
+    }
+    ready = _technical_component({**base, "sig_setup_status": "EXECUTION_READY"})
+    watch = _technical_component({**base, "sig_setup_status": "WATCHLIST"})
+
+    assert ready[0] > watch[0]
+    assert watch[0] <= 68.0
+    assert "STATE_CAP:WATCHLIST" in watch[2]
+    assert "SETUP_STATE" not in watch[2]
