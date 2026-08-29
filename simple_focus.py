@@ -898,7 +898,7 @@ def build_next_leaders(universe: pd.DataFrame, config: ScanConfig | None = None)
         entry = _first_num(row, ("sig_entry", "sig_entry_low"))
         rr1 = _first_num(row, ("sig_rr1",))
         adtv = _first_num(row, ("sig_adtv20_idr", "flow_adtv20_idr"))
-        liquidity_ok = not np.isfinite(adtv) or adtv >= 250_000_000.0
+        liquidity_ok = bool(np.isfinite(adtv) and adtv >= 250_000_000.0)
         candidate_type = _candidate_type(row, future[0], business[0])
         freshness_profile = reporting_refresh_profile(row)
         growth_profile = latest_growth_profile(row)
@@ -1066,7 +1066,8 @@ def build_next_leaders(universe: pd.DataFrame, config: ScanConfig | None = None)
     out["portfolio_rank_eligible"] = (
         out["production_rank_eligible"]
         & score_series.ge(66.0)
-        & (adtv_series.isna() | adtv_series.ge(250_000_000.0))
+        & adtv_series.notna()
+        & adtv_series.ge(250_000_000.0)
     )
     out["research_gate_state"] = np.where(out["rank_eligible"], "PASS", "BLOCKED")
     official_verified_series = out.get("fundamental_official_verified", pd.Series(False, index=out.index)).fillna(False).astype(bool)
@@ -1241,6 +1242,7 @@ def build_swing_ready(universe: pd.DataFrame, next_leaders: pd.DataFrame, config
     out["actionable_rank_eligible"] = (
         out["production_rank_eligible"]
         & out["status"].isin(["EXECUTION_READY", "ENTRY_PLAN_READY"])
+        & out.get("real_money_authorization_pass", pd.Series(False, index=out.index)).fillna(False).astype(bool)
         & ~out.get("anti_chase_gate", pd.Series(False, index=out.index)).fillna(False).astype(bool)
     )
     out["research_gate_state"] = np.where(out["rank_eligible"], "PASS", "BLOCKED")
