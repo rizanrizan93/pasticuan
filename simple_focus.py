@@ -428,32 +428,45 @@ def _narrative_flow_component(row: Mapping[str, Any]) -> tuple[float, float, str
 
 
 def _technical_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
+    """Score independent technical measurements; use setup state only as a cap.
+
+    Setup status is derived from the same price/quality/momentum evidence and is
+    therefore not an independent alpha vote. Treating it as 35% of the score
+    double-counted the setup. The state now constrains the maximum score instead.
+    """
     state = str(_first(row, ("sig_setup_status", "sig_status", "sig_decision_state"), "")).upper()
-    state_map = {
-        "EXECUTION_READY": 95.0,
-        "ENTRY_PLAN_READY": 82.0,
-        "READY_FOR_PRICE_VERIFY": 76.0,
-        "READY_FOR_STOCKBIT_VERIFY": 74.0,
-        "WATCHLIST": 55.0,
-        "WATCHLIST_ENTRY": 60.0,
-        "PENDING": 42.0,
-        "REJECT": 10.0,
-    }
-    state_score = state_map.get(state, np.nan)
+    state_cap = {
+        "EXECUTION_READY": 100.0,
+        "ENTRY_PLAN_READY": 90.0,
+        "READY_FOR_PRICE_VERIFY": 82.0,
+        "READY_FOR_STOCKBIT_VERIFY": 80.0,
+        "WATCHLIST_ENTRY": 72.0,
+        "WATCHLIST": 68.0,
+        "PENDING": 50.0,
+        "REJECT": 20.0,
+    }.get(state, 100.0)
     quality = _first_num(row, ("sig_quality_score", "sig_analyst_fusion_score", "sig_setup_score"))
     momentum = _first_num(row, ("sig_momentum_score", "fund_momentum_score"))
     if np.isfinite(momentum) and momentum <= 12:
         momentum = momentum * 100.0 / 12.0
     rr1 = _first_num(row, ("sig_rr1",))
     rr_score = _clip(40.0 + 25.0 * rr1) if np.isfinite(rr1) else np.nan
-    values = [(state_score, 0.35, "SETUP_STATE"), (quality, 0.30, "QUALITY"),
-              (momentum, 0.20, "MOMENTUM"), (rr_score, 0.15, "RR")]
+
+    values = [
+        (quality, 0.45, "QUALITY"),
+        (momentum, 0.30, "MOMENTUM"),
+        (rr_score, 0.25, "RR"),
+    ]
     observed = [(v, w, label) for v, w, label in values if np.isfinite(v)]
     if not observed:
         return np.nan, 0.0, ""
     weight = sum(w for _, w, _ in observed)
-    score = sum(_clip(v) * w for v, w, _ in observed) / weight
-    return score, 100.0 * weight, " | ".join(label for _, _, label in observed)
+    raw_score = sum(_clip(v) * w for v, w, _ in observed) / weight
+    score = min(raw_score, state_cap)
+    labels = " | ".join(label for _, _, label in observed)
+    if state:
+        labels = f"{labels} | STATE_CAP:{state}"
+    return score, 100.0 * weight, labels
 
 
 def _research_accumulation_plan(row: Mapping[str, Any]) -> dict[str, Any]:
