@@ -137,7 +137,6 @@ def yahoo_chart_direct(
     corporate action from an unexplained discontinuity.
     """
     client = session or requests.Session()
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
     params: dict[str, Any] = {
         "interval": "1d",
         "events": "div,splits,capitalGains",
@@ -149,10 +148,25 @@ def yahoo_chart_direct(
         params["period2"] = _epoch(end, now + 2 * 86400)
     else:
         params["range"] = period
-    payload, attempts = _request_json(
-        client, url, params=params, timeout=timeout,
-        retry_count=retry_count, retry_backoff=retry_backoff,
-    )
+    payload: dict[str, Any] | None = None
+    attempts = 0
+    route_errors: list[str] = []
+    selected_host = ""
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        url = f"https://{host}/v8/finance/chart/{ticker}"
+        try:
+            payload, used = _request_json(
+                client, url, params=params, timeout=timeout,
+                retry_count=retry_count, retry_backoff=retry_backoff,
+            )
+            attempts += int(used)
+            selected_host = host
+            break
+        except Exception as exc:
+            attempts += max(1, int(retry_count))
+            route_errors.append(f"{host}:{type(exc).__name__}:{str(exc)[:100]}")
+    if payload is None:
+        raise RuntimeError("Yahoo chart hosts failed: " + " | ".join(route_errors))
     chart = payload.get("chart") or {}
     error = chart.get("error")
     if error:
@@ -238,6 +252,7 @@ def yahoo_chart_direct(
     return frame, {
         "provider": "YAHOO_CHART_DIRECT",
         "status": "OK",
+        "host": selected_host,
         "rows": int(len(frame)),
         "attempts": attempts,
         "split_events": len(split_dates),
