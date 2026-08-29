@@ -120,6 +120,17 @@ def select_top_candidates(frame: pd.DataFrame, *, model: str, limit: int = 3, la
         local = local.loc[local[eligibility_column].fillna(False).astype(bool)].copy()
     elif "rank_eligible" in local.columns:
         local = local.loc[local["rank_eligible"].fillna(False).astype(bool)].copy()
+
+    # Named production lanes are semantic contracts, not just sorting aliases.
+    # A WATCH/BLOCKED gate may remain visible in research, but must never appear
+    # under an Investable or Swing Ready heading.
+    if model_name == "NEXT_LEADER" and lane_name == "PORTFOLIO":
+        gate = local.get("portfolio_gate_state", pd.Series("BLOCKED", index=local.index)).astype(str).str.upper()
+        local = local.loc[gate.eq("PASS")].copy()
+    elif model_name != "NEXT_LEADER" and lane_name in {"ACTIONABLE", "EXECUTION"}:
+        execution_gate = local.get("execution_gate_state", pd.Series("BLOCKED", index=local.index)).astype(str).str.upper()
+        auth = local.get("real_money_authorization_pass", pd.Series(False, index=local.index)).fillna(False).astype(bool)
+        local = local.loc[execution_gate.eq("PASS") & auth].copy()
     if local.empty:
         return local
     local["_status_priority"] = local.get("status", pd.Series(index=local.index, dtype=str)).astype(str).str.upper().map(priority_map).fillna(50)
