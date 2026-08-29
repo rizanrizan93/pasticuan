@@ -1,6 +1,16 @@
-> Production runtime audit: v9.8.2 Hotfix 9 (universe sector integrity).
+> Current production contract: **v9.8.21-future-evidence-status-ui**.
 
-# IDX Super Scanner v9.8.2 — ALL_ELIGIBLE_LITE / Database Acceleration
+# IDX Super Scanner — ALL_ELIGIBLE_LITE / Evidence-Governed Production
+
+Current integrity contract:
+- uploaded universe is preserved exactly; portfolio-only tickers never displace scan members;
+- cold OHLCV may use the shared canonical EOD seed only as a provider-outage fallback;
+- every accepted OHLCV frame must still match the last completed IDX session;
+- setup state caps technical conviction instead of receiving a second correlated score vote;
+- optional runtime-patch failures are observable; the mandatory integrity patch remains fail-hard;
+- research, production ranking, and real-money authorization remain separate lanes.
+
+Historical v9.8.2 notes are retained below for migration lineage.
 
 Production workflow:
 
