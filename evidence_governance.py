@@ -61,7 +61,7 @@ def validate_official_evidence(
     distinct_https = list(dict.fromkeys(url for url in urls if is_https_url(url)))
     parsed_date = pd.to_datetime(evidence_date, errors="coerce", utc=True)
     now_ts = now if now is not None else pd.Timestamp.now(tz="UTC")
-    date_valid = bool(pd.notna(parsed_date) and parsed_date <= now_ts + pd.Timedelta(days=1))
+    date_valid = bool(pd.notna(parsed_date) and parsed_date <= now_ts + pd.to_timedelta(1, unit="D"))
     verified = _truthy(source_verified)
     entity_ok = _truthy(entity_match_verified)
     https_ok = bool(primary and is_https_url(primary))
