@@ -39,23 +39,31 @@ def test_top3_html_embeds_downloadable_full_csv_with_zapi_audit_columns():
     assert "zapi_foreign_flow_coverage_pct" in restored.columns
 
 
-def test_actionable_swing_top3_excludes_order_builder_ineligible_or_real_money_blocked_rows():
+def test_actionable_swing_top3_requires_direct_authorization_and_execution_gate_pass():
     frame = pd.DataFrame([
         {
-            "ticker": "MMIX.JK",
+            "ticker": "BLOCKED.JK",
             "actionable_rank_eligible": True,
             "order_builder_eligible": False,
+            "real_money_authorization_pass": False,
             "real_money_authorization_state": "REAL_MONEY_BLOCKED",
-            "rr1": 0.11,
-            "rr2": 0.83,
+            "execution_gate_state": "BLOCKED",
+        },
+        {
+            "ticker": "MANUAL.JK",
+            "actionable_rank_eligible": True,
+            "order_builder_eligible": True,
+            "real_money_authorization_pass": False,
+            "real_money_authorization_state": "REAL_MONEY_MANUAL_CONFIRMATION_REQUIRED",
+            "execution_gate_state": "BLOCKED",
         },
         {
             "ticker": "SAFE.JK",
             "actionable_rank_eligible": True,
             "order_builder_eligible": True,
-            "real_money_authorization_state": "REAL_MONEY_MANUAL_CONFIRMATION_REQUIRED",
-            "rr1": 1.4,
-            "rr2": 2.1,
+            "real_money_authorization_pass": True,
+            "real_money_authorization_state": "REAL_MONEY_DIRECT_VERIFIED_READY",
+            "execution_gate_state": "PASS",
         },
     ])
 
