@@ -92,7 +92,9 @@ jobs:
               print('WARN_FORWARD_NO_MATERIAL_EVIDENCE_IN_SMOKE_SAMPLE')
           PY
       - name: Run canonical 400-name cold production engine
-        run: python tools/live_scan_400_smoke.py | tee /tmp/live-scan.log
+        run: |
+          set -o pipefail
+          python tools/live_scan_400_smoke.py | tee /tmp/live-scan.log
       - name: Upload scanner outputs
         if: always()
         uses: actions/upload-artifact@v6
