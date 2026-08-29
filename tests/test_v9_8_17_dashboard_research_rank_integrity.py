@@ -34,21 +34,21 @@ def test_research_lane_uses_guarded_score_before_execution_status():
     assert top["ticker"].tolist() == ["PBID.JK", "TSPC.JK", "KINO.JK"]
 
 
-def test_non_research_lane_retains_execution_status_priority():
+def test_portfolio_lane_requires_gate_pass_and_never_labels_watch_as_investable():
     leaders = pd.DataFrame([
         {
-            "ticker": "WATCH.JK", "portfolio_rank_eligible": True, "status": "WATCH",
-            "ranking_score": 90.0,
+            "ticker": "WATCH.JK", "portfolio_rank_eligible": True, "portfolio_gate_state": "WATCH",
+            "status": "WATCH", "ranking_score": 90.0,
         },
         {
-            "ticker": "BUY.JK", "portfolio_rank_eligible": True, "status": "BUY_ZONE",
-            "ranking_score": 75.0,
+            "ticker": "BUY.JK", "portfolio_rank_eligible": True, "portfolio_gate_state": "PASS",
+            "status": "BUY_ZONE", "ranking_score": 75.0,
         },
     ])
 
     top = select_top_candidates(leaders, model="NEXT_LEADER", limit=2, lane="PORTFOLIO")
 
-    assert top["ticker"].tolist() == ["BUY.JK", "WATCH.JK"]
+    assert top["ticker"].tolist() == ["BUY.JK"]
 
 
 def test_dashboard_modules_share_release_lineage():
