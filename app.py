@@ -67,7 +67,7 @@ from macro_engine import MACRO_ENGINE_VERSION  # noqa: E402
 from simple_focus import SIMPLE_FOCUS_VERSION  # noqa: E402
 from decision_overlay import DECISION_OVERLAY_VERSION  # noqa: E402
 from v9_dashboard import SCANNER_VERSION as DASHBOARD_SCANNER_VERSION, V9_DASHBOARD_VERSION, render_dashboard_html, select_top_candidates  # noqa: E402
-from fast_scan_engine import FAST_SCAN_VERSION, run_fast_single_scan  # noqa: E402
+from fast_scan_engine import FAST_SCAN_VERSION, reconcile_requested_universe, run_fast_single_scan  # noqa: E402
 from fundamental_calibration import CALIBRATION_VERSION  # noqa: E402
 from resumable_app_engine import ENGINE_VERSION as RESUMABLE_ENGINE_VERSION  # noqa: E402
 
@@ -190,7 +190,13 @@ if run_scan:
             st.error(f"Portfolio CSV tidak valid: {exc}")
             st.stop()
     portfolio_tickers = portfolio["ticker"].dropna().astype(str).drop_duplicates().tolist() if not portfolio.empty and "ticker" in portfolio else []
-    universe = list(dict.fromkeys(portfolio_tickers + tickers))[:400]
+    universe, portfolio_outside_universe = reconcile_requested_universe(tickers, portfolio_tickers, max_tickers=400)
+    if portfolio_outside_universe:
+        st.info(
+            "Portfolio memiliki ticker di luar universe upload; ticker tersebut dipertahankan sebagai konteks portfolio "
+            "dan tidak menggantikan anggota universe scan: " + ", ".join(portfolio_outside_universe[:20])
+            + (" …" if len(portfolio_outside_universe) > 20 else "")
+        )
     config = {
         "period": period,
         "account_size_idr": account_size,
