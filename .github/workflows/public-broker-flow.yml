@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: "3.12"
       - name: Install lightweight collector dependencies
         run: python -m pip install --disable-pip-version-check --no-cache-dir pandas==2.3.3 requests==2.34.2
       - name: Refresh rolling broker cache
