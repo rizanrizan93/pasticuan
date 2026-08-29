@@ -1496,6 +1496,7 @@ def _download_ohlcv_v431(tickers: Iterable[str], period: str='3y', batch_size: i
                         downloaded_bars += len(live)
                         merged = _merge_ohlcv_history(cached_histories.get(ticker, pd.DataFrame()), live)
                         histories[ticker] = merged
+                        failed.pop(ticker, None)
                         if incremental:
                             incremental_refreshes += 1
                             source_tiers[ticker] = 'LIVE_YAHOO_INCREMENTAL'
@@ -1631,6 +1632,42 @@ def _download_ohlcv_v431(tickers: Iterable[str], period: str='3y', batch_size: i
                         f"Yahoo chart direct {meta.get('rows', len(direct))} bar ({state})",
                         ' • '.join(quality),
                     ]))
+
+    # Emergency cold-bootstrap path. Direct Yahoo JSON is the bounded default,
+    # but public egress can occasionally block both chart hosts at once. When a
+    # broad outage would otherwise leave most of the universe without any
+    # history, make one bounded batch attempt through yfinance before giving up.
+    unresolved = [ticker for ticker in requested if ticker not in histories]
+    emergency_threshold = max(20, int(0.50 * max(1, len(requested))))
+    emergency_enabled = str(os.environ.get(
+        'IDX_SCANNER_ENABLE_EMERGENCY_YFINANCE_BOOTSTRAP', 'true'
+    )).strip().lower() in {'1','true','yes','on','enabled'}
+    if unresolved and len(unresolved) >= emergency_threshold and yf is None and emergency_enabled:
+        try:
+            import yfinance as yf_emergency
+            yf = yf_emergency
+            emergency_incremental = [
+                ticker for ticker in unresolved
+                if not cached_histories.get(ticker, pd.DataFrame()).empty
+            ]
+            emergency_full = [
+                ticker for ticker in unresolved
+                if cached_histories.get(ticker, pd.DataFrame()).empty
+            ]
+            run_batch_download(emergency_incremental, incremental=True)
+            run_batch_download(emergency_full, incremental=False)
+            for ticker in unresolved:
+                if ticker in histories:
+                    prior = warnings.get(ticker, '')
+                    warnings[ticker] = ' • '.join(filter(None, [
+                        prior, 'Emergency yfinance batch fallback used after direct Yahoo outage'
+                    ]))
+        except Exception as exc:
+            for ticker in unresolved:
+                prior = warnings.get(ticker, '')
+                warnings[ticker] = ' • '.join(filter(None, [
+                    prior, f'Emergency yfinance fallback failed: {type(exc).__name__}'
+                ]))
 
     unresolved = [ticker for ticker in requested if ticker not in histories]
     if unresolved:
