@@ -224,9 +224,14 @@ def run_fast_single_scan(
 ) -> dict[str, Any]:
     """Run the complete 400-name workflow without scan-job repository I/O."""
     started = time.perf_counter()
-    universe = list(dict.fromkeys(_ticker(v) for v in tickers if _ticker(v)))[:400]
+    universe = list(dict.fromkeys(_ticker(v) for v in tickers if _ticker(v)))
     if not universe:
         raise ValueError("Universe ticker kosong")
+    if len(universe) > 400:
+        raise ValueError(
+            f"UNIVERSE_EXCEEDS_400:{len(universe)}; refusing silent truncation. "
+            "Provide the intended 400-name production universe explicitly."
+        )
     cfg = dict(config or {})
     # Lean production policy. These are research budgets, not user-facing modes.
     cfg.setdefault("period", "5y")
