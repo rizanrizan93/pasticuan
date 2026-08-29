@@ -209,9 +209,14 @@ def _actionable_selector_input(frame: pd.DataFrame, *, model: str, lane: str) ->
     local = frame.copy()
     if "order_builder_eligible" in local.columns:
         local = local.loc[local["order_builder_eligible"].fillna(False).astype(bool)].copy()
-    if "real_money_authorization_state" in local.columns:
+    if "real_money_authorization_pass" in local.columns:
+        local = local.loc[local["real_money_authorization_pass"].fillna(False).astype(bool)].copy()
+    elif "real_money_authorization_state" in local.columns:
         state = local["real_money_authorization_state"].fillna("").astype(str).str.upper()
-        local = local.loc[state.ne("REAL_MONEY_BLOCKED")].copy()
+        local = local.loc[state.eq("REAL_MONEY_DIRECT_VERIFIED_READY")].copy()
+    if "execution_gate_state" in local.columns:
+        gate = local["execution_gate_state"].fillna("BLOCKED").astype(str).str.upper()
+        local = local.loc[gate.eq("PASS")].copy()
     if "zapi_execution_flow_guard_state" in local.columns:
         guard = local["zapi_execution_flow_guard_state"].fillna("").astype(str).str.upper()
         local = local.loc[~guard.isin({"WAIT_FLOW_STABILIZATION_AND_RECLAIM", "REQUIRE_ABSORPTION_OR_RECLAIM_BEFORE_ENTRY"})].copy()
