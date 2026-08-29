@@ -280,7 +280,10 @@ def _authorization_for_row(row: Mapping[str, Any], model: str, account_size_idr:
         if not np.isfinite(business) or business < 60: blockers.append("BUSINESS<60")
         if not np.isfinite(future) or future < 45: blockers.append("FUTURE<45")
         if np.isfinite(technical) and technical < 68: blockers.append("TECHNICAL<68")
-        if np.isfinite(adtv) and adtv < 250_000_000: blockers.append("LIQUIDITY<250M_ADTV")
+        if not np.isfinite(adtv) or adtv <= 0:
+            manual.append("LIQUIDITY_ADTV_CONFIRMATION")
+        elif adtv < 250_000_000:
+            blockers.append("LIQUIDITY<250M_ADTV")
         if np.isfinite(rr) and rr < 1.5: blockers.append("RR<1.5")
         if np.isfinite(data_quality) and data_quality < 70: blockers.append("FUND_DATA_QUALITY<70")
         if trend_state == "FUNDAMENTAL_DETERIORATION": blockers.append("FUNDAMENTAL_DETERIORATION")
@@ -294,6 +297,11 @@ def _authorization_for_row(row: Mapping[str, Any], model: str, account_size_idr:
         if not np.isfinite(score) or score < 65: blockers.append("SWING_SCORE<65")
         if not np.isfinite(technical) or technical < 60: blockers.append("TECHNICAL<60")
         if np.isfinite(risk_data) and risk_data < 55: blockers.append("RISK_DATA<55")
+        adtv = _first_num(row, "adtv20_idr")
+        if not np.isfinite(adtv) or adtv <= 0:
+            manual.append("LIQUIDITY_ADTV_CONFIRMATION")
+        elif adtv < 250_000_000:
+            blockers.append("LIQUIDITY<250M_ADTV")
         if trend_state == "FUNDAMENTAL_DETERIORATION": manual.append("FUNDAMENTAL_DETERIORATION_SWING_REVIEW")
         if np.isfinite(rr) and rr < 1.5: blockers.append("RR<1.5")
         if not official_verified:
