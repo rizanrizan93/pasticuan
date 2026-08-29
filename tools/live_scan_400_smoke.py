@@ -112,6 +112,20 @@ summary = {
 }
 Path("live_scan_output/summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
 print(json.dumps(summary, indent=2, default=str))
+
+technical_coverage = 0.0
+if isinstance(coverage, pd.DataFrame) and not coverage.empty:
+    technical_coverage = float(pd.to_numeric(
+        coverage.iloc[0].get("technical_coverage_pct"), errors="coerce"
+    ) or 0.0)
+if technical_coverage < 90.0:
+    state_counts = coverage.iloc[0].get("ohlcv_state_counts") if isinstance(coverage, pd.DataFrame) and not coverage.empty else {}
+    raise SystemExit(
+        f"LIVE_400_TECHNICAL_COVERAGE_TOO_LOW:{technical_coverage:.1f}% "
+        f"ohlcv_state_counts={state_counts}"
+    )
+if leader_n + swing_n <= 0:
+    raise SystemExit("LIVE_400_EMPTY_RANKING_WITH_SUFFICIENT_TECHNICAL_COVERAGE")
 if isinstance(leaders, pd.DataFrame) and not leaders.empty:
     cols = [c for c in [
         "ticker", "raw_research_rank", "guarded_decision_priority_rank", "production_real_money_rank",
