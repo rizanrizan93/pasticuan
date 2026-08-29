@@ -4932,7 +4932,7 @@ FUNDAMENTAL_HISTORY_COLUMNS: tuple[str, ...] = (
     'operating_income', 'ebit', 'ebitda', 'net_income',
     'operating_cash_flow', 'capex', 'total_assets', 'total_liabilities',
     'equity', 'total_debt', 'cash', 'shares_outstanding', 'interest_expense',
-    'car', 'npl_gross', 'ldr', 'source_verified', 'validation_flags',
+    'car', 'npl_gross', 'ldr', 'source_verified', 'available_at', 'validation_flags',
 )
 
 _FUNDAMENTAL_VALUE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -5148,6 +5148,21 @@ def normalize_fundamental_history(frame: pd.DataFrame) -> pd.DataFrame:
     # observations, therefore the wall-time component is discarded.
     normalized_period_end = out['period_end'].map(_as_jakarta_naive_timestamp)
     out['period_end'] = pd.to_datetime(normalized_period_end, errors='coerce').dt.normalize()
+
+    # Point-in-time availability is distinct from fiscal period_end.  Legacy rows
+    # without a publication/observation timestamp are conservatively stamped at
+    # first ingestion, never backdated to the reporting period.
+    normalized_available_at = out['available_at'].map(_as_jakarta_naive_timestamp)
+    out['available_at'] = pd.to_datetime(normalized_available_at, errors='coerce')
+    availability_missing = out['available_at'].isna()
+    if availability_missing.any():
+        ingestion_time = _as_jakarta_naive_timestamp(pd.Timestamp.now(tz='Asia/Jakarta'))
+        out.loc[availability_missing, 'available_at'] = ingestion_time
+        prior_availability_flags = out.loc[availability_missing, 'validation_flags'].fillna('').astype(str)
+        out.loc[availability_missing, 'validation_flags'] = [
+            ' • '.join(part for part in (old.strip(), 'AVAILABILITY_TIMESTAMP_ASSIGNED_AT_INGESTION') if part)
+            for old in prior_availability_flags
+        ]
     out['period_type'] = [
         _normalize_period_type(period, date)
         for period, date in zip(out['period_type'], out['period_end'])
@@ -5201,6 +5216,11 @@ def normalize_fundamental_history(frame: pd.DataFrame) -> pd.DataFrame:
             values = values[values.ne('')]
             if not values.empty:
                 base[column] = values.iloc[-1]
+        availability_values = pd.to_datetime(group['available_at'], errors='coerce').dropna()
+        if not availability_values.empty:
+            # A merged row is only fully available once its latest contributing
+            # observation was known.
+            base['available_at'] = availability_values.max()
         flags = [
             flag.strip() for value in group['validation_flags'].fillna('').astype(str)
             for flag in value.split(' • ') if flag.strip()
@@ -5238,6 +5258,10 @@ def parse_fundamental_history_csv(source: bytes | BinaryIO | pd.DataFrame) -> pd
     source_column = pick('source_name', 'provider', 'source', 'sumber')
     source_url_column = pick('source_url', 'document_url', 'idx_url', 'url')
     currency_column = pick('currency', 'mata_uang')
+    availability_column = pick(
+        'available_at', 'published_at', 'filing_date', 'release_date',
+        'report_modified', 'file_modified', 'observed_at', 'fetched_at',
+    )
     multiplier_column = pick('unit_multiplier', 'multiplier', 'satuan_pengali')
     shares_multiplier_column = pick('shares_multiplier', 'share_unit_multiplier', 'pengali_saham')
     out['period_type'] = raw[period_column] if period_column is not None else ''
@@ -5245,6 +5269,11 @@ def parse_fundamental_history_csv(source: bytes | BinaryIO | pd.DataFrame) -> pd
     out['source_name'] = raw[source_column] if source_column is not None else 'User statement upload'
     out['source_url'] = raw[source_url_column] if source_url_column is not None else ''
     out['currency'] = raw[currency_column] if currency_column is not None else 'IDR'
+    out['available_at'] = (
+        raw[availability_column]
+        if availability_column is not None
+        else pd.Timestamp.now(tz='Asia/Jakarta').isoformat()
+    )
     official_reference = out['source_url'].map(_official_idx_reference)
     out['source_family'] = np.where(official_reference, 'IDX_OFFICIAL_REFERENCE', 'USER_UPLOAD')
     # A referenced URL is evidence provenance, not cryptographic verification.
@@ -6484,6 +6513,20 @@ def _history_features_for_ticker(ticker: str, history: pd.DataFrame, now: Any | 
     if local.empty:
         return {'ticker': ticker, 'fundamental_data_grade': 'D', 'fundamental_history_quarters': 0, 'fundamental_history_years': 0}
     current = _as_jakarta_naive_timestamp(now if now is not None else pd.Timestamp.now(tz='Asia/Jakarta'))
+
+    if 'available_at' in local.columns:
+        availability = pd.to_datetime(local['available_at'], errors='coerce')
+        local = local.loc[availability.notna() & availability.le(current)].copy()
+    if local.empty:
+        return {
+            'ticker': ticker,
+            'fundamental_data_grade': 'D',
+            'fundamental_history_quarters': 0,
+            'fundamental_history_years': 0,
+            'fundamental_point_in_time_state': 'NO_EVIDENCE_AVAILABLE_AS_OF',
+            'fundamental_latest_available_at': pd.NaT,
+        }
+
     currency_counts = local['currency'].replace('', np.nan).dropna().value_counts()
     primary_currency = str(currency_counts.index[0]) if not currency_counts.empty else 'IDR'
     currency_conflict = len(currency_counts) > 1
@@ -6853,6 +6896,8 @@ def _history_features_for_ticker(ticker: str, history: pd.DataFrame, now: Any | 
             'COMPLETE_FOR_MULTIBAGGER' if complete_for_multibagger
             else 'PARTIAL_MISSING_' + ('_'.join(missing_core_fields[:4]) if missing_core_fields else 'HISTORY_OR_LINEAGE')
         ),
+        'fundamental_point_in_time_state': 'AVAILABLE_AS_OF',
+        'fundamental_latest_available_at': pd.to_datetime(local['available_at'], errors='coerce').max(),
     }
 
 
