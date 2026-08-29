@@ -55,7 +55,10 @@ class SetupPlan:
     detected: bool
     setup_score: float
     signal_date: Any = None
+    confirmation_date: Any = None
+    executable_date: Any = None
     zone_created_date: Any = None
+    timestamp_semantics: str = "SIGNAL_DATE_IS_SETUP_ORIGIN_NOT_ENTRY"
     entry_low: float | None = None
     entry_high: float | None = None
     entry: float | None = None
@@ -719,6 +722,8 @@ def _detect_breakout_v21(df: pd.DataFrame, ticker: str) -> SetupPlan:
         plan.action = 'WAIT_RETEST'
     raw_stop = min(retest_low, resistance - 0.7 * atr_v) - 0.15 * atr_v
     plan.signal_date = breakout_date
+    plan.confirmation_date = df.index[-1] if (retest_date is not None and confirmation) else retest_date
+    plan.executable_date = df.index[-1] if plan.action in {"READY_TRIGGER", "READY_LIMIT"} else None
     plan.zone_created_date = breakout_date
     plan.zone_age_bars = _bars_since(df, breakout_date)
     plan.valid_until = pd.Timestamp(breakout_date) + pd.offsets.BDay(25)
@@ -821,6 +826,8 @@ def _detect_reversal_v21(df: pd.DataFrame, ticker: str) -> SetupPlan:
         plan.action = 'WAIT_CHOCH'
     raw_stop = sweep_low - 0.2 * atr_v
     plan.signal_date = sweep_date
+    plan.confirmation_date = choch_date
+    plan.executable_date = df.index[-1] if plan.action in {"READY_TRIGGER", "READY_LIMIT"} else None
     plan.zone_created_date = choch_date or sweep_date
     plan.zone_age_bars = _bars_since(df, plan.zone_created_date)
     plan.valid_until = pd.Timestamp(sweep_date) + pd.offsets.BDay(30)
@@ -929,6 +936,8 @@ def _detect_unicorn_v21(df: pd.DataFrame, ticker: str) -> SetupPlan:
         plan.action = 'WAIT_FVG_RETRACE'
     raw_stop = min(sweep_low, zone_low - 0.45 * atr_v) - 0.1 * atr_v
     plan.signal_date = sweep_date
+    plan.confirmation_date = fvg_date
+    plan.executable_date = df.index[-1] if plan.action in {"READY_TRIGGER", "READY_LIMIT"} else None
     plan.zone_created_date = fvg_date
     plan.zone_age_bars = _bars_since(df, fvg_date)
     plan.valid_until = pd.Timestamp(fvg_date) + pd.offsets.BDay(30)
