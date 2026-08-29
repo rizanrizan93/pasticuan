@@ -1402,6 +1402,57 @@ def _idx_eod_patch_frame(row: pd.Series) -> pd.DataFrame:
     frame = pd.DataFrame([{'Open': row.get('Open'), 'High': row.get('High'), 'Low': row.get('Low'), 'Close': row.get('Close'), 'Volume': row.get('Volume')}], index=[pd.Timestamp(row.get('Date')).normalize()])
     return _clean_ohlcv(frame, strict=True)
 
+
+def _load_canonical_remote_ohlcv_seed(
+    tickers: Iterable[str], *, timeout: int = 20,
+) -> dict[str, pd.DataFrame]:
+    """Load the shared verified 400-name EOD seed as an outage fallback.
+
+    Freshness is not trusted here. The normal download_ohlcv final-session
+    validation still rejects a stale seed instead of silently scoring it.
+    """
+    import gzip
+    import requests
+
+    requested = {
+        str(t).strip().upper().removesuffix(".JK"): str(t).strip()
+        for t in tickers if str(t).strip()
+    }
+    if not requested:
+        return {}
+    url = (
+        "https://raw.githubusercontent.com/rizanrizan93/idx-flow-scanner/"
+        "main/data/cache/idx_400_ohlcv_1y.csv.gz"
+    )
+    response = requests.get(
+        url,
+        timeout=max(5, int(timeout)),
+        headers={"User-Agent": "IDX-Super-Scanner-Canonical-EOD-Seed/1.0"},
+    )
+    response.raise_for_status()
+    raw = pd.read_csv(BytesIO(gzip.decompress(response.content)))
+    required = {"ticker", "date", "open", "high", "low", "close", "volume"}
+    if not required.issubset(raw.columns):
+        raise RuntimeError(
+            f"Canonical OHLCV seed missing columns: {sorted(required - set(raw.columns))}"
+        )
+    raw["ticker"] = raw["ticker"].astype(str).str.upper().str.removesuffix(".JK")
+    raw = raw[raw["ticker"].isin(requested)].copy()
+    if raw.empty:
+        return {}
+    result: dict[str, pd.DataFrame] = {}
+    for canonical, group in raw.groupby("ticker", sort=False):
+        frame = group.rename(columns={
+            "open": "Open", "high": "High", "low": "Low",
+            "close": "Close", "volume": "Volume",
+        }).copy()
+        frame.index = pd.to_datetime(frame["date"], errors="coerce")
+        frame = frame.drop(columns=["ticker", "date"], errors="ignore")
+        frame = _clean_ohlcv(frame, strict=True)
+        if not frame.empty:
+            result[requested.get(str(canonical), str(canonical))] = frame
+    return result
+
 def _yfinance_fallback_enabled() -> bool:
     """Keep wrapper calls opt-in because their timeout is not a hard wall clock."""
     return str(os.environ.get('IDX_SCANNER_ENABLE_YFINANCE_FALLBACK', '')).strip().lower() in {
@@ -1668,6 +1719,40 @@ def _download_ohlcv_v431(tickers: Iterable[str], period: str='3y', batch_size: i
                 warnings[ticker] = ' • '.join(filter(None, [
                     prior, f'Emergency yfinance fallback failed: {type(exc).__name__}'
                 ]))
+
+    unresolved = [ticker for ticker in requested if ticker not in histories]
+    if unresolved:
+        try:
+            provider_calls += 1
+            canonical_seed = _load_canonical_remote_ohlcv_seed(
+                unresolved,
+                timeout=max(8, int(os.environ.get("IDX_SCANNER_CANONICAL_SEED_TIMEOUT_SECONDS", "20"))),
+            )
+        except Exception as exc:
+            canonical_seed = {}
+            for ticker in unresolved:
+                prior = warnings.get(ticker, "")
+                warnings[ticker] = " • ".join(filter(None, [
+                    prior, f"Canonical EOD seed unavailable: {type(exc).__name__}"
+                ]))
+        for ticker, frame in canonical_seed.items():
+            cached = cached_histories.get(ticker, pd.DataFrame())
+            merged = _merge_ohlcv_history(cached, frame)
+            if merged.empty:
+                continue
+            histories[ticker] = merged
+            downloaded_bars += len(frame)
+            source_tiers[ticker] = "CANONICAL_GITHUB_EOD_SEED"
+            if cached.empty:
+                full_refreshes += 1
+            else:
+                incremental_refreshes += 1
+            _write_daily_ohlcv_cache(ticker, merged, "CANONICAL_GITHUB_SEED")
+            failed.pop(ticker, None)
+            prior = warnings.get(ticker, "")
+            warnings[ticker] = " • ".join(filter(None, [
+                prior, "Canonical shared EOD seed used after live provider outage"
+            ]))
 
     unresolved = [ticker for ticker in requested if ticker not in histories]
     if unresolved:
