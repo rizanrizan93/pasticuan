@@ -195,7 +195,7 @@ def _cross_section(series: pd.Series) -> pd.Series:
     score = pd.Series(np.nan, index=values.index, dtype=float)
     if int(valid.sum()) >= 3:
         score.loc[valid] = values.loc[valid].rank(pct=True) * 100.0
-    elif int(valid):
+    elif bool(valid.any()):
         score.loc[valid] = 50.0
     return score
 
