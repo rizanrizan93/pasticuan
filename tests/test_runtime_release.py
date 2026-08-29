@@ -57,3 +57,18 @@ def test_stale_loaded_modules_are_reloaded_in_dependency_order(monkeypatch):
     assert expected == SCANNER_RELEASE_VERSION
     assert calls == list(modules)
     assert reloaded == tuple(calls)
+
+
+def test_optional_runtime_patch_failure_is_observable(monkeypatch):
+    def fake_import(name):
+        if name == "broken_patch":
+            raise RuntimeError("boom")
+        return types.SimpleNamespace(install=lambda: None)
+
+    monkeypatch.setattr(runtime_release.importlib, "import_module", fake_import)
+    runtime_release._LAST_PATCH_STATUS.clear()
+    runtime_release._try_optional_patch("broken_patch", "install")
+
+    status = runtime_release.runtime_patch_status()
+    assert status["broken_patch.install"]["state"] == "FAILED"
+    assert "RuntimeError" in status["broken_patch.install"]["detail"]
