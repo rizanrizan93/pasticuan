@@ -29,6 +29,26 @@ from resumable_app_engine import process_daily_scan_chunk, finalize_daily_scan_j
 FAST_SCAN_VERSION = SCANNER_RELEASE_VERSION
 
 
+def reconcile_requested_universe(
+    uploaded_tickers: Sequence[str], portfolio_tickers: Sequence[str] = (),
+    *, max_tickers: int = 400,
+) -> tuple[list[str], list[str]]:
+    """Preserve the exact uploaded scan universe.
+
+    Portfolio membership is context for sizing/holdings; it must never displace
+    names from the user-supplied research universe. Portfolio-only symbols are
+    returned separately for transparent UI reporting.
+    """
+    universe = list(dict.fromkeys(str(t).strip() for t in uploaded_tickers if str(t).strip()))
+    if len(universe) > int(max_tickers):
+        raise ValueError(
+            f"UNIVERSE_EXCEEDS_{int(max_tickers)}:{len(universe)}; refusing silent truncation"
+        )
+    portfolio = list(dict.fromkeys(str(t).strip() for t in portfolio_tickers if str(t).strip()))
+    extras = [ticker for ticker in portfolio if ticker not in set(universe)]
+    return universe, extras
+
+
 class FastDatabaseBridge(ScannerDatabaseBridge):
     """Short-timeout bridge with independent read/write transport circuits.
 
