@@ -564,22 +564,50 @@ def _risk_data_component(row: Mapping[str, Any]) -> tuple[float, float, str]:
     return score, 100.0 * weight, " | ".join(label for _, _, label in observed)
 
 
-def _weighted_final(components: Mapping[str, tuple[float, float]], weights: Mapping[str, float], *, min_coverage: float) -> tuple[float, float]:
-    raw_sum = 0.0
-    coverage_sum = 0.0
+def _weighted_final(
+    components: Mapping[str, tuple[float, float] | tuple[float, float, str]],
+    weights: Mapping[str, float],
+    *,
+    min_coverage: float,
+) -> tuple[float, float]:
+    """Combine observed quality while keeping evidence state out of the score.
+
+    Missing, stale and provider-failed evidence reduce coverage/authorization;
+    they are not silently converted to a neutral score of 50. A genuine numeric
+    zero remains observed negative evidence. NOT_APPLICABLE removes the
+    component from the applicable denominator instead of being treated as zero
+    or unknown.
+    """
+    quality_sum = 0.0
+    observed_weight = 0.0
+    reliable_weight = 0.0
+    applicable_weight = 0.0
+    unavailable_states = {
+        "MISSING", "UNKNOWN", "NO_DATA", "PROVIDER_FAILURE", "FAILURE",
+        "STALE", "EXPIRED", "UNAVAILABLE",
+    }
     for name, weight in weights.items():
-        score, coverage = components[name]
-        observed = np.isfinite(score) and coverage > 0
-        reliability = np.clip(coverage, 0.0, 100.0) / 100.0 if observed else 0.0
-        # Shrink each evidence family independently.  Applying one aggregate
-        # shrink after mixing scores let a 15%-covered Management=100 influence
-        # ranking as strongly as a fully covered component.
-        effective = 50.0 + reliability * (score - 50.0) if observed else 50.0
-        raw_sum += weight * effective
-        coverage_sum += weight * (100.0 * reliability)
-    if coverage_sum < min_coverage:
-        return np.nan, coverage_sum
-    return _clip(raw_sum), _clip(coverage_sum)
+        raw = components[name]
+        score, coverage = raw[0], raw[1]
+        state = str(raw[2] if len(raw) >= 3 else "").strip().upper()
+        if state in {"NOT_APPLICABLE", "N/A", "NA"}:
+            continue
+        applicable_weight += weight
+        observed = np.isfinite(score) and coverage > 0.0 and state not in unavailable_states
+        reliability = float(np.clip(coverage, 0.0, 100.0) / 100.0) if observed else 0.0
+        if reliability > 0.0:
+            # Preserve the established partial-coverage contraction for an
+            # actually observed component. Wholly unavailable components do not
+            # enter this quality denominator at all.
+            effective_score = 50.0 + reliability * (_clip(score) - 50.0)
+            quality_sum += weight * effective_score
+            observed_weight += weight
+            reliable_weight += weight * reliability
+    coverage_pct = 100.0 * reliable_weight / applicable_weight if applicable_weight > 0.0 else 0.0
+    coverage_pct = round(float(coverage_pct), 10)
+    if coverage_pct < min_coverage or observed_weight <= 0.0:
+        return np.nan, _clip(coverage_pct)
+    return _clip(quality_sum / observed_weight), _clip(coverage_pct)
 
 
 def _coverage_gap_profile(

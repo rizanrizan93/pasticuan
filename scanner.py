@@ -1198,6 +1198,7 @@ def parse_ticker_csv(source: bytes | BinaryIO | pd.DataFrame, max_tickers: int=1
     universe = parse_universe_csv(source, max_tickers=max_tickers, strict_limit=strict_limit)
     return universe['ticker'].tolist() if not universe.empty else []
 
+
 def _clean_ohlcv(frame: pd.DataFrame, strict: bool=False) -> pd.DataFrame:
     if frame is None or frame.empty:
         return pd.DataFrame()

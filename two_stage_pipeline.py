@@ -265,6 +265,7 @@ class ShortlistConfig:
     multibagger_quota: int = 30
     core_quota: int = 30
     technical_rescue_quota: int = 15
+    exploration_quota: int = 3
 
 
 def build_enrichment_shortlist(
@@ -308,6 +309,12 @@ def build_enrichment_shortlist(
     source_rank: dict[tuple[str, str], int] = {}
     ordered: list[str] = []
     max_tickers = max(1, int(cfg.max_tickers))
+    exploration_cap = min(
+        max(0, int(cfg.exploration_quota)),
+        max(0, max_tickers // 4),
+        max(0, len(universe_order) - 1),
+    )
+    primary_cap = max(1, max_tickers - exploration_cap)
 
     for source_name, names in sources.items():
         for rank, ticker in enumerate(names, start=1):
@@ -315,13 +322,13 @@ def build_enrichment_shortlist(
                 continue
             reasons.setdefault(ticker, []).append(source_name)
             source_rank[(ticker, source_name)] = rank
-            if ticker not in ordered and len(ordered) < max_tickers:
+            if ticker not in ordered and len(ordered) < primary_cap:
                 ordered.append(ticker)
 
     # Fill any unused capacity in original universe order.  This makes small
     # universes complete and keeps the selection deterministic.
     for ticker in universe_order:
-        if len(ordered) >= max_tickers:
+        if len(ordered) >= primary_cap:
             break
         if ticker not in ordered:
             ordered.append(ticker)
@@ -340,6 +347,58 @@ def build_enrichment_shortlist(
         tmp["ticker"] = tmp["ticker"].map(_ticker)
         core_map = tmp.drop_duplicates("ticker", keep="first").set_index("ticker").to_dict("index")
 
+    signal_map: dict[str, dict[str, object]] = {}
+    if isinstance(signals, pd.DataFrame) and not signals.empty and "ticker" in signals:
+        tmp = signals.copy()
+        tmp["ticker"] = tmp["ticker"].map(_ticker)
+        signal_map = tmp.drop_duplicates("ticker", keep="first").set_index("ticker").to_dict("index")
+
+    def candidate_metrics(ticker: str) -> tuple[float, float]:
+        candidates: list[tuple[float, float]] = []
+        for row, score_names in (
+            (mb_map.get(ticker, {}), ("preliminary_multibagger_score", "ranking_score", "v9_next_leader_score", "final_score")),
+            (core_map.get(ticker, {}), ("preliminary_core_score", "ranking_score", "v9_swing_score", "final_score")),
+            (signal_map.get(ticker, {}), ("quality_score", "score", "technical_score", "confidence_score")),
+        ):
+            score = next((float(row[name]) for name in score_names if pd.notna(row.get(name))), np.nan)
+            if not np.isfinite(score):
+                continue
+            coverage = next((
+                float(row[name]) for name in (
+                    "score_coverage_pct", "cached_fundamental_coverage_pct",
+                    "technical_feature_coverage_pct", "data_quality_score",
+                ) if pd.notna(row.get(name))
+            ), 100.0)
+            candidates.append((float(np.clip(score, 0.0, 100.0)), float(np.clip(coverage, 0.0, 100.0))))
+        return max(candidates, key=lambda pair: pair[0]) if candidates else (0.0, 0.0)
+
+    primary_scores = [candidate_metrics(ticker)[0] for ticker in ordered]
+    cutoff = min(primary_scores) if primary_scores else 0.0
+    exploration_rows: list[tuple[tuple[float, float, float, str], str, float, float, float]] = []
+    for ticker in universe_order:
+        if ticker in ordered:
+            continue
+        score, coverage = candidate_metrics(ticker)
+        uncertainty = 100.0 - coverage
+        plausible_upside = score + (100.0 - score) * uncertainty / 100.0
+        distance = max(0.0, cutoff - score)
+        priority = (
+            0.0 if plausible_upside >= cutoff else 1.0,
+            distance,
+            -uncertainty,
+            ticker,
+        )
+        exploration_rows.append((priority, ticker, score, coverage, plausible_upside))
+    exploration_rows.sort(key=lambda item: item[0])
+    exploration_meta: dict[str, tuple[float, float, float]] = {}
+    for _, ticker, score, coverage, plausible_upside in exploration_rows[:exploration_cap]:
+        ordered.append(ticker)
+        exploration_meta[ticker] = (score, coverage, plausible_upside)
+        reasons.setdefault(ticker, []).append(
+            "HIGH_UNCERTAINTY_UPSIDE_EXPLORATION" if coverage < 50.0 and plausible_upside >= cutoff
+            else "NEAR_CUTOFF_EXPLORATION"
+        )
+
     rows: list[dict[str, object]] = []
     for final_rank, ticker in enumerate(ordered, start=1):
         mb_row = mb_map.get(ticker, {})
@@ -349,6 +408,11 @@ def build_enrichment_shortlist(
             "enrichment_rank": final_rank,
             "enrichment_reasons": " | ".join(reasons.get(ticker, [])),
             "portfolio_priority": "PORTFOLIO" in reasons.get(ticker, []),
+            "enrichment_cohort": "EXPLORATION" if ticker in exploration_meta else "PRIMARY_PROVISIONAL",
+            "provisional_cutoff_score": round(float(cutoff), 4),
+            "provisional_score": round(float(candidate_metrics(ticker)[0]), 4),
+            "provisional_coverage_pct": round(float(candidate_metrics(ticker)[1]), 4),
+            "plausible_score_upside": round(float(exploration_meta.get(ticker, (0.0, 0.0, candidate_metrics(ticker)[0]))[2]), 4),
             "preliminary_multibagger_rank": source_rank.get((ticker, "MULTIBAGGER_PRELIMINARY"), np.nan),
             "preliminary_core_rank": source_rank.get((ticker, "CORE_PRELIMINARY"), np.nan),
             "technical_rescue_rank": source_rank.get((ticker, "TECHNICAL_RESCUE"), np.nan),
@@ -357,6 +421,49 @@ def build_enrichment_shortlist(
             "two_stage_pipeline_version": TWO_STAGE_PIPELINE_VERSION,
         })
     return ordered, pd.DataFrame(rows)
+
+
+def build_enrichment_recall_diagnostics(
+    shortlist_audit: pd.DataFrame | None,
+    final_focus: Mapping[str, pd.DataFrame] | None,
+    *,
+    top_n: int = 3,
+) -> pd.DataFrame:
+    """Measure bounded exploration outcomes without imposing a target."""
+    audit = shortlist_audit.copy() if isinstance(shortlist_audit, pd.DataFrame) else pd.DataFrame()
+    if audit.empty or "ticker" not in audit.columns:
+        return pd.DataFrame()
+    audit["ticker"] = audit["ticker"].map(_ticker)
+    cohort = audit.get("enrichment_cohort", pd.Series("PRIMARY_PROVISIONAL", index=audit.index)).astype(str)
+    primary = set(audit.loc[cohort.eq("PRIMARY_PROVISIONAL"), "ticker"])
+    exploration = set(audit.loc[cohort.eq("EXPLORATION"), "ticker"])
+    focus = final_focus or {}
+    lanes = (
+        ("NEXT_LEADER", focus.get("next_leaders_all", focus.get("next_leaders", pd.DataFrame()))),
+        ("SWING_READY", focus.get("swing_ready_all", focus.get("swing_ready", pd.DataFrame()))),
+    )
+    rows: list[dict[str, object]] = []
+    for lane, frame in lanes:
+        final = _ranked_tickers(
+            frame if isinstance(frame, pd.DataFrame) else pd.DataFrame(),
+            score_columns=("ranking_score", "v9_next_leader_score", "v9_swing_score", "final_score"),
+            eligibility_columns=("rank_eligible",),
+        )[:max(0, int(top_n))]
+        denominator = len(final)
+        promoted = [ticker for ticker in final if ticker in exploration]
+        recalled = [ticker for ticker in final if ticker in primary]
+        rows.append({
+            "lane": lane,
+            "top_n": int(top_n),
+            "provisional_shortlist_size": len(primary),
+            "exploration_cohort_size": len(exploration),
+            "promoted_after_enrichment": len(promoted),
+            "promoted_tickers": promoted,
+            "final_top_n_count": denominator,
+            "final_top_n_recall_from_provisional_pct": round(100.0 * len(recalled) / denominator, 2) if denominator else np.nan,
+            "two_stage_pipeline_version": TWO_STAGE_PIPELINE_VERSION,
+        })
+    return pd.DataFrame(rows)
 
 
 def default_refresh_state_path() -> Path:
@@ -510,6 +617,7 @@ __all__ = [
     "ShortlistConfig",
     "build_lightweight_preliminary_focus",
     "build_enrichment_shortlist",
+    "build_enrichment_recall_diagnostics",
     "plan_round_robin_refresh",
     "build_two_stage_coverage_audit",
     "default_refresh_state_path",

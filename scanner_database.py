@@ -52,6 +52,7 @@ from selector_engine import selector_snapshot_frame
 
 DATABASE_BRIDGE_VERSION = "20.0.0-evidence-lineage-integrity"
 DATABASE_SCHEMA_VERSION = "scanner_schema_v20"
+FEATURE_CACHE_SCHEMA_VERSION = "ALL_ELIGIBLE_LITE_V2"
 SCANNER_VERSION = SCANNER_RELEASE_VERSION
 LEGACY_DATABASE_HEALTH_STATE_V14 = "HEALTHY_V14_GUARDED_REAL_MONEY"  # compatibility marker for v9.8.0 regression audit
 
@@ -1953,6 +1954,18 @@ class ScannerDatabaseBridge:
             params["artifact_type"] = f"eq.{artifact_type}"
         return pd.DataFrame(self._get_rows("scan_job_artifacts", params))
 
+    def read_final_decision_snapshot(self, scan_id: str) -> dict[str, Any]:
+        """Reload and checksum-validate the immutable decision artifact."""
+        from decision_snapshot import (
+            FINAL_DECISION_SNAPSHOT_VERSION,
+            reload_final_decision_snapshot,
+        )
+
+        rows = self.read_scan_job_artifacts(
+            str(scan_id), artifact_type=FINAL_DECISION_SNAPSHOT_VERSION,
+        )
+        return reload_final_decision_snapshot(rows)
+
     @staticmethod
     def _normalise_ohlcv_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
         if not isinstance(frame, pd.DataFrame) or frame.empty:
@@ -2015,6 +2028,30 @@ class ScannerDatabaseBridge:
         return base64.b64encode(compressed).decode("ascii"), "ZLIB_CSV_V1", len(clean)
 
     @classmethod
+    def ohlcv_semantic_identity(cls, frame: pd.DataFrame | None, *, max_bars: int = 900) -> dict[str, Any]:
+        """Return the compact, revision-sensitive identity used by feature cache.
+
+        The digest covers the bounded OHLCV series rather than only its last
+        date, so vendor corrections and split-adjustment rewrites invalidate
+        dependent features without copying OHLCV into the feature-cache key.
+        """
+        clean = cls._normalise_ohlcv_frame(frame).tail(max(260, int(max_bars)))
+        compact, _, bars = cls._ohlcv_compact_encode(clean, max_bars=max_bars)
+        last = pd.Timestamp(clean.index[-1]).date().isoformat() if not clean.empty else None
+        compact_hash = _semantic_hash(compact) if compact else None
+        series_hash = _semantic_hash({
+            "compact_hash": compact_hash,
+            "bars": int(bars),
+            "last": last,
+        }) if compact else None
+        return {
+            "latest_ohlcv_timestamp": last,
+            "bar_count": int(bars),
+            "ohlcv_fingerprint": series_hash,
+            "corporate_action_series_identity": series_hash,
+        }
+
+    @classmethod
     def _ohlcv_compact_decode(cls, payload: Any, codec: Any = "ZLIB_CSV_V1") -> pd.DataFrame:
         text = str(payload or "").strip()
         if not text:
@@ -2034,6 +2071,7 @@ class ScannerDatabaseBridge:
         *,
         expected_session: Any | None = None,
         scanner_version: str = "",
+        indicator_config_version: str = "",
     ) -> tuple[dict[str, dict[str, Any]], pd.DataFrame]:
         """Read current ALL_ELIGIBLE_LITE rows without one oversized JSONB GET.
 
@@ -2074,7 +2112,7 @@ class ScannerDatabaseBridge:
                 last_date = str(row.get("last_bar_date") or "")[:10]
                 version_ok = (not scanner_version) or str(row.get("scanner_version") or "") == str(scanner_version)
                 schema_value = str(row.get("feature_schema_version") or "").strip()
-                schema_ok = (not schema_value) or schema_value == "ALL_ELIGIBLE_LITE_V1"
+                schema_ok = schema_value == FEATURE_CACHE_SCHEMA_VERSION
                 state_ok = str(row.get("feature_state") or "").upper() == "CURRENT"
                 session_ok = (not expected_text) or last_date == expected_text
                 meta_ready = bool(version_ok and schema_ok and state_ok and session_ok)
@@ -2087,6 +2125,29 @@ class ScannerDatabaseBridge:
                     "feature_state": row.get("feature_state"), "source_tier": row.get("source_tier"),
                     "scanner_version": row.get("scanner_version"), "updated_at": row.get("updated_at"),
                 })
+
+        # Compare the feature payload with compact OHLCV metadata.  This second
+        # metadata-only read is bounded and catches revised bars/corporate-action
+        # adjustments without transferring the full price history.
+        input_meta: dict[str, dict[str, Any]] = {}
+        identity_names = list(dict.fromkeys([*current_meta.keys(), "^JKSE"]))
+        for start in range(0, len(identity_names), meta_batch):
+            chunk = identity_names[start:start + meta_batch]
+            if not chunk:
+                continue
+            try:
+                rows = self._get_rows("ohlcv_daily_cache", {
+                    "select": "ticker,last_bar_date,bar_count,content_hash,refresh_state",
+                    "ticker": f"in.({','.join(chunk)})",
+                    "limit": str(max(1, len(chunk))),
+                })
+            except Exception:
+                rows = []
+            input_meta.update({
+                str(row.get("ticker", "")).upper().strip(): dict(row)
+                for row in rows
+                if str(row.get("ticker", "")).strip()
+            })
 
         hits: dict[str, dict[str, Any]] = {}
         ready_names = list(current_meta)
@@ -2121,8 +2182,33 @@ class ScannerDatabaseBridge:
                     payload_ticker = str(local.get("ticker") or ticker).upper().strip()
                     payload_last = pd.to_datetime(local.get("ohlcv_last_bar_date"), errors="coerce")
                     payload_last_text = pd.Timestamp(payload_last).date().isoformat() if pd.notna(payload_last) else ""
+                    identity = local.get("feature_input_identity")
+                    current_ohlcv = input_meta.get(ticker, {})
+                    current_benchmark = input_meta.get("^JKSE", {})
+                    payload_hash_ready = (
+                        bool(current_meta.get(ticker, {}).get("content_hash"))
+                        and str(current_meta[ticker].get("content_hash")) == _semantic_hash(local)
+                    )
+                    identity_ready = isinstance(identity, Mapping)
+                    if identity_ready:
+                        identity_ready = bool(
+                            str(identity.get("symbol") or "").upper().strip() == ticker
+                            and str(identity.get("feature_schema_version") or "") == FEATURE_CACHE_SCHEMA_VERSION
+                            and str(identity.get("scanner_version") or "") == str(scanner_version)
+                            and ((not expected_text) or str(identity.get("completed_session") or "")[:10] == expected_text)
+                            and int(identity.get("bar_count") or 0) == int(current_ohlcv.get("bar_count") or 0)
+                            and str(identity.get("latest_ohlcv_timestamp") or "")[:10] == str(current_ohlcv.get("last_bar_date") or "")[:10]
+                            and bool(identity.get("ohlcv_fingerprint"))
+                            and str(identity.get("ohlcv_fingerprint")) == str(current_ohlcv.get("content_hash") or "")
+                            and str(identity.get("corporate_action_series_identity") or "") == str(current_ohlcv.get("content_hash") or "")
+                            and bool(identity.get("benchmark_context_identity"))
+                            and str(identity.get("benchmark_context_identity")) == str(current_benchmark.get("content_hash") or "")
+                            and ((not indicator_config_version) or str(identity.get("indicator_config_version") or "") == str(indicator_config_version))
+                        )
                     payload_ready = (
                         payload_ticker == ticker
+                        and identity_ready
+                        and payload_hash_ready
                         and bool(local.get("technical_ready", False))
                         and str(local.get("completion_state") or "").upper() == "TECHNICAL_READY"
                         and isinstance(local.get("signal"), Mapping)
@@ -2132,7 +2218,7 @@ class ScannerDatabaseBridge:
                     if payload_ready:
                         hits[ticker] = local
                     else:
-                        payload_errors[ticker] = "Feature payload failed technical/session contract; recompute required"
+                        payload_errors[ticker] = "Feature payload failed semantic input/technical/session contract; recompute required"
 
         if audits:
             audit_frame = pd.DataFrame(audits)
@@ -2157,7 +2243,7 @@ class ScannerDatabaseBridge:
         payloads: Mapping[str, Mapping[str, Any]],
         *,
         scanner_version: str,
-        feature_schema_version: str = "ALL_ELIGIBLE_LITE_V1",
+        feature_schema_version: str = FEATURE_CACHE_SCHEMA_VERSION,
     ) -> pd.DataFrame:
         if not payloads:
             return pd.DataFrame()
@@ -2281,6 +2367,7 @@ class ScannerDatabaseBridge:
                     "source_checked_at": row.get("source_checked_at"),
                     "refresh_state": row.get("refresh_state"),
                     "last_error": row.get("last_error"),
+                    "content_hash": row.get("content_hash"),
                     "payload_format": payload_format,
                     "compact_migration_required": payload_format == "LEGACY_JSON",
                 })
@@ -2313,6 +2400,7 @@ class ScannerDatabaseBridge:
         for ticker in names:
             frame = self._normalise_ohlcv_frame(histories.get(ticker)).tail(max(260, int(max_bars)))
             compact_payload, payload_codec, compact_bars = self._ohlcv_compact_encode(frame, max_bars=max_bars)
+            semantic_identity = self.ohlcv_semantic_identity(frame, max_bars=max_bars)
             tier = tiers.get(ticker, "DATABASE_OR_UNKNOWN")
             upper_tier = tier.upper()
             family = "UNKNOWN"
@@ -2341,7 +2429,7 @@ class ScannerDatabaseBridge:
                 "source_checked_at": now.isoformat(),
                 "refresh_state": state,
                 "last_error": error or None,
-                "content_hash": _semantic_hash({"compact_hash": _semantic_hash(compact_payload) if compact_payload else None, "bars": int(compact_bars), "last": pd.Timestamp(frame.index[-1]).date().isoformat() if not frame.empty else None}),
+                "content_hash": semantic_identity["ohlcv_fingerprint"],
                 "model_version": "9.6.0",
                 "schema_version": DATABASE_SCHEMA_VERSION,
                 "created_at": now.isoformat(),
@@ -2353,6 +2441,7 @@ class ScannerDatabaseBridge:
                 "status": "WRITE_PENDING", "bars": int(compact_bars),
                 "last_bar_date": record["last_bar_date"],
                 "refresh_state": state, "error": error,
+                "content_hash": record["content_hash"],
             })
         database_unavailable = self.settings.mode not in {"OUTBOX_ONLY", "SUPABASE_REST"}
         if self.settings.mode == "OUTBOX_ONLY":
@@ -2619,6 +2708,7 @@ class ScannerDatabaseBridge:
                 selector_evaluations.append(local)
 
         payloads: dict[str, list[dict[str, Any]]] = {
+            "scan_job_artifacts": [],
             "fundamental_snapshots": _frame_records(fundamentals, (
                 "ticker", "period_end", "statement_date", "fundamental_score", "fundamental_score_10",
                 "fundamental_coverage", "fundamental_data_grade", "fundamental_reliability",
@@ -2949,6 +3039,25 @@ class ScannerDatabaseBridge:
                 ),
             ),
         }
+
+        final_decision_snapshot = result.get("final_decision_snapshot")
+        if isinstance(final_decision_snapshot, Mapping) and final_decision_snapshot:
+            artifact_type = str(
+                final_decision_snapshot.get("snapshot_schema_version")
+                or FEATURE_CACHE_SCHEMA_VERSION
+            )
+            payloads["scan_job_artifacts"].append({
+                "artifact_key": hashlib.sha256(
+                    f"{scan_id}|{artifact_type}|0".encode("utf-8")
+                ).hexdigest(),
+                "job_id": scan_id,
+                "artifact_type": artifact_type,
+                "chunk_number": 0,
+                "payload": _json_safe(final_decision_snapshot),
+                "created_at": as_of,
+                "updated_at": as_of,
+                "model_version": model_version,
+            })
 
         if isinstance(fundamentals, pd.DataFrame) and not fundamentals.empty and "ticker" in fundamentals:
             for _, row in fundamentals.dropna(subset=["ticker"]).drop_duplicates("ticker", keep="last").iterrows():

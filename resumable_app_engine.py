@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
 import os
 import re
 import time
@@ -60,16 +62,44 @@ from scanner import (
 from scanner_database import ScannerDatabaseBridge
 from idx_trading_calendar import idx_session_lag, is_idx_session, previous_idx_session
 from simple_focus import build_simple_focus, build_silent_profiles
-from two_stage_pipeline import ShortlistConfig, build_enrichment_shortlist
+from two_stage_pipeline import (
+    ShortlistConfig,
+    build_enrichment_shortlist,
+    build_enrichment_recall_diagnostics,
+)
 from fundamental_calibration import maintenance_refresh_priority, reporting_refresh_profile
 from release_contract import SCANNER_RELEASE_VERSION
+from decision_snapshot import build_final_decision_snapshot
 
 ENGINE_VERSION = SCANNER_RELEASE_VERSION
+
+
+def feature_indicator_config_version(config: Mapping[str, Any] | None = None) -> str:
+    """Fingerprint decision-material technical configuration, not I/O budgets."""
+    ignored = {
+        "portfolio_records", "portfolio_overlay_records", "universe_records",
+        "lean_persistence", "lean_skip_narrative_history",
+    }
+    ignored_prefixes = (
+        "evidence_", "daily_", "provider_", "execution_verification_",
+        "macro_timeout_", "incremental_cache_", "core_incremental_cache_",
+    )
+    material = {
+        str(key): json_safe(value)
+        for key, value in sorted(dict(config or {}).items(), key=lambda item: str(item[0]))
+        if str(key) not in ignored and not str(key).startswith(ignored_prefixes)
+    }
+    encoded = json.dumps(
+        {"scanner_version": ENGINE_VERSION, "config": material},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 LEAN_FINAL_PERSISTENCE_TABLES = (
     "fundamental_cache", "fundamental_snapshots",
     "multibagger_snapshots", "technical_snapshots",
     "ihsg_direction_snapshots", "narrative_snapshots", "scan_runs",
+    "scan_job_artifacts",
 )
 FULL_FINAL_PERSISTENCE_TABLES = (
     "fundamental_cache", "fundamental_snapshots",
@@ -79,6 +109,7 @@ FULL_FINAL_PERSISTENCE_TABLES = (
     "narrative_events", "narrative_event_outcomes",
     "narrative_snapshots", "selector_snapshots",
     "selector_outcomes", "selector_model_evaluations",
+    "scan_job_artifacts",
 )
 
 
@@ -613,6 +644,7 @@ def _universe_metadata(
             "universe_role": first("universe_role", "role"),
             "universe_priority": first("priority", "universe_priority"),
             "universe_active_scan": first("active_scan", "scan_active"),
+            "portfolio_held": _truthy(first("portfolio_held")),
             "universe_metadata_source": "UPLOADED_UNIVERSE",
         })
     if not rows:
@@ -934,6 +966,22 @@ def process_daily_scan_chunk(
         min_bars=260, max_stale_sessions=5,
     )
     benchmark, benchmark_report = _job_benchmark(str(job.get("job_id") or ""), bridge, period=period)
+    completed_session = _expected_completed_session().date().isoformat()
+    indicator_config_version = feature_indicator_config_version(config)
+    benchmark_identity = bridge.ohlcv_semantic_identity(benchmark)
+    feature_input_identities = {
+        ticker: {
+            "symbol": ticker,
+            "feature_schema_version": "ALL_ELIGIBLE_LITE_V2",
+            "scanner_version": ENGINE_VERSION,
+            "completed_session": completed_session,
+            **bridge.ohlcv_semantic_identity(frame),
+            "indicator_config_version": indicator_config_version,
+            "benchmark_context_identity": benchmark_identity.get("ohlcv_fingerprint"),
+        }
+        for ticker, frame in histories.items()
+        if isinstance(frame, pd.DataFrame) and not frame.empty
+    }
     bounded = {ticker: frame.tail(800).copy() for ticker, frame in histories.items() if isinstance(frame, pd.DataFrame) and not frame.empty}
     core = ScanEngine(cfg).scan(bounded, benchmark.tail(800).copy() if isinstance(benchmark, pd.DataFrame) else benchmark)
     fundamentals = enrich_fundamentals_with_valuation(
@@ -1052,6 +1100,7 @@ def process_daily_scan_chunk(
             "ohlcv_last_bar_date": json_safe(frame.index[-1]),
             "ohlcv_session_lag": ohlcv_meta.get(ticker, {}).get("session_lag"),
             "ohlcv_source_tier": str(ohlcv_meta.get(ticker, {}).get("source_tier") or "DATABASE_OR_PUBLIC"),
+            "feature_input_identity": json_safe(feature_input_identities.get(ticker, {})),
             "ohlcv_database_cache_status": ohlcv_meta.get(ticker, {}).get("database_cache_status"),
             "ohlcv_database_write_status": ohlcv_meta.get(ticker, {}).get("database_write_status"),
             "ohlcv_database_rows_written": ohlcv_meta.get(ticker, {}).get("database_write_rows_written"),
@@ -1396,9 +1445,13 @@ def finalize_daily_scan_job(
     maintenance_reserve = min(2, max(0, evidence_cap // 4)) if evidence_cap else 0
     requested_decision_cap = max(0, _int_config(config, "decision_evidence_cap", 12))
     decision_refresh_cap = min(max(0, evidence_cap - maintenance_reserve), requested_decision_cap) if evidence_cap else 0
-    fallback_evidence, _ = build_enrichment_shortlist(
+    routing_focus = {
+        "multibagger": provisional_focus.get("next_leaders_all", provisional_focus.get("next_leaders", pd.DataFrame())),
+        "profit_order_builder": provisional_focus.get("swing_ready_all", provisional_focus.get("swing_ready", pd.DataFrame())),
+    }
+    fallback_evidence, shortlist_audit = build_enrichment_shortlist(
         completed_tickers,
-        preliminary_focus={},
+        preliminary_focus=routing_focus,
         signals=signals,
         portfolio_tickers=portfolio_tickers,
         config=ShortlistConfig(
@@ -1406,6 +1459,7 @@ def finalize_daily_scan_job(
             multibagger_quota=max(1, decision_refresh_cap // 2),
             core_quota=max(1, decision_refresh_cap // 3),
             technical_rescue_quota=max(1, decision_refresh_cap),
+            exploration_quota=max(1, decision_refresh_cap // 4),
         ),
     ) if decision_refresh_cap else ([], pd.DataFrame())
     # A top-ranked name whose last statement has crossed the next quarterly
@@ -1420,12 +1474,9 @@ def finalize_daily_scan_job(
         ticker for ticker in provisional_ranked
         if bool(reporting_refresh_profile(fundamental_map.get(ticker, {})).get("fundamental_refresh_due", False))
     ]
-    priority_evidence = list(dict.fromkeys(
-        portfolio_tickers
-        + refresh_due_ranked
-        + provisional_ranked
-        + list(fallback_evidence)
-    ))[:decision_refresh_cap]
+    # The shortlist already reserves bounded exploration capacity. Reordering
+    # it here by provisional rank would silently remove the exploration cohort.
+    priority_evidence = list(fallback_evidence)[:decision_refresh_cap]
 
     # Reserve a small maintenance lane so database coverage keeps expanding even
     # when the same leaders remain at the top for many sessions. Once a ticker is
@@ -1638,6 +1689,9 @@ def finalize_daily_scan_job(
         precomputed_silent_frame=silent_frame,
         precomputed_narrative=narrative,
     )
+    enrichment_diagnostics = build_enrichment_recall_diagnostics(
+        shortlist_audit, focus, top_n=3,
+    )
     portfolio_histories = dict(verify_histories)
     missing_portfolio = [ticker for ticker in portfolio_tickers if ticker not in portfolio_histories]
     if missing_portfolio:
@@ -1668,6 +1722,7 @@ def finalize_daily_scan_job(
     _mark_stage("FINAL_RANKING_AND_PORTFOLIO")
     prepared_placeholder = {ticker: pd.DataFrame() for ticker in completed_tickers}
     result = {
+        "scan_id": job_id,
         "mode": "resumable_chunked_daily_scan",
         "scanner_version": ENGINE_VERSION,
         "scan_started_at": job.get("started_at"),
@@ -1699,11 +1754,18 @@ def finalize_daily_scan_job(
         "database_coverage_after": coverage,
         "database_summary_after": coverage_summary,
         "two_stage_shortlist": shortlist,
+        "two_stage_shortlist_audit": shortlist_audit,
+        "enrichment_diagnostics": enrichment_diagnostics,
         "narrative_events": narrative.get("events", pd.DataFrame()),
         "narrative_event_outcomes": narrative.get("outcomes", pd.DataFrame()),
         "narrative_profiles": narrative.get("profiles", pd.DataFrame()),
         "project_management_review": project_management,
     }
+    result["final_decision_snapshot"] = build_final_decision_snapshot(
+        result,
+        universe=universe,
+        completed_session=_expected_completed_session(),
+    )
     try:
         _update_job(
             job_id,
@@ -1743,6 +1805,7 @@ def finalize_daily_scan_job(
     technical_coverage_pct = 100.0 * len(completed_tickers) / len(universe) if universe else 0.0
     ranking_state = "VALID" if technical_coverage_pct >= 70.0 else "PARTIAL_UNIVERSE"
     artifacts = {
+        "FINAL_DECISION_SNAPSHOT_V1": result.get("final_decision_snapshot", {}),
         "FINAL_NEXT_LEADERS": focus.get("next_leaders", pd.DataFrame()),
         "FINAL_SWING_READY": focus.get("swing_ready", pd.DataFrame()),
         "FINAL_NEXT_LEADERS_ALL": focus.get("next_leaders_all", pd.DataFrame()),
@@ -1756,6 +1819,7 @@ def finalize_daily_scan_job(
         "FINAL_OHLCV_AUDIT": ohlcv_audit,
         "FINAL_DATABASE_SYNC_REPORT": result.get("database_sync_report", pd.DataFrame()),
         "FINAL_FUNDAMENTAL_PROVIDER_AUDIT": fundamental_report,
+        "FINAL_ENRICHMENT_DIAGNOSTICS": enrichment_diagnostics,
         "FINAL_STAGE_TIMINGS": pd.DataFrame([{
             **stage_timings,
             "elapsed_before_artifact_publish_sec": round(time.perf_counter() - finalizer_started, 3),

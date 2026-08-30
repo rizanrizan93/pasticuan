@@ -59,7 +59,11 @@ if missing:
     st.code("\n".join(missing), language="text")
     st.stop()
 
-from scanner import SCANNER_VERSION as CORE_SCANNER_VERSION, parse_portfolio_csv, parse_universe_csv  # noqa: E402
+from scanner import (  # noqa: E402
+    SCANNER_VERSION as CORE_SCANNER_VERSION,
+    parse_portfolio_csv,
+    parse_universe_csv,
+)
 from scanner_database import SCANNER_VERSION as DATABASE_SCANNER_VERSION  # noqa: E402
 from official_evidence_guard import SCANNER_VERSION as OFFICIAL_GUARD_SCANNER_VERSION  # noqa: E402
 from research_maintenance import SCANNER_VERSION as RESEARCH_SCANNER_VERSION  # noqa: E402

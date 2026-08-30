@@ -24,7 +24,12 @@ from scanner_database import (
     DatabaseTransportError,
     ScannerDatabaseBridge,
 )
-from resumable_app_engine import process_daily_scan_chunk, finalize_daily_scan_job, _expected_completed_session
+from resumable_app_engine import (
+    process_daily_scan_chunk,
+    finalize_daily_scan_job,
+    _expected_completed_session,
+    feature_indicator_config_version,
+)
 
 FAST_SCAN_VERSION = SCANNER_RELEASE_VERSION
 
@@ -230,6 +235,7 @@ def _compact_feature_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "ohlcv_last_bar_date": local.get("ohlcv_last_bar_date"),
         "ohlcv_session_lag": local.get("ohlcv_session_lag"),
         "ohlcv_source_tier": local.get("ohlcv_source_tier"),
+        "feature_input_identity": dict(local.get("feature_input_identity") or {}),
         "completed_at": local.get("completed_at"),
     }
     return compact
@@ -299,7 +305,10 @@ def run_fast_single_scan(
     if hasattr(bridge, "read_feature_cache"):
         try:
             feature_hits, feature_audit = bridge.read_feature_cache(
-                universe, expected_session=expected_session, scanner_version=FAST_SCAN_VERSION,
+                universe,
+                expected_session=expected_session,
+                scanner_version=FAST_SCAN_VERSION,
+                indicator_config_version=feature_indicator_config_version(cfg),
             )
         except Exception as exc:
             feature_hits, feature_audit = {}, pd.DataFrame([{
