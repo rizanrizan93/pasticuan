@@ -27,7 +27,9 @@ from release_contract import SCANNER_RELEASE_VERSION
 from idx_trading_calendar import (
     CALENDAR_VERSION as IDX_CALENDAR_VERSION,
     filter_known_nontrading_dates, previous_idx_session, idx_session_lag, sanitize_idx_histories,
+    latest_expected_completed_session, trading_session_age,
 )
+from provider_semantics import normalize_provenance
 from incremental_store import (
     IncrementalEvidenceStore,
     cache_enabled as incremental_cache_enabled,
@@ -2182,7 +2184,7 @@ def parse_broker_summary_csv(
     frame['sell'] = pd.to_numeric(frame[sell_col], errors='coerce')
     frame['net'] = frame['buy'] - frame['sell']
     frame['gross'] = frame['buy'] + frame['sell']
-    reference = _jakarta_timestamp(as_of).tz_localize(None).normalize()
+    reference = latest_expected_completed_session(_jakarta_timestamp(as_of))
     valid = (
         frame['ticker'].notna()
         & frame['date'].notna()
@@ -2200,7 +2202,8 @@ def parse_broker_summary_csv(
         'broksum_source_type', 'broksum_source_name',
         'broksum_source_verified', 'broksum_provenance_state',
         'broksum_direct_evidence_eligible', 'broksum_current',
-        'broksum_age_days', 'broksum_data_quality_pct',
+        'broksum_age_days', 'broksum_age_sessions', 'broksum_data_quality_pct',
+        'broksum_canonical_provenance',
     ]
     if frame.empty:
         return pd.DataFrame(columns=empty_columns)
@@ -2233,7 +2236,11 @@ def parse_broker_summary_csv(
         label = 'ACCUMULATION_PROXY' if ratio >= 0.08 else 'DISTRIBUTION_PROXY' if ratio <= -0.08 else 'NEUTRAL'
         latest = pd.Timestamp(recent['date'].max())
         age_days = int((reference - latest.normalize()).days)
-        current = bool(0 <= age_days <= max(0, int(max_age_days)))
+        age_sessions = trading_session_age(latest, reference)
+        current = bool(
+            age_sessions is not None
+            and 0 <= age_sessions <= max(0, int(max_age_days))
+        )
         direct_eligible = bool(
             verified_source and current and len(dates) >= 5
             and global_quality >= 90.0
@@ -2255,9 +2262,15 @@ def parse_broker_summary_csv(
                 else 'VERIFIED_SOURCE_STALE_OR_PARTIAL' if verified_source
                 else 'MANUAL_OR_UNVERIFIED_SOURCE'
             ),
+            'broksum_canonical_provenance': normalize_provenance(
+                'DIRECT_SOURCE_VERIFIED' if direct_eligible
+                else 'VERIFIED' if verified_source
+                else 'PROXY'
+            ).value,
             'broksum_direct_evidence_eligible': direct_eligible,
             'broksum_current': current,
             'broksum_age_days': age_days,
+            'broksum_age_sessions': age_sessions,
             'broksum_input_rows': input_rows,
             'broksum_invalid_rows': invalid_rows,
             'broksum_duplicate_rows': duplicate_rows,

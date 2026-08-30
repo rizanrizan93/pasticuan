@@ -8,14 +8,39 @@ legitimate zero-volume observation from a single illiquid security.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import time, timedelta
+from enum import Enum
 from typing import Any, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
 
-CALENDAR_VERSION = "2026.08.01-official-2026-consensus-history"
+CALENDAR_VERSION = "2026.08.30-official-2025-2026-session-contract"
 CALENDAR_SOURCE = "IDX_OFFICIAL_EXCHANGE_HOLIDAY_ANNOUNCEMENT"
+JAKARTA_TIMEZONE = "Asia/Jakarta"
+SESSION_COMPLETION_TIME = time(16, 20)
+
+
+class CalendarState(str, Enum):
+    TRADING_SESSION = "TRADING_SESSION"
+    CLOSED = "CLOSED"
+    UNKNOWN = "UNKNOWN"
+
+
+class CalendarCoverageError(ValueError):
+    """Raised when a decision asks the static calendar to invent coverage."""
+
+
+# Static exchange calendars are intentionally local: normal scans and tests do
+# not depend on a holiday API.  Unknown years remain UNKNOWN/fail closed.
+_OFFICIAL_CLOSED_2025 = {
+    "2025-01-01", "2025-01-27", "2025-01-28", "2025-01-29",
+    "2025-03-28", "2025-03-31",
+    "2025-04-01", "2025-04-02", "2025-04-03", "2025-04-04", "2025-04-07", "2025-04-18",
+    "2025-05-01", "2025-05-12", "2025-05-13", "2025-05-29", "2025-05-30",
+    "2025-06-06", "2025-06-09", "2025-06-27",
+    "2025-08-18", "2025-09-05", "2025-12-25", "2025-12-26", "2025-12-31",
+}
 
 # Official 2026 IDX exchange closures (Peng-00171/BEI.POP/09-2025).
 _OFFICIAL_CLOSED_2026 = {
@@ -29,7 +54,46 @@ _OFFICIAL_CLOSED_2026 = {
     "2026-12-24", "2026-12-25", "2026-12-31",
 }
 
-OFFICIAL_CLOSED_DATES = frozenset(pd.Timestamp(value).normalize() for value in _OFFICIAL_CLOSED_2026)
+_OFFICIAL_CLOSED_BY_YEAR = {2025: _OFFICIAL_CLOSED_2025, 2026: _OFFICIAL_CLOSED_2026}
+SUPPORTED_CALENDAR_YEARS = frozenset(_OFFICIAL_CLOSED_BY_YEAR)
+OFFICIAL_CLOSED_DATES = frozenset(
+    pd.Timestamp(value).normalize()
+    for values in _OFFICIAL_CLOSED_BY_YEAR.values()
+    for value in values
+)
+
+
+def _jakarta_timestamp(value: Any) -> pd.Timestamp:
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid calendar value: {value!r}") from None
+    if pd.isna(stamp):
+        raise ValueError(f"invalid calendar value: {value!r}")
+    if stamp.tzinfo is None:
+        return stamp.tz_localize(JAKARTA_TIMEZONE)
+    return stamp.tz_convert(JAKARTA_TIMEZONE)
+
+
+def calendar_state(
+    value: Any,
+    *,
+    extra_open_dates: Iterable[Any] | None = None,
+    extra_closed_dates: Iterable[Any] | None = None,
+) -> CalendarState:
+    try:
+        day = _jakarta_timestamp(value).tz_localize(None).normalize()
+    except (TypeError, ValueError):
+        return CalendarState.UNKNOWN
+    if day.year not in SUPPORTED_CALENDAR_YEARS:
+        return CalendarState.UNKNOWN
+    opens = _normalise_dates(extra_open_dates)
+    extra_closes = _normalise_dates(extra_closed_dates)
+    if day in opens:
+        return CalendarState.TRADING_SESSION
+    if day.weekday() >= 5 or day in OFFICIAL_CLOSED_DATES or day in extra_closes:
+        return CalendarState.CLOSED
+    return CalendarState.TRADING_SESSION
 
 
 def _normalise_dates(values: Iterable[Any] | None) -> set[pd.Timestamp]:
@@ -50,20 +114,11 @@ def is_idx_session(
     extra_open_dates: Iterable[Any] | None = None,
     extra_closed_dates: Iterable[Any] | None = None,
 ) -> bool:
-    parsed = pd.to_datetime(value, errors="coerce")
-    if pd.isna(parsed):
-        return False
-    stamp = pd.Timestamp(parsed)
-    if stamp.tzinfo is not None:
-        stamp = stamp.tz_convert("Asia/Jakarta").tz_localize(None)
-    day = stamp.normalize()
-    opens = _normalise_dates(extra_open_dates)
-    closes = OFFICIAL_CLOSED_DATES | _normalise_dates(extra_closed_dates)
-    if day in opens:
-        return True
-    if day.weekday() >= 5:
-        return False
-    return day not in closes
+    return calendar_state(
+        value,
+        extra_open_dates=extra_open_dates,
+        extra_closed_dates=extra_closed_dates,
+    ) is CalendarState.TRADING_SESSION
 
 
 def previous_idx_session(
@@ -77,15 +132,73 @@ def previous_idx_session(
     if parsed.tzinfo is not None:
         parsed = parsed.tz_convert("Asia/Jakarta").tz_localize(None)
     day = parsed.normalize() if include_date else parsed.normalize() - timedelta(days=1)
-    for _ in range(370):
-        if is_idx_session(
+    for _ in range(740):
+        state = calendar_state(
             day,
             extra_open_dates=extra_open_dates,
             extra_closed_dates=extra_closed_dates,
-        ):
+        )
+        if state is CalendarState.TRADING_SESSION:
             return day
+        if state is CalendarState.UNKNOWN:
+            raise CalendarCoverageError(f"IDX calendar has no coverage for {day.date().isoformat()}")
         day -= timedelta(days=1)
-    raise RuntimeError("Tidak dapat menemukan sesi IDX sebelumnya dalam 370 hari")
+    raise RuntimeError("Tidak dapat menemukan sesi IDX sebelumnya dalam 740 hari")
+
+
+def n_idx_sessions_ago(value: Any, sessions: int) -> pd.Timestamp:
+    if int(sessions) < 0:
+        raise ValueError("sessions must be >= 0")
+    current = previous_idx_session(value, include_date=True)
+    for _ in range(int(sessions)):
+        current = previous_idx_session(current, include_date=False)
+    return current
+
+
+def latest_expected_completed_session(
+    value: Any = None,
+    *,
+    completion_time: time = SESSION_COMPLETION_TIME,
+) -> pd.Timestamp:
+    local = _jakarta_timestamp(pd.Timestamp.now(tz=JAKARTA_TIMEZONE) if value is None else value)
+    today = local.tz_localize(None).normalize()
+    state = calendar_state(today)
+    if state is CalendarState.UNKNOWN:
+        raise CalendarCoverageError(f"IDX calendar has no coverage for {today.date().isoformat()}")
+    include_today = (
+        state is CalendarState.TRADING_SESSION
+        and local.time().replace(tzinfo=None) >= completion_time
+    )
+    return previous_idx_session(today, include_date=include_today)
+
+
+def trading_session_age(observed_at: Any, decision_at: Any) -> int | None:
+    """Count completed IDX sessions after an observed trading session.
+
+    A non-session observation or unavailable yearly calendar returns ``None``;
+    callers must preserve UNKNOWN rather than treating it as fresh.
+    """
+    try:
+        observed = _jakarta_timestamp(observed_at).tz_localize(None).normalize()
+        decision = _jakarta_timestamp(decision_at).tz_localize(None).normalize()
+    except (TypeError, ValueError):
+        return None
+    if calendar_state(observed) is not CalendarState.TRADING_SESSION:
+        return None
+    if calendar_state(decision) is CalendarState.UNKNOWN:
+        return None
+    if decision < observed:
+        return -1
+    age = 0
+    day = observed + timedelta(days=1)
+    while day <= decision:
+        state = calendar_state(day)
+        if state is CalendarState.UNKNOWN:
+            return None
+        if state is CalendarState.TRADING_SESSION:
+            age += 1
+        day += timedelta(days=1)
+    return age
 
 
 def idx_session_lag(
@@ -111,6 +224,10 @@ def idx_session_lag(
     if expected.tzinfo is not None:
         expected = expected.tz_convert("Asia/Jakarta").tz_localize(None)
     last = last.normalize(); expected = expected.normalize()
+    if calendar_state(last, extra_open_dates=extra_open_dates, extra_closed_dates=extra_closed_dates) is not CalendarState.TRADING_SESSION:
+        return 9999
+    if calendar_state(expected, extra_open_dates=extra_open_dates, extra_closed_dates=extra_closed_dates) is CalendarState.UNKNOWN:
+        return 9999
     if last >= expected:
         return 0 if last == expected else -1
     lag = 0

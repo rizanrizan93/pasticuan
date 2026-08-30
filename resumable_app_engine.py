@@ -61,6 +61,7 @@ from scanner import (
 )
 from scanner_database import ScannerDatabaseBridge
 from idx_trading_calendar import idx_session_lag, is_idx_session, previous_idx_session
+from provider_semantics import canonicalize_provider_audit
 from simple_focus import build_simple_focus, build_silent_profiles
 from two_stage_pipeline import (
     ShortlistConfig,
@@ -529,7 +530,7 @@ def _database_first_ohlcv(
                 })
     if global_rows:
         combined_audit = pd.concat([combined_audit, pd.DataFrame(global_rows)], ignore_index=True, sort=False)
-    return histories, report, combined_audit
+    return histories, report, canonicalize_provider_audit(combined_audit)
 
 
 def _database_first_benchmark(
