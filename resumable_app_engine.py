@@ -58,6 +58,7 @@ from scanner import (
     read_cached_news_review,
     select_yahoo_fundamental_tickers,
     seed_daily_ohlcv_cache,
+    truthy,
 )
 from scanner_database import ScannerDatabaseBridge
 from idx_trading_calendar import idx_session_lag, is_idx_session, previous_idx_session
@@ -645,7 +646,7 @@ def _universe_metadata(
             "universe_role": first("universe_role", "role"),
             "universe_priority": first("priority", "universe_priority"),
             "universe_active_scan": first("active_scan", "scan_active"),
-            "portfolio_held": _truthy(first("portfolio_held")),
+            "portfolio_held": truthy(first("portfolio_held")),
             "universe_metadata_source": "UPLOADED_UNIVERSE",
         })
     if not rows:
