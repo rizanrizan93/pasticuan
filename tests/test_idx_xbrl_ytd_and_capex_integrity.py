@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
+import scanner
 from scanner import (
     _stable_unique_delimited,
     combine_fundamental_history,
@@ -17,16 +19,23 @@ def _instance(
     ocf: float,
     ppe_capex: float,
     intangible_capex: float,
+    entity_identifier: str | None = 'test_maker',
+    entity_identifier_scheme: str = 'http://www.idx.co.id/xbrl',
+    extra_xml: str = '',
 ) -> bytes:
+    identifier = (
+        f'<xbrli:identifier scheme="{entity_identifier_scheme}">{entity_identifier}</xbrli:identifier>'
+        if entity_identifier is not None else ''
+    )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <xbrli:xbrl xmlns:xbrli="http://www.xbrl.org/2003/instance"
              xmlns:id="http://www.idx.co.id/xbrl/taxonomy/2020">
   <xbrli:context id="CurrentYearDuration">
-    <xbrli:entity><xbrli:identifier scheme="TEST">TEST</xbrli:identifier></xbrli:entity>
+    <xbrli:entity>{identifier}</xbrli:entity>
     <xbrli:period><xbrli:startDate>2026-01-01</xbrli:startDate><xbrli:endDate>{period_end}</xbrli:endDate></xbrli:period>
   </xbrli:context>
   <xbrli:context id="CurrentYearInstant">
-    <xbrli:entity><xbrli:identifier scheme="TEST">TEST</xbrli:identifier></xbrli:entity>
+    <xbrli:entity>{identifier}</xbrli:entity>
     <xbrli:period><xbrli:instant>{period_end}</xbrli:instant></xbrli:period>
   </xbrli:context>
   <xbrli:unit id="IDR"><xbrli:measure>iso4217:IDR</xbrli:measure></xbrli:unit>
@@ -38,6 +47,7 @@ def _instance(
   <id:Assets contextRef="CurrentYearInstant" unitRef="IDR">1000</id:Assets>
   <id:Liabilities contextRef="CurrentYearInstant" unitRef="IDR">400</id:Liabilities>
   <id:Equity contextRef="CurrentYearInstant" unitRef="IDR">600</id:Equity>
+  {extra_xml}
 </xbrli:xbrl>""".encode()
 
 
@@ -64,6 +74,97 @@ def test_idx_taxonomy_property_and_equipment_capex_components_are_summed() -> No
     ).iloc[0]
 
     assert row["capex"] == pytest.approx(10.0)
+    assert bool(row["issuer_match"])
+    assert bool(row["source_verified"])
+    assert row["issuer_identifier"] == "test_maker"
+    assert row["issuer_identifier_scheme"] == "http://www.idx.co.id/xbrl"
+    assert row["provider"] == "IDX_OFFICIAL_XBRL"
+    assert row["evidence_type"] == "FUNDAMENTAL_STATEMENT"
+    assert str(row["reporting_period"]) == "Q1"
+    assert str(row["source_url"]).startswith("https://www.idx.co.id/")
+
+
+def test_wrong_issuer_is_rejected_even_with_valid_numeric_facts() -> None:
+    payload = _instance(
+        period_end="2026-03-31", revenue=100, net_income=10, ocf=20,
+        ppe_capex=7, intangible_capex=3, entity_identifier="other_maker",
+    )
+
+    with pytest.raises(ValueError, match="ISSUER_MISMATCH"):
+        parse_idx_xbrl_attachment(
+            payload, ticker="TEST.JK", period_end="2026-03-31", period_type="Q1",
+            source_url="https://www.idx.co.id/official/TEST/instance.zip",
+            defer_ytd_conversion=True,
+        )
+
+
+def test_mixed_entity_document_uses_only_requested_issuer_contexts() -> None:
+    other = """
+      <xbrli:context id="OtherIssuerDuration">
+        <xbrli:entity><xbrli:identifier scheme="http://www.idx.co.id/xbrl">other_maker</xbrli:identifier></xbrli:entity>
+        <xbrli:period><xbrli:startDate>2026-01-01</xbrli:startDate><xbrli:endDate>2026-03-31</xbrli:endDate></xbrli:period>
+      </xbrli:context>
+      <id:Revenues contextRef="OtherIssuerDuration" unitRef="IDR">999999</id:Revenues>
+      <id:ProfitLoss contextRef="OtherIssuerDuration" unitRef="IDR">999999</id:ProfitLoss>
+      <id:NetCashFlowsReceivedFromUsedInOperatingActivities contextRef="OtherIssuerDuration" unitRef="IDR">999999</id:NetCashFlowsReceivedFromUsedInOperatingActivities>
+    """
+    row = parse_idx_xbrl_attachment(
+        _instance(
+            period_end="2026-03-31", revenue=100, net_income=10, ocf=20,
+            ppe_capex=7, intangible_capex=3, extra_xml=other,
+        ),
+        ticker="TEST.JK", period_end="2026-03-31", period_type="Q1",
+        source_url="https://www.idx.co.id/official/TEST/instance.zip",
+        defer_ytd_conversion=True,
+    ).iloc[0]
+
+    assert row["revenue"] == pytest.approx(100.0)
+    assert row["net_income"] == pytest.approx(10.0)
+    assert row["operating_cash_flow"] == pytest.approx(20.0)
+    assert row["issuer_identifier"] == "test_maker"
+
+
+def test_missing_entity_identifier_fails_closed() -> None:
+    payload = _instance(
+        period_end="2026-03-31", revenue=100, net_income=10, ocf=20,
+        ppe_capex=7, intangible_capex=3, entity_identifier=None,
+    )
+
+    with pytest.raises(ValueError, match="ISSUER_IDENTITY_MISSING"):
+        parse_idx_xbrl_attachment(
+            payload, ticker="TEST.JK", period_end="2026-03-31", period_type="Q1",
+            source_url="https://www.idx.co.id/official/TEST/instance.zip",
+            defer_ytd_conversion=True,
+        )
+
+
+def test_fetch_report_classifies_issuer_mismatch(monkeypatch) -> None:
+    payload = _instance(
+        period_end="2026-03-31", revenue=100, net_income=10, ocf=20,
+        ppe_capex=7, intangible_capex=3, entity_identifier="other_approver",
+    )
+    manifest = pd.DataFrame([{
+        "ticker": "TEST.JK", "period_end": pd.Timestamp("2026-03-31"),
+        "period_type": "Q1", "attachment_rank": 0, "filename": "instance.zip",
+        "attachment_url": "https://www.idx.co.id/official/TEST/instance.zip",
+    }])
+    monkeypatch.setattr(scanner, "_load_cache", lambda _name: pd.DataFrame())
+    monkeypatch.setattr(scanner, "_idx_manifest_rows", lambda *args, **kwargs: (manifest.copy(), pd.DataFrame()))
+
+    class Response:
+        status_code = 200
+        url = "https://www.idx.co.id/official/TEST/instance.zip"
+        content = payload
+
+    history, report = scanner.fetch_idx_fundamental_history(
+        ["TEST.JK"], request_get=lambda *args, **kwargs: Response(),
+        max_tickers=1, years_back=1,
+    )
+
+    assert history.empty
+    row = report.loc[report["ticker"].eq("TEST.JK")].iloc[0]
+    assert row["status"] == "NO_DATA"
+    assert row["error_code"] == "ISSUER_MISMATCH"
 
 
 def test_ytd_conversion_is_deferred_until_all_official_periods_are_combined() -> None:

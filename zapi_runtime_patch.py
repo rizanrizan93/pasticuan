@@ -87,7 +87,7 @@ def _merge_audit_fields(out: pd.DataFrame, enriched: pd.DataFrame) -> pd.DataFra
         "zapi_super_silent_score_delta",
         "zapi_super_flow_basis",
         "zapi_flow_meta_state",
-        "zapi_shared_cache_state",
+        "zapi_owned_cache_state",
         "zapi_direct_state",
     ]
     cols = [column for column in wanted if column in audit_source.columns]

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-"""Shared ZAPI foreign-flow enrichment with bounded scoring influence.
+"""Pasticuan-owned ZAPI foreign-flow enrichment with bounded scoring influence.
 
-The module reuses the working IDX Flow Scanner ZAPI contract while preserving
+The module implements the upstream ZAPI contract locally while preserving
 an explicit evidence boundary: foreign flow can confirm accumulation/smart-money
 hypotheses, but it never identifies a broker or beneficial owner and it never
 replaces price-structure/SMC evidence.
@@ -17,11 +17,17 @@ import numpy as np
 import pandas as pd
 import requests
 
+from idx_trading_calendar import (
+    latest_expected_completed_session,
+    previous_idx_session,
+    trading_session_age,
+)
 
-ZAPI_FLOW_ENRICHMENT_VERSION = "1.0.0-shared-cache-bounded-confirmation"
+
+ZAPI_FLOW_ENRICHMENT_VERSION = "1.1.0-pasticuan-owned-idx-session-coverage"
 ZAPI_FOREIGN_FLOW_URL = "https://api.zpi.web.id/v1/finance:idx/foreign-flow"
 ZAPI_STOCK_SUMMARY_URL = "https://api.zpi.web.id/v1/finance:idx/stock-summary"
-SHARED_CACHE_URL = "https://raw.githubusercontent.com/rizanrizan93/idx-flow-scanner/main/data/cache/zapi_idx_foreign_60d.csv.gz"
+OWNED_CACHE_URL = "https://raw.githubusercontent.com/rizanrizan93/pasticuan/main/data/zapi_foreign_flow_60d.csv.gz"
 
 _HISTORY_CACHE: dict[str, tuple[float, pd.DataFrame, dict[str, Any]]] = {}
 _FEATURE_CACHE: dict[tuple[str, ...], tuple[float, pd.DataFrame, dict[str, Any]]] = {}
@@ -123,15 +129,18 @@ def _normalize_foreign_payload(payload: Any, trade_date: Any, universe: set[str]
         ticker = _canonical(item.get("code"))
         if not ticker or ticker not in universe:
             continue
-        buy = _finite(item.get("foreignBuyShares"), 0.0)
-        sell = _finite(item.get("foreignSellShares"), 0.0)
+        buy = _finite(item.get("foreignBuyShares"), np.nan)
+        sell = _finite(item.get("foreignSellShares"), np.nan)
         raw_net = _finite(item.get("netForeignShares"), np.nan)
+        net = raw_net if np.isfinite(raw_net) else (buy - sell if np.isfinite(buy) and np.isfinite(sell) else np.nan)
+        if not any(np.isfinite(value) for value in (buy, sell, net)):
+            continue
         normalized.append({
             "ticker": ticker,
             "trade_date": day,
             "foreign_buy_shares": buy,
             "foreign_sell_shares": sell,
-            "foreign_net_shares": raw_net if np.isfinite(raw_net) else buy - sell,
+            "foreign_net_shares": net,
             "volume": _finite(item.get("volume"), np.nan),
             "value": _finite(item.get("value"), np.nan),
             "source": "ZAPI_IDX_FOREIGN_FLOW",
@@ -155,14 +164,17 @@ def _normalize_stock_summary_payload(payload: Any, trade_date: Any, universe: se
             continue
         item_date = pd.to_datetime(item.get("Date"), errors="coerce")
         day = item_date.normalize() if pd.notna(item_date) else fallback.normalize()
-        buy = _finite(item.get("ForeignBuy"), 0.0)
-        sell = _finite(item.get("ForeignSell"), 0.0)
+        buy = _finite(item.get("ForeignBuy"), np.nan)
+        sell = _finite(item.get("ForeignSell"), np.nan)
+        if not any(np.isfinite(value) for value in (buy, sell)):
+            continue
+        net = buy - sell if np.isfinite(buy) and np.isfinite(sell) else np.nan
         normalized.append({
             "ticker": ticker,
             "trade_date": day,
             "foreign_buy_shares": buy,
             "foreign_sell_shares": sell,
-            "foreign_net_shares": buy - sell,
+            "foreign_net_shares": net,
             "volume": _finite(item.get("Volume"), np.nan),
             "value": _finite(item.get("Value"), np.nan),
             "frequency": _finite(item.get("Frequency"), np.nan),
@@ -309,7 +321,7 @@ def _normalize_history(frame: pd.DataFrame | None) -> pd.DataFrame:
         )
         out["foreign_net_shares"] = buy - sell
     if "source" not in out.columns:
-        out["source"] = "ZAPI_SHARED_CACHE"
+        out["source"] = "ZAPI_CACHE_SOURCE_UNKNOWN"
     if "flow_unit" not in out.columns:
         out["flow_unit"] = "SHARES"
     out = out.dropna(subset=["ticker", "trade_date"])
@@ -319,18 +331,18 @@ def _normalize_history(frame: pd.DataFrame | None) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def _load_shared_cache() -> tuple[pd.DataFrame, dict[str, Any]]:
-    cached = _HISTORY_CACHE.get("shared")
+def _load_owned_cache() -> tuple[pd.DataFrame, dict[str, Any]]:
+    cached = _HISTORY_CACHE.get("owned")
     now = time.monotonic()
     if cached and cached[0] > now:
         return cached[1].copy(), dict(cached[2])
     try:
-        payload = _http_get(SHARED_CACHE_URL, timeout=10.0, raw=True)
+        payload = _http_get(OWNED_CACHE_URL, timeout=10.0, raw=True)
         frame = pd.read_csv(BytesIO(payload), compression="gzip")
         frame = _normalize_history(frame)
         meta = {
             "state": "OK" if not frame.empty else "EMPTY",
-            "provider": "IDX_FLOW_SCANNER_SHARED_ZAPI_CACHE",
+            "provider": "PASTICUAN_OWNED_ZAPI_CACHE",
             "rows": int(len(frame)),
             "latest_trade_date": (
                 pd.to_datetime(frame["trade_date"], errors="coerce").max().date().isoformat()
@@ -341,34 +353,41 @@ def _load_shared_cache() -> tuple[pd.DataFrame, dict[str, Any]]:
         frame = pd.DataFrame()
         meta = {
             "state": "FAIL_SOFT",
-            "provider": "IDX_FLOW_SCANNER_SHARED_ZAPI_CACHE",
+            "provider": "PASTICUAN_OWNED_ZAPI_CACHE",
             "rows": 0,
             "error": f"{type(exc).__name__}: {str(exc)[:180]}",
         }
-    _HISTORY_CACHE["shared"] = (now + 900.0, frame.copy(), dict(meta))
+    _HISTORY_CACHE["owned"] = (now + 900.0, frame.copy(), dict(meta))
     return frame, meta
 
 
-def _recent_weekdays(anchor: pd.Timestamp | None = None, count: int = 3) -> list[pd.Timestamp]:
-    current = anchor or pd.Timestamp.now(tz="Asia/Jakarta").tz_localize(None).normalize()
+def _expected_idx_sessions(anchor: Any = None, count: int = 20) -> list[pd.Timestamp]:
+    """Return completed IDX sessions newest-first; unknown calendars fail closed."""
+    current = latest_expected_completed_session(anchor)
     values: list[pd.Timestamp] = []
-    cursor = pd.Timestamp(current).normalize()
     while len(values) < max(1, int(count)):
-        if cursor.weekday() < 5:
-            values.append(cursor)
-        cursor -= pd.Timedelta(days=1)
+        values.append(pd.Timestamp(current).normalize())
+        current = previous_idx_session(current, include_date=False)
     return values
+
+
+def _recent_weekdays(anchor: pd.Timestamp | None = None, count: int = 3) -> list[pd.Timestamp]:
+    """Compatibility name: refresh dates are actual IDX sessions, not weekdays."""
+    return _expected_idx_sessions(anchor, count)
 
 
 def _load_history_for_universe(tickers: Iterable[Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
     names = sorted({_canonical(value) for value in tickers if _canonical(value)})
-    shared, meta = _load_shared_cache()
-    history = shared.loc[shared["ticker"].isin(names)].copy() if not shared.empty else pd.DataFrame()
+    owned, meta = _load_owned_cache()
+    history = owned.loc[owned["ticker"].isin(names)].copy() if not owned.empty else pd.DataFrame()
     latest = pd.to_datetime(history.get("trade_date"), errors="coerce").max() if not history.empty else pd.NaT
     recent = _recent_weekdays(count=3)
     fresh_enough = pd.notna(latest) and latest >= recent[0]
-    direct_meta: dict[str, Any] = {"state": "NOT_NEEDED" if fresh_enough else "NOT_ATTEMPTED"}
     api_key = _secret("ZAPI_KEY")
+    direct_meta: dict[str, Any] = {
+        "state": "NOT_NEEDED" if fresh_enough else ("NOT_ATTEMPTED" if api_key else "NO_ZAPI_KEY"),
+        "provider": "ZAPI_DIRECT",
+    }
     if not fresh_enough and api_key:
         for day in recent:
             direct, direct_meta = _fetch_direct_day(names, day, api_key)
@@ -380,8 +399,8 @@ def _load_history_for_universe(tickers: Iterable[Any]) -> tuple[pd.DataFrame, di
                 break
     combined_meta = {
         "state": "OK" if not history.empty else (direct_meta.get("state") or meta.get("state") or "NO_DATA"),
-        "shared_cache_state": meta.get("state"),
-        "shared_cache_provider": meta.get("provider"),
+        "owned_cache_state": meta.get("state"),
+        "owned_cache_provider": meta.get("provider"),
         "direct_state": direct_meta.get("state"),
         "direct_provider": direct_meta.get("provider"),
         "zapi_key_available": bool(api_key),
@@ -416,45 +435,117 @@ def _cross_section_score(series: pd.Series) -> pd.Series:
     return out
 
 
-def score_foreign_history(history: pd.DataFrame, universe: Iterable[Any] | None = None) -> pd.DataFrame:
+def score_foreign_history(
+    history: pd.DataFrame,
+    universe: Iterable[Any] | None = None,
+    *,
+    as_of: Any = None,
+) -> pd.DataFrame:
     frame = _normalize_history(history)
     names = sorted({_canonical(value) for value in (universe or frame.get("ticker", [])) if _canonical(value)})
     if not names:
         return pd.DataFrame()
+    expected = _expected_idx_sessions(as_of, 20)
+    expected_set = set(expected)
+    expected5 = set(expected[:5])
+    expected10 = set(expected[:10])
+    latest_expected = expected[0]
+    expected_dates = "|".join(day.date().isoformat() for day in expected)
     rows: list[dict[str, Any]] = []
     for ticker in names:
-        local = frame.loc[frame["ticker"].eq(ticker)].sort_values("trade_date").tail(20).copy()
+        ticker_history = frame.loc[frame["ticker"].eq(ticker)].copy()
+        local = ticker_history.loc[ticker_history["trade_date"].isin(expected_set)].sort_values("trade_date").copy()
+        observed = int(local["trade_date"].nunique()) if not local.empty else 0
+        coverage_ratio = observed / 20.0
+        sources = sorted(set(str(value) for value in local.get("source", pd.Series(dtype=str)).dropna() if str(value).strip()))
+        source_text = " | ".join(sources)
+        verified_sources = {"ZAPI_IDX_FOREIGN_FLOW", "ZAPI_IDX_STOCK_SUMMARY_FALLBACK"}
+        provenance = "VERIFIED_UPSTREAM_ZAPI" if sources and set(sources).issubset(verified_sources) else ("UNVERIFIED_SOURCE" if sources else "MISSING")
         if local.empty:
-            rows.append({"ticker": ticker})
+            rows.append({
+                "ticker": ticker,
+                "zapi_foreign_latest_trade_date": np.nan,
+                "zapi_foreign_observed_days": 0,
+                "zapi_foreign_net_shares_1d": np.nan,
+                "zapi_foreign_net_shares_5d": np.nan,
+                "zapi_foreign_net_shares_10d": np.nan,
+                "zapi_foreign_net_shares_20d": np.nan,
+                "zapi_foreign_net_participation_1d": np.nan,
+                "zapi_foreign_net_participation_5d": np.nan,
+                "zapi_foreign_net_participation_10d": np.nan,
+                "zapi_foreign_net_participation_20d": np.nan,
+                "zapi_foreign_positive_days_ratio_5d": np.nan,
+                "zapi_foreign_positive_days_ratio_20d": np.nan,
+                "zapi_foreign_buy_ratio_20d": np.nan,
+                "zapi_foreign_buy_ratio_5d": np.nan,
+                "zapi_flow_source": source_text,
+                "zapi_flow_unit": "SHARES",
+                "foreign_source": source_text,
+                "foreign_latest_session": "",
+                "foreign_expected_sessions": 20,
+                "foreign_expected_session_dates": expected_dates,
+                "foreign_observed_sessions": 0,
+                "foreign_coverage_ratio": 0.0,
+                "foreign_freshness_state": "MISSING",
+                "foreign_provenance": provenance,
+                "foreign_window_state": "MISSING",
+                "_foreign_freshness_factor": 0.0,
+            })
             continue
         latest = local.iloc[-1]
-        recent5 = local.tail(5)
+        recent5 = local.loc[local["trade_date"].isin(expected5)]
+        recent10 = local.loc[local["trade_date"].isin(expected10)]
         buy20 = pd.to_numeric(local.get("foreign_buy_shares"), errors="coerce")
         sell20 = pd.to_numeric(local.get("foreign_sell_shares"), errors="coerce")
         net20 = pd.to_numeric(local.get("foreign_net_shares"), errors="coerce")
         vol20 = pd.to_numeric(local.get("volume"), errors="coerce")
         net5 = pd.to_numeric(recent5.get("foreign_net_shares"), errors="coerce")
+        net10 = pd.to_numeric(recent10.get("foreign_net_shares"), errors="coerce")
         vol5 = pd.to_numeric(recent5.get("volume"), errors="coerce")
+        vol10 = pd.to_numeric(recent10.get("volume"), errors="coerce")
         gross20 = buy20.fillna(0.0) + sell20.fillna(0.0)
         gross5 = pd.to_numeric(recent5.get("foreign_buy_shares"), errors="coerce").fillna(0.0) + pd.to_numeric(recent5.get("foreign_sell_shares"), errors="coerce").fillna(0.0)
         latest_volume = _finite(latest.get("volume"), np.nan)
         latest_net = _finite(latest.get("foreign_net_shares"), np.nan)
+        latest_session = pd.Timestamp(latest.get("trade_date")).normalize()
+        lag = trading_session_age(latest_session, latest_expected)
+        if lag == 0:
+            freshness_state, freshness_factor = "FRESH", 1.0
+        elif lag == 1:
+            freshness_state, freshness_factor = "LAGGING_1_SESSION", 0.85
+        elif lag == 2:
+            freshness_state, freshness_factor = "LAGGING_2_SESSIONS", 0.55
+        else:
+            freshness_state, freshness_factor = "STALE", 0.0
+        window_state = "SUFFICIENT_20D" if observed == 20 else "PARTIAL"
         rows.append({
             "ticker": ticker,
-            "zapi_foreign_latest_trade_date": pd.to_datetime(latest.get("trade_date"), errors="coerce"),
-            "zapi_foreign_observed_days": int(local["trade_date"].nunique()),
+            "zapi_foreign_latest_trade_date": latest_session,
+            "zapi_foreign_observed_days": observed,
             "zapi_foreign_net_shares_1d": latest_net,
             "zapi_foreign_net_shares_5d": float(net5.sum(min_count=1)),
+            "zapi_foreign_net_shares_10d": float(net10.sum(min_count=1)),
             "zapi_foreign_net_shares_20d": float(net20.sum(min_count=1)),
             "zapi_foreign_net_participation_1d": latest_net / latest_volume if np.isfinite(latest_net) and np.isfinite(latest_volume) and latest_volume > 0 else np.nan,
             "zapi_foreign_net_participation_5d": float(net5.sum(min_count=1) / vol5.sum(min_count=1)) if vol5.sum(min_count=1) > 0 else np.nan,
+            "zapi_foreign_net_participation_10d": float(net10.sum(min_count=1) / vol10.sum(min_count=1)) if vol10.sum(min_count=1) > 0 else np.nan,
             "zapi_foreign_net_participation_20d": float(net20.sum(min_count=1) / vol20.sum(min_count=1)) if vol20.sum(min_count=1) > 0 else np.nan,
             "zapi_foreign_positive_days_ratio_5d": float(net5.gt(0).mean()) if net5.notna().any() else np.nan,
             "zapi_foreign_positive_days_ratio_20d": float(net20.gt(0).mean()) if net20.notna().any() else np.nan,
             "zapi_foreign_buy_ratio_20d": float(buy20.sum(min_count=1) / gross20.sum(min_count=1)) if gross20.sum(min_count=1) > 0 else np.nan,
             "zapi_foreign_buy_ratio_5d": float(pd.to_numeric(recent5.get("foreign_buy_shares"), errors="coerce").sum(min_count=1) / gross5.sum(min_count=1)) if gross5.sum(min_count=1) > 0 else np.nan,
-            "zapi_flow_source": " | ".join(sorted(set(str(value) for value in local.get("source", pd.Series(dtype=str)).dropna() if str(value).strip()))),
+            "zapi_flow_source": source_text,
             "zapi_flow_unit": "SHARES",
+            "foreign_source": source_text,
+            "foreign_latest_session": latest_session.date().isoformat(),
+            "foreign_expected_sessions": 20,
+            "foreign_expected_session_dates": expected_dates,
+            "foreign_observed_sessions": observed,
+            "foreign_coverage_ratio": coverage_ratio,
+            "foreign_freshness_state": freshness_state,
+            "foreign_provenance": provenance,
+            "foreign_window_state": window_state,
+            "_foreign_freshness_factor": freshness_factor,
         })
     out = pd.DataFrame(rows)
     ratio20 = pd.to_numeric(out["zapi_foreign_net_participation_20d"], errors="coerce")
@@ -478,12 +569,8 @@ def score_foreign_history(history: pd.DataFrame, universe: Iterable[Any] | None 
     denominator = components.notna().mul(weights, axis=1).sum(axis=1)
     flow_score = numerator.div(denominator.replace(0.0, np.nan)).clip(0.0, 100.0)
 
-    now_day = pd.Timestamp.now(tz="Asia/Jakarta").tz_localize(None).normalize()
-    age = (now_day - pd.to_datetime(out["zapi_foreign_latest_trade_date"], errors="coerce")).dt.days.clip(lower=0)
-    # Calendar gaps of up to three days are normal around IDX weekends.
-    # Do not downgrade Friday EOD evidence merely because the scanner runs on Sunday/Monday.
-    freshness = np.where(age <= 3, 1.0, np.where(age <= 5, 0.85, np.where(age <= 10, 0.55, 0.0)))
-    history_cov = np.minimum(1.0, pd.to_numeric(out["zapi_foreign_observed_days"], errors="coerce").fillna(0.0) / 20.0)
+    freshness = pd.to_numeric(out.pop("_foreign_freshness_factor"), errors="coerce").fillna(0.0)
+    history_cov = pd.to_numeric(out["foreign_coverage_ratio"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
     coverage = (100.0 * history_cov * freshness).clip(0.0, 100.0)
 
     out["zapi_foreign_flow_score"] = flow_score.round(1)
@@ -522,7 +609,7 @@ def get_zapi_features(tickers: Iterable[Any]) -> tuple[pd.DataFrame, dict[str, A
     features = score_foreign_history(history, codes)
     if not features.empty:
         features["zapi_flow_meta_state"] = str(meta.get("state") or "UNKNOWN")
-        features["zapi_shared_cache_state"] = str(meta.get("shared_cache_state") or "")
+        features["zapi_owned_cache_state"] = str(meta.get("owned_cache_state") or "")
         features["zapi_direct_state"] = str(meta.get("direct_state") or "")
     _FEATURE_CACHE[codes] = (now + 600.0, features.copy(), dict(meta))
     while len(_FEATURE_CACHE) > 8:

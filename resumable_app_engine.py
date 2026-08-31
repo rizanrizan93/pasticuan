@@ -820,6 +820,8 @@ def _refresh_missing_daily_evidence(
                     years_back=max(1, int(getattr(cfg, "idx_fundamental_years_back", 2))),
                     timeout=4,
                     max_workers=min(8, max(1, len(official_targets))),
+                    existing_history=history,
+                    missing_periods_only=True,
                 )
             except Exception as exc:
                 idx_report = pd.DataFrame([{

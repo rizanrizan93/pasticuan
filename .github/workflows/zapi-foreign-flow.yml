@@ -1,0 +1,40 @@
+name: Pasticuan-owned ZAPI foreign-flow cache
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 11 * * 1-5"
+  push:
+    branches: [main]
+    paths:
+      - "zapi_flow_enrichment.py"
+      - "scripts/update_zapi_foreign_flow.py"
+      - ".github/workflows/zapi-foreign-flow.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check --no-cache-dir pandas==2.3.3 numpy==2.4.2 requests==2.34.2
+      - run: python scripts/update_zapi_foreign_flow.py
+      - name: Commit Pasticuan-owned cache
+        run: |
+          if git diff --quiet -- data/zapi_foreign_flow_60d.csv.gz data/zapi_foreign_flow_state.json; then
+            echo "No valid ZAPI cache update."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/zapi_foreign_flow_60d.csv.gz data/zapi_foreign_flow_state.json
+          git commit -m "data: refresh Pasticuan-owned ZAPI foreign flow cache"
+          git push

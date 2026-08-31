@@ -1,4 +1,4 @@
-name: Super canonical IDX participant flow verify
+name: Pasticuan-owned IDX participant flow verify
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install pandas requests
-      - name: Verify canonical 400-ticker participant cache
+      - name: Verify Pasticuan-owned participant cache
         run: |
           python - <<'PY'
           from io import BytesIO
@@ -30,11 +30,11 @@ jobs:
           import pandas as pd
           import requests
 
-          url = 'https://raw.githubusercontent.com/rizanrizan93/idx-flow-scanner/main/data/cache/idx_public_participant_30d.csv.gz'
-          r = requests.get(url, timeout=20, headers={'User-Agent':'Super-Canonical-Participant-Verify/1.0'})
+          url = 'https://raw.githubusercontent.com/rizanrizan93/pasticuan/main/data/public_broker_flow_30d.csv.gz'
+          r = requests.get(url, timeout=20, headers={'User-Agent':'Pasticuan-Owned-Participant-Verify/1.0'})
           r.raise_for_status()
           df = pd.read_csv(BytesIO(gzip.decompress(r.content)))
-          required = {'ticker','trade_date','participant','buy_value','sell_value','buy_volume','sell_volume','participant_flow_source'}
+          required = {'ticker','trade_date','broker_code','buy_value','sell_value','buy_volume','sell_volume','source','provenance_state'}
           missing = required - set(df.columns)
           if missing:
               raise SystemExit(f'MISSING_COLUMNS:{sorted(missing)}')
@@ -44,5 +44,5 @@ jobs:
           tickers = int(df.loc[df['trade_date'].eq(latest),'ticker'].nunique()) if pd.notna(latest) else 0
           print({'latest_trade_date': str(latest.date()) if pd.notna(latest) else None, 'latest_tickers': tickers, 'rows': len(df), 'days': int(df['trade_date'].nunique())})
           if tickers < 360:
-              raise SystemExit(f'LATEST_PARTICIPANT_COVERAGE_TOO_LOW:{tickers}/400')
+              raise SystemExit(f'OWNED_PARTICIPANT_COVERAGE_TOO_LOW:{tickers}/400')
           PY

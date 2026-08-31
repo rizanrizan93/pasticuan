@@ -1406,56 +1406,6 @@ def _idx_eod_patch_frame(row: pd.Series) -> pd.DataFrame:
     return _clean_ohlcv(frame, strict=True)
 
 
-def _load_canonical_remote_ohlcv_seed(
-    tickers: Iterable[str], *, timeout: int = 20,
-) -> dict[str, pd.DataFrame]:
-    """Load the shared verified 400-name EOD seed as an outage fallback.
-
-    Freshness is not trusted here. The normal download_ohlcv final-session
-    validation still rejects a stale seed instead of silently scoring it.
-    """
-    import gzip
-    import requests
-
-    requested = {
-        str(t).strip().upper().removesuffix(".JK"): str(t).strip()
-        for t in tickers if str(t).strip()
-    }
-    if not requested:
-        return {}
-    url = (
-        "https://raw.githubusercontent.com/rizanrizan93/idx-flow-scanner/"
-        "main/data/cache/idx_400_ohlcv_1y.csv.gz"
-    )
-    response = requests.get(
-        url,
-        timeout=max(5, int(timeout)),
-        headers={"User-Agent": "IDX-Super-Scanner-Canonical-EOD-Seed/1.0"},
-    )
-    response.raise_for_status()
-    raw = pd.read_csv(BytesIO(gzip.decompress(response.content)))
-    required = {"ticker", "date", "open", "high", "low", "close", "volume"}
-    if not required.issubset(raw.columns):
-        raise RuntimeError(
-            f"Canonical OHLCV seed missing columns: {sorted(required - set(raw.columns))}"
-        )
-    raw["ticker"] = raw["ticker"].astype(str).str.upper().str.removesuffix(".JK")
-    raw = raw[raw["ticker"].isin(requested)].copy()
-    if raw.empty:
-        return {}
-    result: dict[str, pd.DataFrame] = {}
-    for canonical, group in raw.groupby("ticker", sort=False):
-        frame = group.rename(columns={
-            "open": "Open", "high": "High", "low": "Low",
-            "close": "Close", "volume": "Volume",
-        }).copy()
-        frame.index = pd.to_datetime(frame["date"], errors="coerce")
-        frame = frame.drop(columns=["ticker", "date"], errors="ignore")
-        frame = _clean_ohlcv(frame, strict=True)
-        if not frame.empty:
-            result[requested.get(str(canonical), str(canonical))] = frame
-    return result
-
 def _yfinance_fallback_enabled() -> bool:
     """Keep wrapper calls opt-in because their timeout is not a hard wall clock."""
     return str(os.environ.get('IDX_SCANNER_ENABLE_YFINANCE_FALLBACK', '')).strip().lower() in {
@@ -1722,40 +1672,6 @@ def _download_ohlcv_v431(tickers: Iterable[str], period: str='3y', batch_size: i
                 warnings[ticker] = ' • '.join(filter(None, [
                     prior, f'Emergency yfinance fallback failed: {type(exc).__name__}'
                 ]))
-
-    unresolved = [ticker for ticker in requested if ticker not in histories]
-    if unresolved:
-        try:
-            provider_calls += 1
-            canonical_seed = _load_canonical_remote_ohlcv_seed(
-                unresolved,
-                timeout=max(8, int(os.environ.get("IDX_SCANNER_CANONICAL_SEED_TIMEOUT_SECONDS", "20"))),
-            )
-        except Exception as exc:
-            canonical_seed = {}
-            for ticker in unresolved:
-                prior = warnings.get(ticker, "")
-                warnings[ticker] = " • ".join(filter(None, [
-                    prior, f"Canonical EOD seed unavailable: {type(exc).__name__}"
-                ]))
-        for ticker, frame in canonical_seed.items():
-            cached = cached_histories.get(ticker, pd.DataFrame())
-            merged = _merge_ohlcv_history(cached, frame)
-            if merged.empty:
-                continue
-            histories[ticker] = merged
-            downloaded_bars += len(frame)
-            source_tiers[ticker] = "CANONICAL_GITHUB_EOD_SEED"
-            if cached.empty:
-                full_refreshes += 1
-            else:
-                incremental_refreshes += 1
-            _write_daily_ohlcv_cache(ticker, merged, "CANONICAL_GITHUB_SEED")
-            failed.pop(ticker, None)
-            prior = warnings.get(ticker, "")
-            warnings[ticker] = " • ".join(filter(None, [
-                prior, "Canonical shared EOD seed used after live provider outage"
-            ]))
 
     unresolved = [ticker for ticker in requested if ticker not in histories]
     if unresolved:
@@ -5068,7 +4984,10 @@ FUNDAMENTAL_HISTORY_COLUMNS: tuple[str, ...] = (
     'operating_income', 'ebit', 'ebitda', 'net_income',
     'operating_cash_flow', 'capex', 'total_assets', 'total_liabilities',
     'equity', 'total_debt', 'cash', 'shares_outstanding', 'interest_expense',
-    'car', 'npl_gross', 'ldr', 'source_verified', 'available_at', 'validation_flags',
+    'car', 'npl_gross', 'ldr', 'source_verified', 'issuer_match',
+    'issuer_identifier', 'issuer_identifier_scheme', 'provider',
+    'evidence_type', 'report_date', 'reporting_period', 'fetched_at',
+    'available_at', 'validation_flags',
 )
 
 _FUNDAMENTAL_VALUE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -5271,10 +5190,10 @@ def normalize_fundamental_history(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
     for column in FUNDAMENTAL_HISTORY_COLUMNS:
         if column not in out:
-            if column == 'source_verified':
+            if column in {'source_verified', 'issuer_match'}:
                 out[column] = False
             else:
-                out[column] = '' if column in {'period_type', 'statement_basis', 'source_family', 'source_name', 'source_url', 'currency', 'validation_flags'} else np.nan
+                out[column] = '' if column in {'period_type', 'statement_basis', 'source_family', 'source_name', 'source_url', 'currency', 'issuer_identifier', 'issuer_identifier_scheme', 'provider', 'evidence_type', 'reporting_period', 'validation_flags'} else np.nan
     out['ticker'] = out['ticker'].map(normalize_idx_ticker)
     # Supabase may return ISO timestamps with offsets while Yahoo, IDX, and
     # uploaded CSV rows are commonly date-only/tz-naive.  Pandas 2.3+ keeps a
@@ -5288,8 +5207,15 @@ def normalize_fundamental_history(frame: pd.DataFrame) -> pd.DataFrame:
     # Point-in-time availability is distinct from fiscal period_end.  Legacy rows
     # without a publication/observation timestamp are conservatively stamped at
     # first ingestion, never backdated to the reporting period.
-    normalized_available_at = out['available_at'].map(_as_jakarta_naive_timestamp)
-    out['available_at'] = pd.to_datetime(normalized_available_at, errors='coerce')
+    available_raw = out['available_at'].where(
+        out['available_at'].notna() & out['available_at'].astype(str).str.strip().ne(''),
+        out['fetched_at'],
+    )
+    normalized_available_at = available_raw.map(_as_jakarta_naive_timestamp)
+    # Force nanosecond resolution before filling missing values.  Depending on
+    # the source mix, pandas may otherwise infer datetime64[s], which rejects a
+    # current ingestion timestamp containing microseconds.
+    out['available_at'] = pd.to_datetime(normalized_available_at, errors='coerce').astype('datetime64[ns]')
     availability_missing = out['available_at'].isna()
     if availability_missing.any():
         ingestion_time = _as_jakarta_naive_timestamp(pd.Timestamp.now(tz='Asia/Jakarta'))
@@ -5307,6 +5233,16 @@ def normalize_fundamental_history(frame: pd.DataFrame) -> pd.DataFrame:
     out['source_family'] = out['source_family'].fillna('').astype(str).str.upper().replace('', 'USER_UPLOAD')
     out['source_name'] = out['source_name'].fillna('').astype(str)
     out['source_url'] = out['source_url'].fillna('').astype(str)
+    out['source_verified'] = out['source_verified'].fillna(False).astype(bool)
+    out['issuer_match'] = out['issuer_match'].fillna(False).astype(bool)
+    out['issuer_identifier'] = out['issuer_identifier'].fillna('').astype(str)
+    out['issuer_identifier_scheme'] = out['issuer_identifier_scheme'].fillna('').astype(str)
+    out['provider'] = out['provider'].fillna('').astype(str)
+    out.loc[out['provider'].str.strip().eq(''), 'provider'] = out.loc[out['provider'].str.strip().eq(''), 'source_family']
+    out['evidence_type'] = out['evidence_type'].fillna('').astype(str).replace('', 'FUNDAMENTAL_STATEMENT')
+    out['report_date'] = out['period_end']
+    out['reporting_period'] = out['period_type']
+    out['fetched_at'] = out['available_at']
     # Repair orphaned provider provenance from older caches.  Yahoo statement
     # rows historically stored an empty URL even though the underlying public
     # financial-statement page is deterministic from the ticker.  Backfilling
@@ -6083,6 +6019,26 @@ def _xbrl_attribute(element: Any, name: str) -> str:
     return ''
 
 
+_IDX_XBRL_ENTITY_SCHEME = 'http://www.idx.co.id/xbrl'
+_IDX_XBRL_ENTITY_ROLES = frozenset({'maker', 'approver'})
+
+
+def _idx_xbrl_entity_matches_ticker(identifier: object, scheme: object, ticker: object) -> bool:
+    """Match only the deterministic identity forms observed in IDX filings."""
+    entity_scheme = _safe_text(scheme).strip().lower().rstrip('/')
+    if entity_scheme != _IDX_XBRL_ENTITY_SCHEME:
+        return False
+    entity_identifier = _safe_text(identifier).strip().lower()
+    issuer_code, separator, role = entity_identifier.rpartition('_')
+    expected_code = normalize_idx_ticker(ticker).removesuffix('.JK').strip().lower()
+    return bool(
+        separator
+        and expected_code
+        and issuer_code == expected_code
+        and role in _IDX_XBRL_ENTITY_ROLES
+    )
+
+
 def _xbrl_fact_number(element: Any, inline: bool=False) -> float:
     if _xbrl_attribute(element, 'nil').lower() in {'true', '1'}:
         return np.nan
@@ -6174,6 +6130,8 @@ def parse_idx_xbrl_attachment(
                     continue
                 start = end = instant = pd.NaT
                 dimensions = 0
+                entity_identifier = ''
+                entity_identifier_scheme = ''
                 for child in element.iter():
                     child_name = _xbrl_local_name(child.tag).lower()
                     if child_name == 'startdate':
@@ -6184,9 +6142,17 @@ def parse_idx_xbrl_attachment(
                         instant = pd.to_datetime(child.text, errors='coerce')
                     elif child_name in {'explicitmember', 'typedmember'}:
                         dimensions += 1
+                    elif child_name == 'identifier' and not entity_identifier:
+                        entity_identifier = _safe_text(child.text)
+                        entity_identifier_scheme = _xbrl_attribute(child, 'scheme')
                 contexts[(member_name, context_id)] = {
                     'id': context_id, 'start': start, 'end': end,
                     'instant': instant, 'dimensions': dimensions,
+                    'entity_identifier': entity_identifier,
+                    'entity_identifier_scheme': entity_identifier_scheme,
+                    'issuer_match': _idx_xbrl_entity_matches_ticker(
+                        entity_identifier, entity_identifier_scheme, ticker,
+                    ),
                 }
             elif local == 'unit':
                 unit_id = _xbrl_attribute(element, 'id')
@@ -6216,6 +6182,20 @@ def parse_idx_xbrl_attachment(
             raise ValueError('XBRL tidak dapat diparse: ' + ' | '.join(parse_errors[:3]))
         return _fundamental_empty_history()
 
+    matched_contexts = [context for context in contexts.values() if bool(context.get('issuer_match'))]
+    if not matched_contexts:
+        observed_identifiers = sorted({
+            _safe_text(context.get('entity_identifier'))
+            for context in contexts.values()
+            if _safe_text(context.get('entity_identifier'))
+        })
+        if observed_identifiers:
+            raise ValueError(
+                'ISSUER_MISMATCH: XBRL entity identifier tidak cocok dengan '
+                f'{normalize_idx_ticker(ticker)}; observed={"|".join(observed_identifiers[:6])}'
+            )
+        raise ValueError('ISSUER_IDENTITY_MISSING: context XBRL tidak memiliki entity identifier terverifikasi')
+
     target = pd.Timestamp(period_end).tz_localize(None) if getattr(pd.Timestamp(period_end), 'tzinfo', None) is not None else pd.Timestamp(period_end)
     duration_fields = {
         'revenue', 'gross_profit', 'operating_income', 'ebit', 'ebitda',
@@ -6230,6 +6210,8 @@ def parse_idx_xbrl_attachment(
             if concept_score <= 0:
                 continue
             context = fact['context']
+            if not bool(context.get('issuer_match')):
+                continue
             context_end = context.get('instant') if pd.notna(context.get('instant', pd.NaT)) else context.get('end')
             if pd.isna(context_end):
                 continue
@@ -6291,13 +6273,29 @@ def parse_idx_xbrl_attachment(
     unit_text = ' '.join(selected_units).upper()
     if 'USD' in unit_text and 'IDR' not in unit_text:
         currency = 'USD'
+    issuer_identifiers = sorted({
+        _safe_text(context.get('entity_identifier'))
+        for context in matched_contexts
+        if _safe_text(context.get('entity_identifier'))
+    })
+    issuer_schemes = sorted({
+        _safe_text(context.get('entity_identifier_scheme'))
+        for context in matched_contexts
+        if _safe_text(context.get('entity_identifier_scheme'))
+    })
     row: dict[str, Any] = {
         'ticker': ticker, 'period_end': target, 'period_type': period_type,
         'statement_basis': 'ANNUAL' if str(period_type).upper() == 'FY' else 'YTD_CUMULATIVE',
         'source_family': 'IDX_OFFICIAL_XBRL',
         'source_name': 'IDX official public filing (XBRL/iXBRL)',
         'source_url': source_url, 'currency': currency,
-        'source_verified': True, 'validation_flags': '',
+        'source_verified': True, 'issuer_match': True,
+        'issuer_identifier': ' | '.join(issuer_identifiers),
+        'issuer_identifier_scheme': ' | '.join(issuer_schemes),
+        'provider': 'IDX_OFFICIAL_XBRL', 'evidence_type': 'FUNDAMENTAL_STATEMENT',
+        'report_date': target, 'reporting_period': period_type,
+        'fetched_at': pd.Timestamp.now(tz='Asia/Jakarta').isoformat(),
+        'validation_flags': '',
         **selected,
     }
     raw = pd.DataFrame([row])
@@ -6308,7 +6306,7 @@ def parse_idx_xbrl_attachment(
         # combining them, so preserve the raw canonical row on that path.
         for column in FUNDAMENTAL_HISTORY_COLUMNS:
             if column not in raw:
-                raw[column] = False if column == 'source_verified' else np.nan
+                raw[column] = False if column in {'source_verified', 'issuer_match'} else np.nan
         return raw[list(FUNDAMENTAL_HISTORY_COLUMNS)].reset_index(drop=True)
     return normalize_fundamental_history(raw)
 
@@ -6321,6 +6319,8 @@ def fetch_idx_fundamental_history(
     max_workers: int=4,
     max_attachment_bytes: int=25_000_000,
     request_get: Any | None=None,
+    existing_history: pd.DataFrame | None=None,
+    missing_periods_only: bool=True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Automatically fetch a bounded official IDX XBRL statement shortlist.
 
@@ -6337,10 +6337,17 @@ def fetch_idx_fundamental_history(
         getter = request_get
     names = [normalize_idx_ticker(value) for value in tickers]
     names = [value for value in dict.fromkeys(names) if value][:max(0, int(max_tickers))]
-    columns = ['ticker', 'provider', 'status', 'rows', 'documents_found', 'documents_parsed', 'error', 'stability']
+    columns = [
+        'ticker', 'provider', 'status', 'rows', 'documents_found',
+        'documents_requested', 'documents_parsed', 'cached_valid_periods',
+        'error', 'error_code', 'stability',
+    ]
     if not names:
         return (_fundamental_empty_history(), pd.DataFrame(columns=columns))
-    cached_all = normalize_fundamental_history(_load_cache('idx_fundamental_history'))
+    cached_all = combine_fundamental_history(
+        normalize_fundamental_history(_load_cache('idx_fundamental_history')),
+        normalize_fundamental_history(existing_history) if isinstance(existing_history, pd.DataFrame) and not existing_history.empty else _fundamental_empty_history(),
+    )
     cached = (
         cached_all.loc[cached_all['ticker'].isin(names)].copy()
         if not cached_all.empty else _fundamental_empty_history()
@@ -6355,17 +6362,40 @@ def fetch_idx_fundamental_history(
             'ticker': ticker, 'provider': 'IDX_OFFICIAL_XBRL',
             'status': 'CACHE_FALLBACK' if not cached.loc[cached['ticker'].eq(ticker)].empty else 'UNAVAILABLE',
             'rows': len(cached.loc[cached['ticker'].eq(ticker)]),
-            'documents_found': 0, 'documents_parsed': 0,
+            'documents_found': 0, 'documents_requested': 0, 'documents_parsed': 0,
+            'cached_valid_periods': 0,
             'error': 'Manifest IDX tidak tersedia; memakai cache filing terakhir' if not cached.loc[cached['ticker'].eq(ticker)].empty else 'Manifest IDX tidak tersedia atau tidak memiliki attachment XBRL',
+            'error_code': 'PROVIDER_UNAVAILABLE',
             'stability': 'CURRENT_AND_LEGACY_HOST_FAILOVER',
         } for ticker in names]
         report = pd.concat([pd.DataFrame(reports), manifest_report], ignore_index=True, sort=False)
         return (cached, report)
-    manifest = (
+    discovered_manifest = (
         manifest.sort_values(['ticker', 'period_end', 'attachment_rank'])
         .drop_duplicates(['ticker', 'period_end', 'period_type'], keep='first')
         .reset_index(drop=True)
     )
+    valid_cached = cached.copy()
+    if not valid_cached.empty:
+        valid_cached = valid_cached.loc[
+            valid_cached['source_family'].astype(str).str.upper().eq('IDX_OFFICIAL_XBRL')
+            & valid_cached['source_verified'].map(_truthy)
+            & valid_cached.get('issuer_match', pd.Series(False, index=valid_cached.index)).map(_truthy)
+            & valid_cached['source_url'].map(_official_idx_reference)
+        ].copy()
+    valid_cache_keys = {
+        (_safe_text(row.get('ticker')), pd.Timestamp(row.get('period_end')).normalize(), _safe_text(row.get('period_type')).upper())
+        for row in valid_cached.to_dict('records')
+        if _safe_text(row.get('ticker')) and pd.notna(pd.to_datetime(row.get('period_end'), errors='coerce'))
+    }
+    if missing_periods_only and valid_cache_keys:
+        keep = [
+            (_safe_text(row.get('ticker')), pd.Timestamp(row.get('period_end')).normalize(), _safe_text(row.get('period_type')).upper()) not in valid_cache_keys
+            for row in discovered_manifest.to_dict('records')
+        ]
+        manifest = discovered_manifest.loc[keep].reset_index(drop=True)
+    else:
+        manifest = discovered_manifest.copy()
     headers = {
         'User-Agent': 'Mozilla/5.0 (compatible; IDXSuperScanner/5.5; research-client)',
         'Accept': 'application/zip, application/xml, text/xml, text/html, */*',
@@ -6406,14 +6436,15 @@ def fetch_idx_fundamental_history(
 
     frames: list[pd.DataFrame] = []
     document_results: list[dict[str, Any]] = []
-    workers = min(max(1, int(max_workers)), len(manifest))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(one, row.to_dict()) for _, row in manifest.iterrows()]
-        for future in as_completed(futures):
-            frame, report = future.result()
-            if not frame.empty:
-                frames.append(frame)
-            document_results.append(report)
+    if not manifest.empty:
+        workers = min(max(1, int(max_workers)), len(manifest))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(one, row.to_dict()) for _, row in manifest.iterrows()]
+            for future in as_completed(futures):
+                frame, report = future.result()
+                if not frame.empty:
+                    frames.append(frame)
+                document_results.append(report)
     current_history = combine_fundamental_history(*frames)
     history = combine_fundamental_history(cached, current_history)
     if not current_history.empty:
@@ -6422,13 +6453,36 @@ def fetch_idx_fundamental_history(
     document_report = pd.DataFrame(document_results)
     reports: list[dict[str, Any]] = []
     for ticker in names:
+        local_discovered = discovered_manifest.loc[discovered_manifest['ticker'].eq(ticker)]
         local_manifest = manifest.loc[manifest['ticker'].eq(ticker)]
         local_documents = document_report.loc[document_report['ticker'].eq(ticker)] if not document_report.empty else pd.DataFrame()
         parsed_count = int(local_documents['status'].eq('OK').sum()) if not local_documents.empty else 0
         row_count = int(len(history.loc[history['ticker'].eq(ticker)]))
         cached_count = int(len(cached.loc[cached['ticker'].eq(ticker)]))
+        cached_valid_periods = int(len(valid_cached.loc[valid_cached['ticker'].eq(ticker)]))
         errors = ' | '.join(local_documents.loc[local_documents['status'].ne('OK'), 'error'].astype(str).head(4).tolist()) if not local_documents.empty else ''
-        if parsed_count == len(local_manifest) and parsed_count:
+        upper_error = errors.upper()
+        if 'ISSUER_MISMATCH' in upper_error:
+            error_code = 'ISSUER_MISMATCH'
+        elif 'ISSUER_IDENTITY_MISSING' in upper_error:
+            error_code = 'ISSUER_IDENTITY_MISSING'
+        elif 'HTTP 403' in upper_error:
+            error_code = 'HTTP_403'
+        elif 'HTTP 404' in upper_error:
+            error_code = 'HTTP_404'
+        elif 'TIMEOUT' in upper_error:
+            error_code = 'TIMEOUT'
+        elif 'CONTEXT VALIDATION' in upper_error:
+            error_code = 'CONTEXT_REJECTED'
+        elif errors:
+            error_code = 'PARSE_FAILURE'
+        elif local_discovered.empty:
+            error_code = 'NO_MATCH'
+        else:
+            error_code = ''
+        if local_manifest.empty and cached_valid_periods:
+            provider_status = 'VALID_CACHE_REUSED'
+        elif parsed_count == len(local_manifest) and parsed_count:
             provider_status = 'OK'
         elif parsed_count:
             provider_status = 'PARTIAL_WITH_CACHE' if cached_count else 'PARTIAL'
@@ -6439,8 +6493,10 @@ def fetch_idx_fundamental_history(
         reports.append({
             'ticker': ticker, 'provider': 'IDX_OFFICIAL_XBRL',
             'status': provider_status,
-            'rows': row_count, 'documents_found': len(local_manifest),
-            'documents_parsed': parsed_count, 'error': errors,
+            'rows': row_count, 'documents_found': len(local_discovered),
+            'documents_requested': len(local_manifest),
+            'documents_parsed': parsed_count, 'cached_valid_periods': cached_valid_periods,
+            'error': errors, 'error_code': error_code,
             'stability': 'UNDOCUMENTED_PUBLIC_PAGE_ENDPOINT',
         })
     report = pd.concat([pd.DataFrame(reports), manifest_report], ignore_index=True, sort=False)

@@ -7,7 +7,7 @@ import zapi_flow_enrichment as zapi
 
 
 def _history() -> pd.DataFrame:
-    dates = pd.bdate_range(end=pd.Timestamp.now(tz="Asia/Jakarta").tz_localize(None).normalize(), periods=20)
+    dates = list(reversed(zapi._expected_idx_sessions(count=20)))
     rows = []
     for ticker, direction in (("POS1", 1.0), ("POS2", 0.6), ("NEG1", -0.6), ("NEG2", -1.0)):
         for i, day in enumerate(dates):
@@ -28,6 +28,29 @@ def _history() -> pd.DataFrame:
                 }
             )
     return pd.DataFrame(rows)
+
+
+def test_foreign_coverage_uses_idx_sessions_and_does_not_fill_gaps() -> None:
+    as_of = pd.Timestamp("2026-08-31 17:00", tz="Asia/Jakarta")
+    expected = list(reversed(zapi._expected_idx_sessions(as_of, 20)))
+    rows = [
+        {"ticker": "TEST", "trade_date": day, "foreign_net_shares": 1.0,
+         "foreign_buy_shares": 2.0, "foreign_sell_shares": 1.0, "volume": 10.0,
+         "source": "ZAPI_IDX_FOREIGN_FLOW"}
+        for day in expected[1:]
+    ]
+    rows.append({"ticker": "TEST", "trade_date": "2026-08-25", "foreign_net_shares": 99.0,
+                 "foreign_buy_shares": 100.0, "foreign_sell_shares": 1.0, "volume": 100.0,
+                 "source": "ZAPI_IDX_FOREIGN_FLOW"})
+
+    row = zapi.score_foreign_history(pd.DataFrame(rows), ["TEST"], as_of=as_of).iloc[0]
+
+    assert int(row["foreign_expected_sessions"]) == 20
+    assert int(row["foreign_observed_sessions"]) == 19
+    assert float(row["foreign_coverage_ratio"]) == 0.95
+    assert row["foreign_freshness_state"] == "FRESH"
+    assert row["foreign_window_state"] == "PARTIAL"
+    assert float(row["zapi_foreign_net_shares_20d"]) == 19.0
 
 
 def test_foreign_flow_score_separates_accumulation_and_distribution() -> None:

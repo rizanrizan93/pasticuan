@@ -24,6 +24,7 @@ import re
 import struct
 import time
 import zlib
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -54,6 +55,7 @@ DATABASE_BRIDGE_VERSION = "20.0.0-evidence-lineage-integrity"
 DATABASE_SCHEMA_VERSION = "scanner_schema_v20"
 FEATURE_CACHE_SCHEMA_VERSION = "ALL_ELIGIBLE_LITE_V2"
 SCANNER_VERSION = SCANNER_RELEASE_VERSION
+IDX_FLOW_SUPABASE_PROJECT_REF = "djqvhbeonmicztxfisav"
 LEGACY_DATABASE_HEALTH_STATE_V14 = "HEALTHY_V14_GUARDED_REAL_MONEY"  # compatibility marker for v9.8.0 regression audit
 
 DATABASE_VERIFICATION_TABLES: tuple[str, ...] = (
@@ -1078,6 +1080,11 @@ def _env_or_streamlit_secret(name: str, default: str = "") -> str:
         return str(default)
 
 
+def _supabase_project_ref(url: str) -> str:
+    host = str(urlparse(str(url or "")).hostname or "").lower()
+    return host.split(".", 1)[0] if host.endswith(".supabase.co") else ""
+
+
 @dataclass(frozen=True)
 class DatabaseSettings:
     enabled: bool = False
@@ -1113,7 +1120,11 @@ class DatabaseSettings:
             ("ANON", _env_or_streamlit_secret("SUPABASE_ANON_KEY", "").strip()),
         )
         key_type, key = next(((kind, value) for kind, value in key_candidates if value), ("NONE", ""))
-        if not enabled:
+        if _supabase_project_ref(url) == IDX_FLOW_SUPABASE_PROJECT_REF:
+            mode = "CONFIG_CROSS_SCANNER_PROJECT_REJECTED"
+            key = ""
+            key_type = "NONE"
+        elif not enabled:
             mode = "DISABLED"
         elif requested_mode == "OUTBOX_ONLY":
             mode = "OUTBOX_ONLY"
