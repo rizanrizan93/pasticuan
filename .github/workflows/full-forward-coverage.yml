@@ -1,53 +1,63 @@
-name: Super full forward collection coverage
+name: Phase 5.6 bounded live validation gate — Pasticuan
 
 on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      declared_cumulative_zapi_attempts:
+        description: Previously consumed attempts in the release-controlled 0/12 ledger
+        required: true
+        default: "0"
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: phase5-6-bounded-live-validation-${{ github.repository }}
+  cancel-in-progress: false
+
 env:
   PYTHONPATH: ${{ github.workspace }}
+  PYTHONDONTWRITEBYTECODE: "1"
+  PHASE56_BASELINE_SHA: 134a379e097d7de5475fb0eead253ca5152389f8
 
 jobs:
-  forward-coverage:
+  bounded-live-validation:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout selected gate ref without push credentials
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the dedicated gate branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF_NAME}" = "gate/phase5-6-bounded-live-validation"
+
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.12'
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Check full 400 live forward source coverage
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          from live_forward_evidence import collect_live_forward_evidence, collection_coverage
+          python-version: "3.12"
 
-          text = Path('tools/idx_400_production_universe_2026-07.txt').read_text()
-          line = next(line for line in text.splitlines() if line.strip() and not line.startswith('#'))
-          tickers = [item.strip() for item in line.split(',') if item.strip()]
-          assert len(tickers) == 400, len(tickers)
-          frame = collect_live_forward_evidence(
-              tickers,
-              lookback_days=180,
-              max_workers=16,
-              timeout=6.0,
-          )
-          report = collection_coverage(frame, tickers)
-          states = frame.groupby('forward_collection_state')['ticker'].nunique().sort_values(ascending=False).to_dict()
-          material = frame.loc[frame['forward_collection_state'].eq('MATERIAL_FORWARD_RESEARCH_EVIDENCE_FOUND')]
-          failed = frame.loc[frame['forward_collection_state'].eq('FORWARD_CHECK_FAILED_RETRYABLE')]
-          print('FULL_FORWARD_REPORT', report)
-          print('STATE_COUNTS', states)
-          print('MATERIAL_TICKERS', material['ticker'].nunique() if not material.empty else 0)
-          print('FAILED_TICKERS', failed['ticker'].nunique() if not failed.empty else 0)
-          if report['coverage_pct'] < 90.0:
-              raise SystemExit(f"full-universe forward collection coverage too low: {report}")
-          PY
+      - name: Install pinned harness dependencies
+        run: python -m pip install --disable-pip-version-check --no-cache-dir pandas==2.3.3 requests==2.34.2 pytest==8.4.2
+
+      - name: Prove delta allowlist
+        run: python tools/phase5_6_bounded_live_validation.py allowlist --baseline "${PHASE56_BASELINE_SHA}"
+
+      - name: Run targeted fake-only harness tests
+        run: pytest -q -p no:cacheprovider tests/test_phase5_6_bounded_live_validation.py
+
+      - name: Execute bounded state machine
+        env:
+          ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
+          SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+          SHARED_EVIDENCE_SUPABASE_SECRET_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SECRET_KEY }}
+          SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
+        run: >-
+          python tools/phase5_6_bounded_live_validation.py run
+          --client PASTICUAN
+          --declared-cumulative-attempts "${{ inputs.declared_cumulative_zapi_attempts }}"
