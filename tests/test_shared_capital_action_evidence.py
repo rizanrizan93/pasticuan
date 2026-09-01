@@ -1,0 +1,390 @@
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+import threading
+from typing import Any, Mapping
+
+import pytest
+import requests
+
+from shared_capital_action_evidence import (
+    FEEDS,
+    ISSUED_HISTORY_LENGTH,
+    PAGE_LENGTH,
+    SharedCapitalActionEvidence,
+    normalize_capital_actions,
+    validate_capital_action_rows,
+)
+from shared_evidence_hub import EvidenceKey, SharedEvidenceCoordinator
+
+
+PERIOD = date(2026, 8, 1)
+OBSERVED = date(2026, 9, 1)
+
+
+def _issued(**changes: Any) -> dict[str, Any]:
+    row = {
+        "id": "issued-1", "code": "INET", "action": "waran",
+        "shares": 3_200, "sharesAfter": 22_375_261_532,
+        "listingDate": "2026-08-14", "publicationDate": "2026-08-15",
+    }
+    row.update(changes)
+    return row
+
+
+def _monthly(feed: str, items: list[Mapping[str, Any]], *, page: int = 1, total: int | None = None, has_more: bool | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "page": page, "year": 2026, "month": 8, "count": len(items),
+        "items": list(items), "total": len(items) if total is None else total,
+        "dataset": feed, "provider": "idx",
+    }
+    if has_more is not None:
+        payload["hasMore"] = has_more
+    return payload
+
+
+def _issued_payload(items: list[Mapping[str, Any]], *, start: int = 0, total: int | None = None) -> dict[str, Any]:
+    return {
+        "items": list(items), "start": start,
+        "total": len(items) if total is None else total,
+        "length": ISSUED_HISTORY_LENGTH,
+        "dataset": "issued-history", "provider": "idx",
+    }
+
+
+class Response:
+    def __init__(self, payload: Any = None, *, status: int = 200, content: bytes = b"json", malformed: bool = False):
+        self.payload = payload
+        self.status_code = status
+        self.content = content
+        self.malformed = malformed
+
+    def json(self) -> Any:
+        if self.malformed:
+            raise ValueError("bad json")
+        return self.payload
+
+
+class Session:
+    def __init__(self, outcomes: list[Any]):
+        self.outcomes = list(outcomes)
+        self.calls: list[dict[str, Any]] = []
+
+    def request(self, method: str, url: str, **kwargs: Any) -> Response:
+        self.calls.append({"method": method, "url": url, **kwargs})
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class MemoryBackend:
+    def __init__(self):
+        self.rows: list[dict[str, Any]] = []
+        self.leases: dict[tuple[str, str, str, date], dict[str, Any]] = {}
+        self.provider_states: list[dict[str, Any]] = []
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _identity(key: EvidenceKey) -> tuple[str, str, str, date]:
+        normalized = key.normalized()
+        return normalized.provider, normalized.family, normalized.scope, normalized.target_date
+
+    def acquire_lease(self, key: EvidenceKey, holder: str, lease_seconds: int) -> Mapping[str, Any]:
+        with self.lock:
+            identity = self._identity(key)
+            current = self.leases.get(identity)
+            if current and current["state"] == "HELD" and current["holder"] != holder:
+                return {"acquired": False, "lease_state": "HELD"}
+            self.leases[identity] = {"state": "HELD", "holder": holder}
+            return {"acquired": True, "lease_state": "HELD"}
+
+    def complete_lease(self, key: EvidenceKey, holder: str, state: str) -> bool:
+        self.leases[self._identity(key)]["state"] = "COMPLETED"
+        return True
+
+    def fail_lease(self, key: EvidenceKey, holder: str, reason: str) -> bool:
+        self.leases[self._identity(key)].update({"state": "FAILED", "reason": reason})
+        return True
+
+    def record_provider_state(self, row: Mapping[str, Any]) -> None:
+        self.provider_states.append(dict(row))
+
+    def read_rows(self, table: str, filters: Mapping[str, Any], *, limit: int, **_: Any) -> list[dict[str, Any]]:
+        assert table == "evidence_capital_actions"
+        return [dict(row) for row in self.rows if all(str(row.get(key)) == str(value) for key, value in filters.items())][:limit]
+
+    def upsert_rows(self, table: str, rows: list[Mapping[str, Any]], *, conflict: tuple[str, ...]) -> list[dict[str, Any]]:
+        assert table == "evidence_capital_actions"
+        assert conflict == ("ticker", "event_type", "event_date", "source_id")
+        keyed = {
+            (row["ticker"], row["event_type"], row["event_date"], row["source_id"]): dict(row)
+            for row in self.rows
+        }
+        for row in rows:
+            key = (row["ticker"], row["event_type"], row["event_date"], row["source_id"])
+            keyed[key] = dict(row)
+        self.rows = list(keyed.values())
+        return [dict(row) for row in rows]
+
+
+def _producer(backend: MemoryBackend, session: Session, *, client: str = "PASTICUAN", api_key: str = "fixture-key") -> SharedCapitalActionEvidence:
+    coordinator = SharedEvidenceCoordinator(backend, client_id=client, worker_id=f"{client}-worker")
+    return SharedCapitalActionEvidence(
+        client, backend=backend, coordinator=coordinator, session=session, api_key=api_key
+    )
+
+
+def test_issued_history_preserves_dates_and_derives_only_compatible_facts() -> None:
+    row = normalize_capital_actions(
+        [_issued()], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    )[0]
+    assert row["event_type"] == "WARRANT_EXERCISE"
+    assert row["event_date"] == "2026-08-14" and row["publication_date"] == "2026-08-15"
+    assert row["delta_shares"] == 3_200
+    assert row["post_shares"] == 22_375_261_532
+    assert row["pre_shares"] == 22_375_258_332
+    assert row["calculation_state"] == "EXPLICIT_DELTA_POST_DERIVED_PRE"
+
+
+def test_pre_and_post_are_explicit_and_delta_is_arithmetic() -> None:
+    item = _issued(action="konversi", shares=None, sharesBefore=1000, sharesAfter=1250)
+    row = normalize_capital_actions([item], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)[0]
+    assert row["event_type"] == "CONVERSION" and row["delta_shares"] == 250
+    assert row["delta_percent"] == 25 and row["calculation_state"] == "EXPLICIT_PRE_POST"
+
+
+def test_incompatible_explicit_share_fields_fail_closed() -> None:
+    item = _issued(sharesBefore=1000, sharesAfter=1200, shares=300)
+    with pytest.raises(RuntimeError, match="PARSE_FAILURE"):
+        normalize_capital_actions([item], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)
+
+
+def test_rights_ratio_is_preserved_without_inventing_share_counts() -> None:
+    item = {
+        "id": "rights-1", "code": "BBRI", "eventDate": "2026-08-20",
+        "publicationDate": "2026-08-05", "ratioBefore": 4, "ratioAfter": 1,
+    }
+    row = normalize_capital_actions([item], feed="rights-offerings", source_period=PERIOD, observed_on=OBSERVED)[0]
+    assert row["event_type"] == "RIGHTS_OFFERING"
+    assert row["ratio_before"] == 4 and row["ratio_after"] == 1
+    assert row["pre_shares"] is None and row["post_shares"] is None
+    assert row["delta_shares"] is None and row["delta_percent"] is None
+    assert row["calculation_state"] == "NO_SHARE_FACTS"
+
+
+def test_reverse_split_requires_explicit_action_not_title() -> None:
+    explicit = {"id": "s1", "code": "ABCD", "effectiveDate": "2026-08-21", "action": "Reverse Stock Split"}
+    title_only = {"id": "s2", "code": "EFGH", "effectiveDate": "2026-08-22", "title": "Reverse Stock Split"}
+    rows = normalize_capital_actions([explicit, title_only], feed="stock-splits", source_period=PERIOD, observed_on=OBSERVED)
+    assert [row["event_type"] for row in rows] == ["REVERSE_STOCK_SPLIT", "STOCK_SPLIT"]
+
+
+def test_stock_split_ratio_does_not_create_delta() -> None:
+    item = {"id": "split", "code": "BBCA", "exDate": "2026-08-10", "ratioBefore": 1, "ratioAfter": 5}
+    row = normalize_capital_actions([item], feed="stock-splits", source_period=PERIOD, observed_on=OBSERVED)[0]
+    assert row["delta_shares"] is None and row["delta_percent"] is None
+
+
+def test_ambiguous_new_shares_and_free_text_description_are_not_inferred() -> None:
+    rights = {
+        "id": "rights", "code": "BBRI", "eventDate": "2026-08-11",
+        "newShares": 500, "description": "Reverse split proposal",
+    }
+    right_row = normalize_capital_actions(
+        [rights], feed="rights-offerings", source_period=PERIOD, observed_on=OBSERVED
+    )[0]
+    assert right_row["post_shares"] is None and right_row["delta_shares"] is None
+    split = {"id": "split", "code": "BBCA", "eventDate": "2026-08-12", "description": "Reverse Stock Split"}
+    split_row = normalize_capital_actions(
+        [split], feed="stock-splits", source_period=PERIOD, observed_on=OBSERVED
+    )[0]
+    assert split_row["event_type"] == "STOCK_SPLIT" and split_row["raw_action"] is None
+
+
+def test_additional_listing_uses_explicit_additional_shares() -> None:
+    item = {"id": "add", "code": "TLKM", "listingDate": "2026-08-09", "additionalShares": "1.000.000"}
+    row = normalize_capital_actions([item], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED)[0]
+    assert row["delta_shares"] == 1_000_000 and row["event_type"] == "ADDITIONAL_LISTING"
+    assert row["pre_shares"] is None and row["post_shares"] is None
+
+
+def test_publication_date_is_never_substituted_from_event_date() -> None:
+    row = normalize_capital_actions(
+        [_issued(publicationDate=None)], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    )[0]
+    assert row["event_date"] == "2026-08-14" and row["publication_date"] is None
+
+
+def test_deduplication_is_deterministic_and_provider_id_conflicts_fail() -> None:
+    item = _issued()
+    rows = normalize_capital_actions([item, dict(item)], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)
+    assert len(rows) == 1
+    changed = dict(item, shares=3_201)
+    with pytest.raises(RuntimeError, match="PARSE_FAILURE"):
+        normalize_capital_actions([item, changed], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)
+
+
+def test_missing_provider_id_has_stable_hash_identity() -> None:
+    item = _issued(id=None)
+    first = normalize_capital_actions([item], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)[0]
+    second = normalize_capital_actions([dict(item)], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)[0]
+    assert first["source_id"] == second["source_id"] and first["source_id"].startswith("ISSUED-HISTORY:")
+
+
+def test_nonofficial_explicit_source_url_is_rejected() -> None:
+    with pytest.raises(RuntimeError, match="CONTEXT_REJECTED"):
+        normalize_capital_actions(
+            [_issued(sourceUrl="https://evil.example/action")],
+            feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED,
+        )
+
+
+def test_invalid_ticker_or_missing_event_date_is_skipped() -> None:
+    assert normalize_capital_actions(
+        [_issued(code="BAD!"), _issued(id="two", listingDate=None)],
+        feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED,
+    ) == []
+
+
+def test_monthly_rows_outside_source_month_are_skipped() -> None:
+    item = {"code": "BBCA", "listingDate": "2026-07-31", "additionalShares": 100}
+    assert normalize_capital_actions([item], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED) == []
+
+
+def test_validation_rejects_inconsistent_or_wrong_period_rows() -> None:
+    row = normalize_capital_actions([_issued()], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)[0]
+    assert validate_capital_action_rows([row], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED) == (True, "VALID")
+    bad = dict(row, delta_shares=999)
+    assert validate_capital_action_rows([bad], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)[1] == "PARSE_FAILURE"
+    wrong = dict(row, observed_on="2026-08-31")
+    assert validate_capital_action_rows([wrong], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)[1] == "WRONG_PERIOD"
+    negative = dict(row, pre_shares=-1, post_shares=3_199)
+    assert validate_capital_action_rows([negative], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)[1] == "CONTEXT_REJECTED"
+
+
+def test_wrapped_zapi_content_envelope_is_supported() -> None:
+    session = Session([Response({"content": _issued_payload([_issued()]), "message": "ok", "errors": None})])
+    rows, meta = _producer(MemoryBackend(), session).get_issued_history(OBSERVED)
+    assert len(rows) == 1 and meta["state"] == "REFRESHED"
+
+
+def test_global_issued_history_uses_offset_pagination_without_ticker_calls() -> None:
+    first = _issued_payload([_issued(id="one", code="BBCA")], total=501)
+    second = _issued_payload([_issued(id="two", code="BBRI")], start=500, total=501)
+    session = Session([Response(first), Response(second)])
+    rows, meta = _producer(MemoryBackend(), session).get_issued_history(OBSERVED)
+    assert {row["ticker"] for row in rows} == {"BBCA", "BBRI"}
+    assert meta["api_calls"] == 2 and len(session.calls) == 2
+    assert [call["params"] for call in session.calls] == [
+        {"length": ISSUED_HISTORY_LENGTH, "start": 0},
+        {"length": ISSUED_HISTORY_LENGTH, "start": ISSUED_HISTORY_LENGTH},
+    ]
+    assert all("code" not in call["params"] for call in session.calls)
+
+
+@pytest.mark.parametrize("feed", ["additional-listings", "rights-offerings", "stock-splits"])
+def test_monthly_feeds_use_one_global_month_call(feed: str) -> None:
+    item = {"id": "x", "code": "BBCA", "eventDate": "2026-08-12"}
+    if feed == "additional-listings":
+        item["additionalShares"] = 100
+    session = Session([Response(_monthly(feed, [item]))])
+    rows, meta = _producer(MemoryBackend(), session).get_month(2026, 8, feed=feed, observed_on=OBSERVED)
+    assert len(rows) == 1 and meta["api_calls"] == 1
+    assert session.calls[0]["url"] == FEEDS[feed]["url"]
+    assert session.calls[0]["params"] == {"year": 2026, "month": 8, "page": 1, "length": PAGE_LENGTH}
+    assert "search" not in session.calls[0]["params"]
+
+
+def test_monthly_pagination_follows_explicit_has_more() -> None:
+    one = {"id": "one", "code": "BBCA", "listingDate": "2026-08-01", "additionalShares": 100}
+    two = {"id": "two", "code": "BBRI", "listingDate": "2026-08-02", "additionalShares": 200}
+    session = Session([
+        Response(_monthly("additional-listings", [one], has_more=True)),
+        Response(_monthly("additional-listings", [two], page=2, has_more=False)),
+    ])
+    rows, meta = _producer(MemoryBackend(), session).get_month(
+        2026, 8, feed="additional-listings", observed_on=OBSERVED
+    )
+    assert len(rows) == 2 and meta["pages"] == 2
+
+
+@pytest.mark.parametrize("first,second", [("PASTICUAN", "EMIR"), ("EMIR", "PASTICUAN")])
+def test_second_scanner_reuses_global_month_without_zapi_key(first: str, second: str) -> None:
+    backend = MemoryBackend()
+    item = {"id": "x", "code": "BBCA", "listingDate": "2026-08-12", "additionalShares": 100}
+    first_rows, _ = _producer(backend, Session([Response(_monthly("additional-listings", [item]))]), client=first).get_month(
+        2026, 8, feed="additional-listings", observed_on=OBSERVED
+    )
+    second_session = Session([])
+    second_rows, meta = _producer(backend, second_session, client=second, api_key="").get_month(
+        2026, 8, feed="additional-listings", observed_on=OBSERVED
+    )
+    assert first_rows == second_rows and not second_session.calls
+    assert meta["cache_hit"] and meta["request_avoided"] and meta["api_calls"] == 0
+
+
+def test_missing_key_on_cache_miss_makes_no_request() -> None:
+    session = Session([])
+    rows, meta = _producer(MemoryBackend(), session, api_key="").get_issued_history(OBSERVED)
+    assert not rows and not session.calls and meta["state"] == "ENVIRONMENT_BLOCKED"
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429])
+def test_http_failures_are_explicit(status: int) -> None:
+    rows, meta = _producer(MemoryBackend(), Session([Response(status=status)])).get_issued_history(OBSERVED)
+    assert not rows and meta["state"] == f"HTTP_{status}"
+
+
+@pytest.mark.parametrize(
+    "outcome,reason",
+    [(requests.Timeout(), "TIMEOUT"), (requests.ConnectionError(), "CONNECTION_ERROR")],
+)
+def test_network_failures_are_explicit(outcome: Exception, reason: str) -> None:
+    rows, meta = _producer(MemoryBackend(), Session([outcome])).get_issued_history(OBSERVED)
+    assert not rows and meta["state"] == reason
+
+
+@pytest.mark.parametrize(
+    "response,reason",
+    [
+        (Response(content=b""), "EMPTY_RESPONSE"),
+        (Response(malformed=True), "PARSE_FAILURE"),
+        (Response({"items": [], "dataset": "wrong", "provider": "idx"}), "CONTEXT_REJECTED"),
+        (Response({"items": {}, "dataset": "issued-history", "provider": "idx"}), "PARSE_FAILURE"),
+    ],
+)
+def test_bad_responses_fail_closed(response: Response, reason: str) -> None:
+    rows, meta = _producer(MemoryBackend(), Session([response])).get_issued_history(OBSERVED)
+    assert not rows and meta["state"] == reason
+
+
+def test_empty_valid_feed_is_explicit_no_report() -> None:
+    rows, meta = _producer(MemoryBackend(), Session([Response(_issued_payload([]))])).get_issued_history(OBSERVED)
+    assert not rows and meta["state"] == "NO_REPORT"
+
+
+def test_invalid_feed_and_month_make_no_request() -> None:
+    session = Session([])
+    producer = _producer(MemoryBackend(), session)
+    assert producer.get_month(2026, 13)[1]["state"] == "WRONG_PERIOD"
+    assert producer.get_month(2026, 8, feed="issued-history")[1]["state"] == "CONTEXT_REJECTED"
+    assert not session.calls
+
+
+def test_migration_contract_and_module_remain_scanner_neutral() -> None:
+    root = Path(__file__).resolve().parents[1]
+    migration_path = next((root / "database").glob("migration_v*_shared_evidence_hub.sql"))
+    migration = migration_path.read_text()
+    module = (root / "shared_capital_action_evidence.py").read_text()
+    for column in (
+        "source_feed text", "source_period date", "observed_on date", "ratio_before numeric",
+        "ratio_after numeric", "raw_action text", "calculation_state text", "payload_hash text",
+        "source_verified boolean",
+    ):
+        assert column in migration
+    assert "grant select, insert, update on table public.%I to service_role" in migration
+    assert "enable row level security" in migration
+    lowered = module.lower()
+    assert "score" not in lowered and "ranking" not in lowered and "production_gate" not in lowered

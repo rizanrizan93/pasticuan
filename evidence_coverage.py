@@ -127,7 +127,8 @@ def build_evidence_coverage(
         else:
             date_col = next((col for col in ("trade_date", "date", "timestamp") if col in price_rows), "")
             dates = pd.to_datetime(price_rows.get(date_col), errors="coerce").dt.tz_localize(None).dt.normalize() if date_col else pd.Series(pd.NaT, index=price_rows.index)
-            local = price_rows.assign(_date=dates).dropna(subset=["_date"]).sort_values("_date")
+            local = price_rows.assign(_date=dates).dropna(subset=["_date"])
+            local = local[local["_date"] <= latest_expected].sort_values("_date")
             latest_price = local.iloc[-1] if not local.empty else None
             if latest_price is None:
                 ohlcv_state = "INVALID"
@@ -148,12 +149,20 @@ def build_evidence_coverage(
         if not fund_rows.empty:
             dated = fund_rows.copy()
             dated["_report_date"] = dated.apply(lambda item: _date(item, ("report_date", "as_of", "period_end", "reporting_period")), axis=1)
+            dated["_publication_date"] = dated.apply(
+                lambda item: _date(item, ("publication_date", "published_at", "filing_date", "available_at")), axis=1
+            )
             dated["_quality"] = dated.apply(
                 lambda item: 3 if (_truth(item.get("source_verified")) and str(item.get("source_url") or "").strip() and any(token in str(item.get("source") or item.get("provider") or "").upper() for token in OFFICIAL_TOKENS))
                 else (2 if (_truth(item.get("source_verified")) and (_truth(item.get("issuer_match")) or _truth(item.get("identity_verified")))) else (1 if _truth(item.get("source_verified")) else 0)),
                 axis=1,
             )
-            dated = dated.dropna(subset=["_report_date"]).sort_values(["_quality", "_report_date"])
+            dated = dated.dropna(subset=["_report_date", "_publication_date"])
+            dated = dated[
+                (dated["_report_date"] <= dated["_publication_date"])
+                & (dated["_publication_date"] <= as_of_day)
+                & (dated["_report_date"] <= as_of_day)
+            ].sort_values(["_quality", "_report_date", "_publication_date"])
             if not dated.empty:
                 fund_row = dated.iloc[-1]
         has_fund = bool(len(fund_row))
@@ -165,6 +174,7 @@ def build_evidence_coverage(
         source = str(fund_row.get("source") or fund_row.get("source_family") or fund_row.get("provider") or "").strip()
         source_url = str(fund_row.get("source_url") or "").strip()
         report_date = fund_row.get("_report_date") if has_fund else None
+        publication_date = fund_row.get("_publication_date") if has_fund else None
         age = (as_of_day - report_date).days if isinstance(report_date, pd.Timestamp) else None
         fresh = age is not None and 0 <= age <= policy.fundamental_max_age_days
         core_available = all(np.isfinite(values[field]) for field in ("revenue", "net_income", "assets", "liabilities", "equity"))
@@ -173,7 +183,7 @@ def build_evidence_coverage(
         capex_period = str(fund_row.get("capex_period_type") or period).upper()
         fcf_available = bool(np.isfinite(values["ocf"]) and np.isfinite(values["capex"]) and period_valid and ocf_period == capex_period)
         fundamental_valid = bool(core_available and identity_valid and source_verified and period_valid and fresh)
-        result.update({"fundamental_valid": fundamental_valid, "fundamental_official": official and fundamental_valid, "fundamental_source": source, "fundamental_report_date": report_date.date().isoformat() if isinstance(report_date, pd.Timestamp) else "", "fundamental_freshness_state": "FRESH" if fresh else ("STALE" if report_date is not None else "MISSING"), "ocf_available": bool(np.isfinite(values["ocf"])), "capex_available": bool(np.isfinite(values["capex"])), "fcf_available": fcf_available})
+        result.update({"fundamental_valid": fundamental_valid, "fundamental_official": official and fundamental_valid, "fundamental_source": source, "fundamental_report_date": report_date.date().isoformat() if isinstance(report_date, pd.Timestamp) else "", "fundamental_publication_date": publication_date.date().isoformat() if isinstance(publication_date, pd.Timestamp) else "", "fundamental_freshness_state": "FRESH" if fresh else ("STALE" if report_date is not None else "MISSING"), "ocf_available": bool(np.isfinite(values["ocf"])), "capex_available": bool(np.isfinite(values["capex"])), "fcf_available": fcf_available})
         for field, value in values.items():
             result[f"fundamental_{field}_available"] = bool(np.isfinite(value))
         if not has_fund:
@@ -197,10 +207,19 @@ def build_evidence_coverage(
         if not forward_rows.empty:
             work = forward_rows.copy()
             work["_evidence_date"] = work.apply(lambda item: _date(item, ("evidence_date", "date", "as_of")), axis=1)
+            work["_publication_date"] = work.apply(
+                lambda item: _date(item, ("publication_date", "published_at", "evidence_date", "date", "as_of")), axis=1
+            )
             work = work.drop_duplicates(subset=[col for col in ("_ticker", "evidence_type", "_evidence_date", "source_url") if col in work])
             for _, item in work.iterrows():
                 item_date = item.get("_evidence_date")
-                item_fresh = isinstance(item_date, pd.Timestamp) and 0 <= (as_of_day - item_date).days <= policy.forward_max_age_days
+                publication = item.get("_publication_date")
+                item_fresh = (
+                    isinstance(item_date, pd.Timestamp)
+                    and isinstance(publication, pd.Timestamp)
+                    and item_date <= publication <= as_of_day
+                    and 0 <= (as_of_day - item_date).days <= policy.forward_max_age_days
+                )
                 if item_fresh and _truth(item.get("issuer_match")) and _truth(item.get("source_verified")) and str(item.get("source_url") or "").startswith("http") and str(item.get("evidence_type") or "").strip():
                     forward_valid += 1
         result.update({"forward_evidence_available": forward_valid > 0, "forward_evidence_count": forward_valid})

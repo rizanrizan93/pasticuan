@@ -4,13 +4,18 @@ from datetime import timedelta
 from pathlib import Path
 import gzip
 import os
+import sys
 
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from public_idx_broker_flow import aggregate_trade_detail, download_trade_detail, trim_daily_top_flow
+from shared_participant_evidence import SharedParticipantEvidence
 
 CACHE_PATH = Path("data/public_broker_flow_30d.csv.gz")
 MAX_DATES = int(os.getenv("BROKER_CACHE_DAYS", "30"))
+OWNER = "PASTICUAN"
 
 
 def _candidate_dates() -> list:
@@ -36,23 +41,38 @@ def _load_existing() -> pd.DataFrame:
 
 def main() -> int:
     existing = _load_existing()
+    shared = SharedParticipantEvidence(OWNER)
+    print({"owner": OWNER, "shared_evidence_hub": shared.status()})
     source_date = None
     daily = pd.DataFrame()
     source_url = ""
     for candidate in _candidate_dates():
-        try:
-            path, source_url = download_trade_detail(candidate)
-            try:
-                daily = aggregate_trade_detail(path, candidate)
-            finally:
-                Path(path).unlink(missing_ok=True)
-            daily = trim_daily_top_flow(daily, top_n=10)
-            if not daily.empty:
-                source_date = candidate
+        if shared.ready:
+            daily, meta = shared.get_day(
+                candidate,
+                download=download_trade_detail,
+                aggregate=aggregate_trade_detail,
+            )
+            for attempt in meta.get("diagnostics", []):
+                print({"owner": OWNER, **attempt})
+            print({"owner": OWNER, "trade_date": candidate.isoformat(), **{key: meta.get(key) for key in ("state", "provider_called", "request_avoided", "lease_state", "rows", "ticker_breadth")}})
+            source_url = str(meta.get("source_url") or "SHARED_IDX_EVIDENCE_HUB")
+            if str(meta.get("state")) == "REFRESH_LOCKED":
                 break
-        except Exception as exc:
-            print(f"candidate {candidate}: {type(exc).__name__}: {exc}")
-            continue
+        else:
+            try:
+                path, source_url = download_trade_detail(candidate)
+                try:
+                    daily = aggregate_trade_detail(path, candidate)
+                finally:
+                    Path(path).unlink(missing_ok=True)
+            except Exception as exc:
+                print(f"candidate {candidate}: {type(exc).__name__}: {exc}")
+                continue
+        daily = trim_daily_top_flow(daily, top_n=10)
+        if not daily.empty:
+            source_date = candidate
+            break
     if daily.empty:
         print("No public IDX Trade Detail file available; leaving rolling cache unchanged.")
         return 0
@@ -70,7 +90,7 @@ def main() -> int:
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(CACHE_PATH, "wb") as stream:
         combined.to_csv(stream, index=False)
-    print(f"broker cache updated: source_date={source_date} rows={len(combined)} source={source_url}")
+    print({"owner": OWNER, "state": "PARTICIPANT_CACHE_WRITTEN", "source_date": str(source_date), "rows": len(combined), "source": source_url, "shared_cache": shared.metrics()})
     return 0
 
 

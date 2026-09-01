@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths:
       - "zapi_flow_enrichment.py"
+      - "shared_evidence_hub.py"
       - "scripts/update_zapi_foreign_flow.py"
       - ".github/workflows/zapi-foreign-flow.yml"
 
@@ -20,6 +21,8 @@ jobs:
     timeout-minutes: 20
     env:
       ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
+      SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+      SHARED_EVIDENCE_SUPABASE_SECRET_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -29,7 +32,7 @@ jobs:
       - run: python scripts/update_zapi_foreign_flow.py
       - name: Commit Pasticuan-owned cache
         run: |
-          if git diff --quiet -- data/zapi_foreign_flow_60d.csv.gz data/zapi_foreign_flow_state.json; then
+          if [[ -z "$(git status --porcelain -- data/zapi_foreign_flow_60d.csv.gz data/zapi_foreign_flow_state.json)" ]]; then
             echo "No valid ZAPI cache update."
             exit 0
           fi

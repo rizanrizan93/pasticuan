@@ -1,0 +1,23 @@
+name: Shared IDX stock-summary evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
+      SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+      SHARED_EVIDENCE_SUPABASE_SECRET_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check --no-cache-dir pandas==2.3.3 requests==2.34.2
+      - run: python scripts/update_shared_stock_summary.py

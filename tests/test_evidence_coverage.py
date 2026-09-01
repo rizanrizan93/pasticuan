@@ -19,7 +19,7 @@ def _sessions(count: int = 20) -> list[pd.Timestamp]:
 
 def _fundamental(**overrides) -> dict:
     row = {
-        "ticker": "GOOD", "report_date": "2025-12-31", "period_type": "FY",
+        "ticker": "GOOD", "report_date": "2025-12-31", "publication_date": "2026-03-15", "period_type": "FY",
         "issuer_match": True, "source_verified": True, "source": "IDX_XBRL_OFFICIAL",
         "source_url": "https://www.idx.co.id/report", "revenue": 100.0,
         "net_income": 10.0, "assets": 200.0, "liabilities": 80.0,
@@ -102,3 +102,49 @@ def test_foreign_holiday_row_is_not_an_observed_session() -> None:
     assert int(row["foreign_observed_sessions"]) == 19
     assert float(row["foreign_coverage_ratio"]) == 0.95
     assert row["foreign_freshness_state"] == "FRESH"
+
+
+def test_future_published_fundamental_is_invisible_at_historical_cutoff() -> None:
+    detail, _ = build_evidence_coverage(
+        ["GOOD"], fundamentals=pd.DataFrame([_fundamental(publication_date="2026-09-02")]),
+        as_of=AS_OF, policy=CoveragePolicy(require_forward=False, require_foreign=False),
+    )
+    row = detail.iloc[0]
+    assert not bool(row["fundamental_valid"])
+    assert row["fundamental_publication_date"] == ""
+
+
+def test_report_period_without_publication_date_is_not_point_in_time_visible() -> None:
+    report = _fundamental()
+    report.pop("publication_date")
+    detail, _ = build_evidence_coverage(
+        ["GOOD"], fundamentals=pd.DataFrame([report]), as_of=AS_OF,
+        policy=CoveragePolicy(require_forward=False, require_foreign=False),
+    )
+    assert not bool(detail.iloc[0]["fundamental_valid"])
+
+
+def test_future_ohlcv_row_does_not_hide_latest_completed_session() -> None:
+    latest = _sessions()[0]
+    detail, _ = build_evidence_coverage(
+        ["GOOD"],
+        ohlcv=pd.DataFrame([
+            {"ticker": "GOOD", "trade_date": latest, "close": 100, "volume": 10},
+            {"ticker": "GOOD", "trade_date": "2026-09-01", "close": 101, "volume": 11},
+        ]),
+        as_of=AS_OF, policy=CoveragePolicy(require_forward=False, require_foreign=False),
+    )
+    assert bool(detail.iloc[0]["ohlcv_valid"])
+    assert detail.iloc[0]["ohlcv_latest_session"] == latest.date().isoformat()
+
+
+def test_future_published_catalyst_is_not_visible() -> None:
+    detail, _ = build_evidence_coverage(
+        ["GOOD"], forward=pd.DataFrame([{
+            "ticker": "GOOD", "evidence_date": "2026-08-01", "publication_date": "2026-09-01",
+            "evidence_type": "CONTRACT", "issuer_match": True, "source_verified": True,
+            "source_url": "https://www.idx.co.id/disclosure",
+        }]),
+        as_of=AS_OF, policy=CoveragePolicy(require_foreign=False),
+    )
+    assert not bool(detail.iloc[0]["forward_evidence_available"])

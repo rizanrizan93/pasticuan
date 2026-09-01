@@ -8,6 +8,9 @@ on:
     branches: [main]
     paths:
       - "public_idx_broker_flow.py"
+      - "idx_trade_detail_discovery.py"
+      - "shared_evidence_hub.py"
+      - "shared_participant_evidence.py"
       - "scripts/update_public_broker_flow.py"
       - ".github/workflows/public-broker-flow.yml"
 
@@ -18,6 +21,9 @@ jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+      SHARED_EVIDENCE_SUPABASE_SECRET_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -29,7 +35,7 @@ jobs:
         run: python scripts/update_public_broker_flow.py
       - name: Commit updated cache
         run: |
-          if git diff --quiet -- data/public_broker_flow_30d.csv.gz; then
+          if [[ -z "$(git status --porcelain -- data/public_broker_flow_30d.csv.gz)" ]]; then
             echo "No cache update; likely market holiday or source unavailable."
             exit 0
           fi

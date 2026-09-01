@@ -15,6 +15,12 @@ import numpy as np
 import pandas as pd
 import requests
 
+from idx_trade_detail_discovery import (
+    DiscoveryAttempt,
+    discover_trade_detail_url as _discover_trade_detail_url,
+    download_trade_detail as _download_trade_detail,
+)
+
 PUBLIC_INDEX_URL = (
     "https://www.idxdata3.co.id/INET_Specification/Market_Summary/Market_Indices/"
     "IX200720.TXT?directory=.%2FIDX+Reporting+PSPP%2FRevitalisasi%2FPUBLIK%2F"
@@ -51,48 +57,21 @@ def _headers() -> dict[str, str]:
     return {"User-Agent": "Mozilla/5.0 (compatible; IDX-Public-Broker-Collector/1.0)", "Accept": "text/csv,text/plain,*/*"}
 
 
-def discover_trade_detail_url(trade_date: date, timeout: int = 20) -> str:
-    filename = f"Trade-Detail-Publik_{trade_date:%Y%m%d}.csv"
-    try:
-        response = requests.get(PUBLIC_INDEX_URL, headers=_headers(), timeout=timeout)
-        response.raise_for_status()
-        matches = re.findall(r"href=[\"']([^\"']*" + re.escape(filename) + r")[\"']", response.text, flags=re.I)
-        for href in matches:
-            candidate = urljoin(response.url, href)
-            if filename.lower() in candidate.lower():
-                return candidate
-    except Exception:
-        pass
-    candidates = [
-        f"https://www.idxdata3.co.id/IDX%20Reporting%20PSPP/Revitalisasi/PUBLIK/{filename}",
-        f"https://idxdata3.co.id/IDX%20Reporting%20PSPP/Revitalisasi/PUBLIK/{filename}",
-        f"https://www.idxdata3.co.id/Market_Summary/Market_Summary/{filename}",
-    ]
-    for candidate in candidates:
-        try:
-            probe = requests.get(candidate, headers=_headers(), timeout=timeout, stream=True)
-            content_type = str(probe.headers.get("content-type", "")).lower()
-            if probe.ok and ("text" in content_type or "csv" in content_type or "octet" in content_type):
-                probe.close()
-                return candidate
-            probe.close()
-        except Exception:
-            continue
-    raise RuntimeError(f"IDX_TRADE_DETAIL_URL_NOT_FOUND:{filename}")
+def discover_trade_detail_url(
+    trade_date: date,
+    timeout: int = 20,
+    diagnostics: list[DiscoveryAttempt] | None = None,
+) -> str:
+    return _discover_trade_detail_url(trade_date, timeout=timeout, diagnostics=diagnostics)
 
 
-def download_trade_detail(trade_date: date, timeout: int = 45) -> tuple[str, str]:
-    url = discover_trade_detail_url(trade_date, timeout=timeout)
-    handle = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-    path = handle.name
-    handle.close()
-    response = requests.get(url, headers=_headers(), timeout=timeout, stream=True)
-    response.raise_for_status()
-    with open(path, "wb") as output:
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                output.write(chunk)
-    return path, url
+def download_trade_detail(
+    trade_date: date,
+    timeout: int = 45,
+    diagnostics: list[DiscoveryAttempt] | None = None,
+) -> tuple[str, str]:
+    path, url = _download_trade_detail(trade_date, timeout=timeout, diagnostics=diagnostics)
+    return str(path), url
 
 
 def _read_trade_chunks(path: str, universe: set[str] | None = None, chunksize: int = 250_000):
