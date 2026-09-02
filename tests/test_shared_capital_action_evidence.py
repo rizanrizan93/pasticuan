@@ -114,8 +114,13 @@ class MemoryBackend:
         self.provider_states.append(dict(row))
 
     def read_rows(self, table: str, filters: Mapping[str, Any], *, limit: int, **_: Any) -> list[dict[str, Any]]:
-        assert table == "evidence_capital_actions"
-        return [dict(row) for row in self.rows if all(str(row.get(key)) == str(value) for key, value in filters.items())][:limit]
+        if table == "evidence_capital_actions":
+            source = self.rows
+        elif table == "evidence_provider_state":
+            source = self.provider_states
+        else:
+            raise AssertionError(table)
+        return [dict(row) for row in source if all(str(row.get(key)) == str(value) for key, value in filters.items())][:limit]
 
     def upsert_rows(self, table: str, rows: list[Mapping[str, Any]], *, conflict: tuple[str, ...]) -> list[dict[str, Any]]:
         assert table == "evidence_capital_actions"
@@ -362,9 +367,11 @@ def test_bad_responses_fail_closed(response: Response, reason: str) -> None:
     assert not rows and meta["state"] == reason
 
 
-def test_empty_valid_feed_is_explicit_no_report() -> None:
+def test_empty_valid_feed_is_explicit_valid_empty() -> None:
     rows, meta = _producer(MemoryBackend(), Session([Response(_issued_payload([]))])).get_issued_history(OBSERVED)
-    assert not rows and meta["state"] == "NO_REPORT"
+    assert not rows and meta["state"] == "REFRESHED_EMPTY"
+    assert meta["bounded_complete"] is True
+    assert meta["provider_rows"] == 0
 
 
 def test_invalid_feed_and_month_make_no_request() -> None:
@@ -478,3 +485,47 @@ def test_validation_rejects_nonofficial_source_url_and_future_publication_date()
 
 def test_default_page_budget_is_bounded() -> None:
     assert 1 <= MAX_PAGES_PER_RUN <= 10
+
+
+def test_valid_empty_month_is_cached_as_fact_without_duplicate_request() -> None:
+    backend = MemoryBackend()
+    first_session = Session([Response(_monthly("rights-offerings", [], has_more=False))])
+    first_rows, first_meta = _producer(backend, first_session, client="PASTICUAN").get_month(
+        2026, 8, feed="rights-offerings", observed_on=OBSERVED
+    )
+    assert first_rows == []
+    assert first_meta["state"] == "REFRESHED_EMPTY"
+    assert first_meta["bounded_complete"] is True
+    assert first_meta["provider_rows"] == 0
+    assert first_meta["api_calls"] == 1
+    assert backend.provider_states[-1]["response_state"] == "VALID_EMPTY"
+    assert backend.provider_states[-1]["error_classification"] is None
+
+    second_session = Session([])
+    second_rows, second_meta = _producer(
+        backend, second_session, client="EMIR", api_key=""
+    ).get_month(2026, 8, feed="rights-offerings", observed_on=OBSERVED)
+    assert second_rows == []
+    assert not second_session.calls
+    assert second_meta["state"] == "CACHE_HIT_EMPTY"
+    assert second_meta["cache_hit"] and second_meta["request_avoided"]
+    assert second_meta["api_calls"] == 0
+
+
+def test_nonempty_provider_page_that_normalizes_to_zero_fails_closed() -> None:
+    backend = MemoryBackend()
+    out_of_period = {
+        "id": "rights-wrong-period",
+        "code": "BBRI",
+        "eventDate": "2026-07-31",
+        "publicationDate": "2026-07-15",
+    }
+    session = Session([
+        Response(_monthly("rights-offerings", [out_of_period], has_more=False))
+    ])
+    rows, meta = _producer(backend, session).get_month(
+        2026, 8, feed="rights-offerings", observed_on=OBSERVED
+    )
+    assert rows == [] and backend.rows == []
+    assert meta["provider_rows"] == 1
+    assert meta["state"] == "CONTEXT_REJECTED"

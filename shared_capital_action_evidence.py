@@ -464,6 +464,20 @@ class SharedCapitalActionEvidence:
             }
             return self.backend.read_rows(TABLE, filters, limit=50000)
 
+        def read_empty_current() -> bool:
+            rows = self.backend.read_rows(
+                "evidence_provider_state",
+                {
+                    "provider": "ZAPI",
+                    "endpoint_family": "CAPITAL_ACTIONS",
+                    "scope": FEEDS[feed]["scope"],
+                    "target_date": source_period.isoformat(),
+                    "response_state": "VALID_EMPTY",
+                },
+                limit=1,
+            )
+            return bool(rows)
+
         def fetch() -> list[dict[str, Any]]:
             if not self.api_key:
                 raise RuntimeError(MissingReason.ENVIRONMENT_BLOCKED.value)
@@ -497,8 +511,11 @@ class SharedCapitalActionEvidence:
             rows = normalize_capital_actions(
                 items, feed=feed, source_period=source_period, observed_on=observed_on
             )
-            if not rows:
-                raise RuntimeError(MissingReason.NO_REPORT.value)
+            if items and not rows:
+                # A non-empty provider payload that cannot produce any factual
+                # rows is not a valid empty month. Fail closed so mapping/date
+                # drift cannot masquerade as "no corporate action".
+                raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
             return rows
 
         def persist(rows: list[Mapping[str, Any]]) -> int:
@@ -517,6 +534,8 @@ class SharedCapitalActionEvidence:
             ),
             minimum_rows=1,
             lease_seconds=300,
+            allow_empty_valid=True,
+            read_empty_current=read_empty_current,
         )
         rows = [dict(row) for row in result.rows]
         return rows, {

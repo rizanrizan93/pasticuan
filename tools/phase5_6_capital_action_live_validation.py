@@ -118,18 +118,34 @@ def main() -> int:
         max_pages=MAX_PAGES_PER_RUN,
     )
     rows = [dict(row) for row in rows]
+    state = str(meta.get("state") or "")
+    valid_empty = not rows and state in {
+        "REFRESHED_EMPTY",
+        "CACHE_HIT_EMPTY",
+        "CACHE_FILLED_EMPTY_BY_OTHER_CLIENT",
+    }
 
-    if not rows:
-        raise SystemExit(f"CAPITAL_ACTION_ROWS_EMPTY:{args.feed}:{meta.get('state')}")
+    if not rows and not valid_empty:
+        diagnostic = {
+            "state": state,
+            "api_calls": int(meta.get("api_calls") or 0),
+            "pages": int(meta.get("pages") or 0),
+            "page_budget": int(meta.get("page_budget") or MAX_PAGES_PER_RUN),
+            "provider_rows": int(meta.get("provider_rows") or 0),
+            "bounded_complete": bool(meta.get("bounded_complete")),
+        }
+        print(json.dumps({"diagnostic": diagnostic}, sort_keys=True))
+        raise SystemExit(f"CAPITAL_ACTION_ROWS_EMPTY:{args.feed}:{state}")
 
-    valid, reason = validate_capital_action_rows(
-        rows,
-        feed=args.feed,
-        source_period=source_period,
-        observed_on=observed_on,
-    )
-    if not valid:
-        raise SystemExit(f"CAPITAL_ACTION_VALIDATION_FAILED:{reason}")
+    if rows:
+        valid, reason = validate_capital_action_rows(
+            rows,
+            feed=args.feed,
+            source_period=source_period,
+            observed_on=observed_on,
+        )
+        if not valid:
+            raise SystemExit(f"CAPITAL_ACTION_VALIDATION_FAILED:{reason}")
 
     forbidden = sorted({
         str(key).lower()
@@ -141,10 +157,9 @@ def main() -> int:
         raise SystemExit(f"FORBIDDEN_SHARED_SEMANTICS:{','.join(forbidden)}")
 
     api_calls = int(meta.get("api_calls") or 0)
-    state = str(meta.get("state") or "")
 
     if args.mode == "producer":
-        if state != "REFRESHED":
+        if state not in {"REFRESHED", "REFRESHED_EMPTY"}:
             raise SystemExit(f"PRODUCER_DID_NOT_REFRESH:{state}")
         if not (1 <= api_calls <= MAX_PAGES_PER_RUN):
             raise SystemExit(f"PRODUCER_REQUEST_BUDGET_VIOLATION:api={api_calls}")
@@ -153,7 +168,12 @@ def main() -> int:
         if bool(meta.get("request_avoided")):
             raise SystemExit("PRODUCER_UNEXPECTED_CACHE_REUSE")
     else:
-        if state not in {"CACHE_HIT", "CACHE_FILLED_BY_OTHER_CLIENT"}:
+        if state not in {
+            "CACHE_HIT",
+            "CACHE_FILLED_BY_OTHER_CLIENT",
+            "CACHE_HIT_EMPTY",
+            "CACHE_FILLED_EMPTY_BY_OTHER_CLIENT",
+        }:
             raise SystemExit(f"CONSUMER_DID_NOT_REUSE_CACHE:{state}")
         if api_calls != 0:
             raise SystemExit(f"CONSUMER_NETWORK_BUDGET_VIOLATION:api={api_calls}")
@@ -180,6 +200,7 @@ def main() -> int:
         "lease_state": str(meta.get("lease_state") or ""),
         "forbidden_shared_semantics": len(forbidden),
         "factual_only": True,
+        "valid_empty": valid_empty,
     }
     print(json.dumps(summary, sort_keys=True))
     return 0
