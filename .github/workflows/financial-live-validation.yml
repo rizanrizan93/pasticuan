@@ -1,0 +1,82 @@
+name: Phase 5.6 financial live producer - Pasticuan
+
+on:
+  workflow_dispatch:
+    inputs:
+      selected_ref:
+        description: Exact commit SHA to validate
+        required: true
+        type: string
+      ticker:
+        description: IDX ticker
+        required: true
+        default: BBCA
+        type: string
+      year:
+        description: Report year
+        required: true
+        default: "2026"
+        type: string
+      period:
+        description: ZAPI report period code
+        required: true
+        default: tw2
+        type: choice
+        options:
+          - tw1
+          - tw2
+          - tw3
+          - audit
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase5-6-financial-live-validation
+  cancel-in-progress: false
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  financial-producer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
+      SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+      SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - name: Checkout exact selected revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.selected_ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install bounded financial validator dependencies
+        run: python -m pip install --disable-pip-version-check --no-cache-dir requests==2.34.2
+
+      - name: Run bounded financial producer proof
+        run: |
+          mkdir -p financial_live_output
+          set -o pipefail
+          python tools/phase5_6_financial_live_validation.py             --mode producer             --client-id PASTICUAN             --ticker "${{ inputs.ticker }}"             --year "${{ inputs.year }}"             --period "${{ inputs.period }}"             | tee financial_live_output/summary.log
+
+      - name: Record selected revision
+        if: always()
+        run: |
+          mkdir -p financial_live_output
+          git rev-parse HEAD > financial_live_output/selected-commit-sha.txt
+
+      - name: Upload bounded proof
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: phase5-6-financial-producer-proof
+          path: financial_live_output/
+          if-no-files-found: error
