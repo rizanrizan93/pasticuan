@@ -12,6 +12,7 @@ import requests
 
 from shared_evidence_hub import EvidenceKey, SharedEvidenceCoordinator
 from shared_financial_evidence import (
+    REQUEST_TIMEOUT_SECONDS,
     SharedFinancialEvidence,
     ZAPI_FINANCIAL_REPORT_URL,
     parse_idx_xbrl_facts,
@@ -215,6 +216,66 @@ def test_parser_sums_distinct_capex_components_without_deriving_fcf() -> None:
     assert "free_cash_flow" not in values
 
 
+
+
+def test_parser_rejects_unknown_or_mixed_currency_units() -> None:
+    unknown = _xbrl().replace(b"iso4217:IDR", b"xbrli:shares")
+    with pytest.raises(RuntimeError, match="CONTEXT_REJECTED"):
+        _parse(unknown)
+
+    mixed = _xbrl().replace(
+        b'<xbrli:unit id="IDR"><xbrli:measure>iso4217:IDR</xbrli:measure></xbrli:unit>',
+        b'<xbrli:unit id="IDR"><xbrli:measure>iso4217:IDR</xbrli:measure></xbrli:unit>'
+        b'<xbrli:unit id="USD"><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unit>',
+    ).replace(
+        b'<id:Assets contextRef="CurrentYearInstant" unitRef="IDR">5000</id:Assets>',
+        b'<id:Assets contextRef="CurrentYearInstant" unitRef="USD">5000</id:Assets>',
+    )
+    with pytest.raises(RuntimeError, match="CONTEXT_REJECTED"):
+        _parse(mixed)
+
+
+def test_parser_requires_ytd_duration_contexts() -> None:
+    non_ytd = _xbrl().replace(b"<xbrli:startDate>2026-01-01</xbrli:startDate>", b"<xbrli:startDate>2026-02-01</xbrli:startDate>")
+    with pytest.raises(RuntimeError, match="CONTEXT_REJECTED"):
+        _parse(non_ytd)
+
+
+def test_parser_rejects_incompatible_duration_contexts_for_cashflow_facts() -> None:
+    payload = _xbrl(extra="""
+      <xbrli:context id="AlternateYTD">
+        <xbrli:entity><xbrli:identifier scheme="http://www.idx.co.id/xbrl">test_maker</xbrli:identifier></xbrli:entity>
+        <xbrli:period><xbrli:startDate>2026-01-02</xbrli:startDate><xbrli:endDate>2026-03-31</xbrli:endDate></xbrli:period>
+      </xbrli:context>
+    """)
+    payload = payload.replace(
+        b'NetCashFlowsReceivedFromUsedInOperatingActivities contextRef="CurrentYearDuration"',
+        b'NetCashFlowsReceivedFromUsedInOperatingActivities contextRef="AlternateYTD"',
+    ).replace(
+        b'PaymentsForAcquisitionOfPropertyAndEquipment contextRef="CurrentYearDuration"',
+        b'PaymentsForAcquisitionOfPropertyAndEquipment contextRef="AlternateYTD"',
+    ).replace(
+        b'PaymentsForAcquisitionOfIntangibleAssets contextRef="CurrentYearDuration"',
+        b'PaymentsForAcquisitionOfIntangibleAssets contextRef="AlternateYTD"',
+    )
+    with pytest.raises(RuntimeError, match="CONTEXT_REJECTED"):
+        _parse(payload)
+
+
+def test_validator_rejects_missing_or_mixed_currency() -> None:
+    _, facts = _parse()
+    missing = [dict(row) for row in facts]
+    missing[0]["currency"] = None
+    assert validate_financial_facts(missing, ticker="TEST", report_period="2026-Q1") == (
+        False, "CONTEXT_REJECTED"
+    )
+    mixed = [dict(row) for row in facts]
+    mixed[0]["currency"] = "USD"
+    assert validate_financial_facts(mixed, ticker="TEST", report_period="2026-Q1") == (
+        False, "CONTEXT_REJECTED"
+    )
+
+
 @pytest.mark.parametrize(
     "payload,reason",
     [
@@ -247,6 +308,11 @@ def test_pipeline_discovers_one_period_downloads_once_and_persists_reports_befor
     assert meta["api_calls"] == 1 and meta["attachment_calls"] == 1 and len(session.calls) == 2
     assert session.calls[0]["url"] == ZAPI_FINANCIAL_REPORT_URL
     assert session.calls[0]["params"] == {"year": 2026, "period": "tw1", "code": "TEST", "length": 100, "start": 0}
+    assert session.calls[0]["allow_redirects"] is False
+    assert session.calls[1]["allow_redirects"] is False
+    assert session.calls[0]["timeout"] == REQUEST_TIMEOUT_SECONDS
+    assert session.calls[0]["headers"]["User-Agent"] == "Shared-IDX-Evidence-Hub/financial-manifest"
+    assert session.calls[1]["headers"]["User-Agent"] == "Shared-IDX-Evidence-Hub/financial-attachment"
     assert len(backend.tables["evidence_financial_reports"]) == 1
     assert len(backend.tables["evidence_financial_facts"]) == 12
     assert "test-key" not in str(meta)
@@ -268,7 +334,15 @@ def test_missing_key_on_cache_miss_makes_no_request() -> None:
     assert not rows and not session.calls and meta["state"] == "ENVIRONMENT_BLOCKED"
 
 
-@pytest.mark.parametrize("status,reason", [(401, "HTTP_401"), (403, "HTTP_403"), (404, "HTTP_404"), (429, "HTTP_429")])
+@pytest.mark.parametrize(
+    "status,reason",
+    [
+        (401, "ZAPI_MANIFEST_HTTP_401"),
+        (403, "ZAPI_MANIFEST_HTTP_403"),
+        (404, "ZAPI_MANIFEST_HTTP_404"),
+        (429, "ZAPI_MANIFEST_HTTP_429"),
+    ],
+)
 def test_discovery_http_failures_are_explicit(status: int, reason: str) -> None:
     rows, meta = _producer(MemoryBackend(), Session([Response(status=status)])).get_period("TEST", 2026, "tw1")
     assert not rows and meta["state"] == reason
@@ -276,11 +350,45 @@ def test_discovery_http_failures_are_explicit(status: int, reason: str) -> None:
 
 @pytest.mark.parametrize(
     "outcome,reason",
-    [(requests.Timeout("slow"), "TIMEOUT"), (requests.ConnectionError("offline"), "CONNECTION_ERROR")],
+    [
+        (requests.Timeout("slow"), "ZAPI_MANIFEST_TIMEOUT"),
+        (requests.ConnectionError("offline"), "ZAPI_MANIFEST_CONNECTION_ERROR"),
+    ],
 )
 def test_network_failures_are_explicit(outcome: Exception, reason: str) -> None:
     rows, meta = _producer(MemoryBackend(), Session([outcome])).get_period("TEST", 2026, "tw1")
     assert not rows and meta["state"] == reason
+
+
+
+
+@pytest.mark.parametrize(
+    "status,reason",
+    [
+        (401, "OFFICIAL_ATTACHMENT_HTTP_401"),
+        (403, "OFFICIAL_ATTACHMENT_HTTP_403"),
+        (404, "OFFICIAL_ATTACHMENT_HTTP_404"),
+        (429, "OFFICIAL_ATTACHMENT_HTTP_429"),
+    ],
+)
+def test_attachment_http_failures_are_stage_specific(status: int, reason: str) -> None:
+    session = Session([
+        Response(payload=_manifest()),
+        Response(status=status, url=OFFICIAL_URL),
+    ])
+    rows, meta = _producer(MemoryBackend(), session).get_period("TEST", 2026, "tw1")
+    assert not rows and meta["state"] == reason
+    assert meta["api_calls"] == 1 and meta["attachment_calls"] == 1
+
+
+def test_attachment_redirect_is_blocked() -> None:
+    session = Session([
+        Response(payload=_manifest()),
+        Response(status=302, url=OFFICIAL_URL),
+    ])
+    rows, meta = _producer(MemoryBackend(), session).get_period("TEST", 2026, "tw1")
+    assert not rows and meta["state"] == "OFFICIAL_ATTACHMENT_REDIRECT_BLOCKED"
+    assert session.calls[-1]["allow_redirects"] is False
 
 
 @pytest.mark.parametrize(
