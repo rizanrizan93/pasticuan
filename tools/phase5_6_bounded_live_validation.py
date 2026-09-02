@@ -681,30 +681,44 @@ def _response_bytes(response: Any) -> bytes:
     return str(text).encode("utf-8")
 
 
+def _recoverable_discovery_failure(code: str) -> bool:
+    state = str(code).strip().upper()
+    return state in {"CONNECTION_ERROR", "TIMEOUT", "HTTP_404"} or bool(
+        re.fullmatch(r"HTTP_5\d\d", state)
+    )
+
+
 def discover_participant_url(
     transport: BoundedOfficialTransport,
     target_date: date,
 ) -> str:
     filename = _expected_participant_filename(target_date)
-    response = transport.request(OFFICIAL_INDEX_URL, "DIRECTORY_INDEX")
+    last_recoverable = ""
     try:
-        index_text = str(getattr(response, "text", ""))
-        if not index_text:
-            index_text = _response_bytes(response).decode("utf-8", errors="replace")
-    finally:
-        close = getattr(response, "close", None)
-        if callable(close):
-            close()
-    matches = re.findall(
-        r"href=[\"']([^\"']*" + re.escape(filename) + r")[\"']",
-        index_text,
-        flags=re.I,
-    )
-    for href in matches:
-        candidate = urljoin(OFFICIAL_INDEX_URL, href)
-        BoundedOfficialTransport._validate_url(candidate)
-        if urlparse(candidate).path.rsplit("/", 1)[-1].lower() == filename.lower():
-            return candidate
+        response = transport.request(OFFICIAL_INDEX_URL, "DIRECTORY_INDEX")
+    except GateFailure as exc:
+        if not _recoverable_discovery_failure(exc.code):
+            raise
+        last_recoverable = exc.code
+    else:
+        try:
+            index_text = str(getattr(response, "text", ""))
+            if not index_text:
+                index_text = _response_bytes(response).decode("utf-8", errors="replace")
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+        matches = re.findall(
+            r"href=[\"']([^\"']*" + re.escape(filename) + r")[\"']",
+            index_text,
+            flags=re.I,
+        )
+        for href in matches:
+            candidate = urljoin(OFFICIAL_INDEX_URL, href)
+            BoundedOfficialTransport._validate_url(candidate)
+            if urlparse(candidate).path.rsplit("/", 1)[-1].lower() == filename.lower():
+                return candidate
 
     candidates = (
         f"https://www.idxdata3.co.id/IDX%20Reporting%20PSPP/Revitalisasi/PUBLIK/{filename}",
@@ -715,14 +729,15 @@ def discover_participant_url(
         try:
             response = transport.request(candidate, "DOCUMENTED_PATH_PROBE")
         except GateFailure as exc:
-            if exc.code == "HTTP_404":
-                continue
-            raise
+            if not _recoverable_discovery_failure(exc.code):
+                raise
+            last_recoverable = exc.code
+            continue
         close = getattr(response, "close", None)
         if callable(close):
             close()
         return candidate
-    raise GateFailure("HTTP_404")
+    raise GateFailure(last_recoverable or "HTTP_404")
 
 
 def download_participant_file(

@@ -694,7 +694,7 @@ def test_directory_index_discovery_and_single_download_success():
     assert len(session.calls) == 2 and ledger.downloads == 1
 
 
-def test_documented_path_probe_success_within_five_request_envelope():
+def test_first_documented_404_advances_to_second_candidate():
     ledger = OfficialRequestLedger("PASTICUAN")
     session = FakeSession([
         FakeResponse(text="no matching link", content_type="text/plain"),
@@ -706,6 +706,8 @@ def test_documented_path_probe_success_within_five_request_envelope():
     )
     assert found.startswith("https://idxdata3.co.id/")
     assert len(session.calls) == 3 and ledger.downloads == 0
+    assert "www.idxdata3.co.id/IDX%20Reporting" in session.calls[1][1]
+    assert "https://idxdata3.co.id/IDX%20Reporting" in session.calls[2][1]
 
 
 def test_all_documented_paths_404_fail_closed_without_download():
@@ -732,18 +734,114 @@ def test_official_403_and_429_fail_closed(status):
     assert len(session.calls) == 1 and ledger.downloads == 0
 
 
-@pytest.mark.parametrize(
-    "error,reason",
-    [(requests.ConnectionError("offline"), "CONNECTION_ERROR"), (requests.Timeout("late"), "TIMEOUT")],
-)
-def test_official_connection_and_timeout_fail_closed(error, reason):
+def test_directory_connection_error_falls_back_to_documented_probe():
     ledger = OfficialRequestLedger("PASTICUAN")
-    session = FakeSession([error])
-    with pytest.raises(GateFailure, match=reason):
-        discover_participant_url(
-            BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
-        )
-    assert len(session.calls) == 1 and ledger.entries[0]["result"] == reason
+    session = FakeSession([
+        requests.ConnectionError("offline"),
+        FakeResponse(content_type="text/csv"),
+    ])
+    found = discover_participant_url(
+        BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
+    )
+    assert found.startswith("https://www.idxdata3.co.id/IDX%20Reporting")
+    assert len(session.calls) == 2
+    assert ledger.entries[0]["result"] == "CONNECTION_ERROR"
+
+
+def test_directory_timeout_falls_back_to_documented_probe():
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([
+        requests.Timeout("late"),
+        FakeResponse(content_type="text/csv"),
+    ])
+    found = discover_participant_url(
+        BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
+    )
+    assert found.startswith("https://www.idxdata3.co.id/IDX%20Reporting")
+    assert len(session.calls) == 2
+    assert ledger.entries[0]["result"] == "TIMEOUT"
+
+
+def test_directory_http_500_falls_back_to_documented_probe():
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([
+        FakeResponse(status_code=500, content_type="text/plain"),
+        FakeResponse(content_type="text/csv"),
+    ])
+    found = discover_participant_url(
+        BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
+    )
+    assert found.startswith("https://www.idxdata3.co.id/IDX%20Reporting")
+    assert len(session.calls) == 2
+    assert ledger.entries[0]["result"] == "HTTP_500"
+
+
+def test_directory_without_exact_filename_uses_documented_probe():
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([
+        FakeResponse(
+            text='<a href="Trade-Detail-Publik_20260831.csv">wrong date</a>',
+            content_type="text/plain",
+        ),
+        FakeResponse(content_type="text/csv"),
+    ])
+    found = discover_participant_url(
+        BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
+    )
+    assert found.endswith("Trade-Detail-Publik_20260901.csv")
+    assert len(session.calls) == 2
+
+
+def test_documented_candidate_connection_error_advances_when_budget_remains():
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([
+        FakeResponse(text="no exact target", content_type="text/plain"),
+        requests.ConnectionError("candidate unavailable"),
+        FakeResponse(content_type="text/csv"),
+    ])
+    found = discover_participant_url(
+        BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
+    )
+    assert found.startswith("https://idxdata3.co.id/IDX%20Reporting")
+    assert len(session.calls) == 3 and ledger.downloads == 0
+
+
+def test_first_successful_documented_probe_stops_remaining_probes():
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([
+        FakeResponse(text="no exact target", content_type="text/plain"),
+        FakeResponse(content_type="text/csv"),
+        FakeResponse(content_type="text/csv"),
+    ])
+    found = discover_participant_url(
+        BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
+    )
+    assert found.startswith("https://www.idxdata3.co.id/IDX%20Reporting")
+    assert len(session.calls) == 2
+    assert len(session.responses) == 1
+    assert ledger.downloads == 0
+
+
+def test_directory_three_probes_and_download_use_exactly_five_transports():
+    body = participant_csv()
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([
+        requests.ConnectionError("directory unavailable"),
+        FakeResponse(status_code=404, content_type="text/csv"),
+        requests.Timeout("second candidate late"),
+        FakeResponse(content_type="text/csv"),
+        FakeResponse(content=body, content_type="text/csv"),
+    ])
+    downloaded, source_url, digest = download_participant_file(
+        BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
+    )
+    assert downloaded == body
+    assert source_url.startswith("https://www.idxdata3.co.id/Market_Summary")
+    assert digest == hashlib.sha256(body).hexdigest()
+    assert len(session.calls) == OFFICIAL_HTTP_CAP == 5
+    assert ledger.downloads == 1
+    assert all(call[2]["allow_redirects"] is False for call in session.calls)
+    assert all("20260901" in call[1] for call in session.calls[1:])
 
 
 def test_invalid_content_type_and_empty_file_body_fail_closed():
