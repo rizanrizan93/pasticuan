@@ -351,10 +351,24 @@ class SharedOwnershipEvidence:
     def ready(self) -> bool:
         return self.backend is not None and self.coordinator is not None
 
-    def _request(self, url: str, *, params: Mapping[str, Any] | None = None, api: bool) -> Any:
+    def _request(
+        self,
+        url: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        api: bool,
+        stage: str,
+    ) -> Any:
         if api and not self.api_key:
             raise RuntimeError(MissingReason.ENVIRONMENT_BLOCKED.value)
-        headers = {"Accept": "application/json" if api else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+        stage = _clean(stage).upper() or ("ZAPI_INDEX" if api else "OFFICIAL_FILE")
+        headers = {
+            "Accept": "application/json" if api else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "User-Agent": (
+                "Shared-IDX-Evidence-Hub/ownership-index"
+                if api else "Shared-IDX-Evidence-Hub/ownership-file"
+            ),
+        }
         if api:
             headers["x-api-key"] = self.api_key
         try:
@@ -367,16 +381,16 @@ class SharedOwnershipEvidence:
                 allow_redirects=False,
             )
         except requests.Timeout as exc:
-            raise RuntimeError(MissingReason.TIMEOUT.value) from exc
+            raise RuntimeError(f"{stage}_TIMEOUT") from exc
         except requests.ConnectionError as exc:
-            raise RuntimeError(MissingReason.CONNECTION_ERROR.value) from exc
+            raise RuntimeError(f"{stage}_CONNECTION_ERROR") from exc
         status = int(getattr(response, "status_code", 0) or 0)
         if 300 <= status < 400:
-            raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
+            raise RuntimeError(f"{stage}_REDIRECT_BLOCKED")
         if status in {401, 403, 404, 429}:
-            raise RuntimeError(f"HTTP_{status}")
+            raise RuntimeError(f"{stage}_HTTP_{status}")
         if not 200 <= status < 300:
-            raise RuntimeError(f"HTTP_{status}")
+            raise RuntimeError(f"{stage}_HTTP_{status}")
         if not getattr(response, "content", b""):
             raise RuntimeError(MissingReason.EMPTY_RESPONSE.value)
         return response
@@ -458,6 +472,7 @@ class SharedOwnershipEvidence:
                     OWNERSHIP_INDEX_URL,
                     params={"category": category, "length": INDEX_PAGE_SIZE, "start": start},
                     api=True,
+                    stage="ZAPI_INDEX",
                 )
                 try:
                     page_entries, total = self._index_page(
@@ -479,7 +494,9 @@ class SharedOwnershipEvidence:
                 if meta["file_calls"] >= MAX_FILES_PER_PUBLICATION:
                     raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
                 meta["file_calls"] += 1
-                response = self._request(entry["source_url"], api=False)
+                response = self._request(
+                    entry["source_url"], api=False, stage="OFFICIAL_FILE"
+                )
                 final_url = _clean(getattr(response, "url", entry["source_url"]))
                 content = bytes(response.content)
                 content_type = _clean((getattr(response, "headers", {}) or {}).get("Content-Type")).lower()
