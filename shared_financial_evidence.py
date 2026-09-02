@@ -534,16 +534,16 @@ class SharedFinancialEvidence:
                 allow_redirects=False,
             )
         except requests.Timeout as exc:
-            raise RuntimeError(f"{stage}_TIMEOUT") from exc
+            raise RuntimeError(MissingReason.TIMEOUT.value) from exc
         except requests.ConnectionError as exc:
-            raise RuntimeError(f"{stage}_CONNECTION_ERROR") from exc
+            raise RuntimeError(MissingReason.CONNECTION_ERROR.value) from exc
         status = int(getattr(response, "status_code", 0) or 0)
         if 300 <= status < 400:
-            raise RuntimeError(f"{stage}_REDIRECT_BLOCKED")
+            raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
         if status in {401, 403, 404, 429}:
-            raise RuntimeError(f"{stage}_HTTP_{status}")
+            raise RuntimeError(f"HTTP_{status}")
         if not 200 <= status < 300:
-            raise RuntimeError(f"{stage}_HTTP_{status}")
+            raise RuntimeError(f"HTTP_{status}")
         if not getattr(response, "content", b""):
             raise RuntimeError(MissingReason.EMPTY_RESPONSE.value)
         return response
@@ -637,20 +637,28 @@ class SharedFinancialEvidence:
             if not self.api_key:
                 raise RuntimeError(MissingReason.ENVIRONMENT_BLOCKED.value)
             meta["api_calls"] += 1
-            response = self._request(
-                ZAPI_FINANCIAL_REPORT_URL,
-                params={"year": int(year), "period": period_code.lower(), "code": code, "length": 100, "start": 0},
-                api=True,
-                stage="ZAPI_MANIFEST",
-            )
+            try:
+                response = self._request(
+                    ZAPI_FINANCIAL_REPORT_URL,
+                    params={"year": int(year), "period": period_code.lower(), "code": code, "length": 100, "start": 0},
+                    api=True,
+                    stage="ZAPI_MANIFEST",
+                )
+            except Exception:
+                meta["failure_stage"] = "ZAPI_MANIFEST"
+                raise
             try:
                 manifest = self._manifest(response.json(), ticker=code, year=year, period_code=period_code)
             except (TypeError, ValueError) as exc:
                 raise RuntimeError(MissingReason.PARSE_FAILURE.value) from exc
             meta["attachment_calls"] += 1
-            attachment = self._request(
-                manifest["url"], api=False, stage="OFFICIAL_ATTACHMENT"
-            )
+            try:
+                attachment = self._request(
+                    manifest["url"], api=False, stage="OFFICIAL_ATTACHMENT"
+                )
+            except Exception:
+                meta["failure_stage"] = "OFFICIAL_ATTACHMENT"
+                raise
             final_url = _clean(getattr(attachment, "url", manifest["url"])) or manifest["url"]
             content = bytes(attachment.content)
             content_type = _clean((getattr(attachment, "headers", {}) or {}).get("Content-Type")).lower()
