@@ -1,0 +1,79 @@
+name: Phase 5.6 announcement live producer - Pasticuan
+
+on:
+  workflow_dispatch:
+    inputs:
+      selected_ref:
+        description: Exact commit SHA to validate
+        required: true
+        type: string
+      feed:
+        description: Shared metadata feed
+        required: true
+        default: announcements
+        type: choice
+        options:
+          - announcements
+          - press-release
+      publication_date:
+        description: IDX-local publication date (YYYY-MM-DD)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase5-6-announcement-live-validation
+  cancel-in-progress: false
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  announcement-producer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
+      SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+      SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - name: Checkout exact selected revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.selected_ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install bounded announcement validator dependencies
+        run: python -m pip install --disable-pip-version-check --no-cache-dir requests==2.34.2
+
+      - name: Run bounded announcement producer proof
+        run: |
+          mkdir -p announcement_live_output
+          set -o pipefail
+          python tools/phase5_6_announcement_live_validation.py \
+            --mode producer \
+            --client-id PASTICUAN \
+            --feed "${{ inputs.feed }}" \
+            --publication-date "${{ inputs.publication_date }}" \
+            | tee announcement_live_output/summary.log
+
+      - name: Record selected revision
+        if: always()
+        run: |
+          mkdir -p announcement_live_output
+          git rev-parse HEAD > announcement_live_output/selected-commit-sha.txt
+
+      - name: Upload bounded proof
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: phase5-6-announcement-producer-proof
+          path: announcement_live_output/
+          if-no-files-found: error
