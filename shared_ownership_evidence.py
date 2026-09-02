@@ -29,8 +29,12 @@ from shared_evidence_hub import (
 
 OWNERSHIP_INDEX_URL = "https://api.zpi.web.id/v1/finance:idx/ownership-files"
 CATEGORIES = frozenset({"lima-persen", "satu-persen", "klasifikasi", "tipe"})
-PARSER_VERSION = "phase5.6-ownership-v1"
+PARSER_VERSION = "phase5.6-ownership-v2"
 MAX_FILE_BYTES = 50 * 1024 * 1024
+INDEX_PAGE_SIZE = 200
+MAX_INDEX_PAGES = 3
+MAX_FILES_PER_PUBLICATION = 1
+REQUEST_TIMEOUT_SECONDS = 30
 
 
 def _clean(value: Any) -> str:
@@ -184,6 +188,9 @@ def parse_ownership_workbook(
             percentage = _number(values.get("ownership_percentage"), percentage=True)
             if shares is None and percentage is None:
                 continue
+            report_date = _date(values.get("report_date"))
+            if report_date is None or report_date > publication_date:
+                raise RuntimeError(MissingReason.WRONG_PERIOD.value)
             identity_hash = hashlib.sha256(
                 "|".join(
                     _key(value) for value in (category, ticker, identity_label)
@@ -199,10 +206,7 @@ def parse_ownership_workbook(
                 "ticker": ticker,
                 "holder_identity_hash": identity_hash,
                 "holder_name": holder or None,
-                "report_date": (
-                    _date(values.get("report_date")).isoformat()
-                    if _date(values.get("report_date")) is not None else None
-                ),
+                "report_date": report_date.isoformat(),
                 "publication_date": publication_date.isoformat(),
                 "shares_held": shares,
                 "ownership_percentage": percentage,
@@ -216,6 +220,9 @@ def parse_ownership_workbook(
             })
     if not rows:
         raise RuntimeError(MissingReason.PARSE_FAILURE.value)
+    report_dates = {_date(row.get("report_date")) for row in rows}
+    if None in report_dates or len(report_dates) != 1:
+        raise RuntimeError(MissingReason.WRONG_PERIOD.value)
     return rows
 
 
@@ -224,6 +231,8 @@ def validate_ownership_rows(rows: Iterable[Mapping[str, Any]], *, category: str)
     if not records:
         return False, MissingReason.EMPTY_RESPONSE.value
     identities: set[tuple[str, str]] = set()
+    report_dates: set[date] = set()
+    publication_dates: set[date] = set()
     for row in records:
         identity = (_ticker(row.get("ticker")), _clean(row.get("holder_identity_hash")))
         if not all(identity) or identity in identities or row.get("category") != category:
@@ -237,8 +246,16 @@ def validate_ownership_rows(rows: Iterable[Mapping[str, Any]], *, category: str)
             not isinstance(percentage, (int, float)) or not 0 <= percentage <= 100
         ):
             return False, MissingReason.CONTEXT_REJECTED.value
+        report_date = _date(row.get("report_date"))
+        publication_date = _date(row.get("publication_date"))
+        if report_date is None or publication_date is None or report_date > publication_date:
+            return False, MissingReason.WRONG_PERIOD.value
+        report_dates.add(report_date)
+        publication_dates.add(publication_date)
         if not row.get("source_verified") or not _official_url(_clean(row.get("source_url"))):
             return False, MissingReason.CONTEXT_REJECTED.value
+    if len(report_dates) != 1 or len(publication_dates) != 1:
+        return False, MissingReason.WRONG_PERIOD.value
     return True, "VALID"
 
 
@@ -341,12 +358,21 @@ class SharedOwnershipEvidence:
         if api:
             headers["x-api-key"] = self.api_key
         try:
-            response = self.session.request("GET", url, params=dict(params or {}), headers=headers, timeout=30)
+            response = self.session.request(
+                "GET",
+                url,
+                params=dict(params or {}),
+                headers=headers,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                allow_redirects=False,
+            )
         except requests.Timeout as exc:
             raise RuntimeError(MissingReason.TIMEOUT.value) from exc
         except requests.ConnectionError as exc:
             raise RuntimeError(MissingReason.CONNECTION_ERROR.value) from exc
         status = int(getattr(response, "status_code", 0) or 0)
+        if 300 <= status < 400:
+            raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
         if status in {401, 403, 404, 429}:
             raise RuntimeError(f"HTTP_{status}")
         if not 200 <= status < 300:
@@ -356,7 +382,9 @@ class SharedOwnershipEvidence:
         return response
 
     @staticmethod
-    def _index_entries(payload: Any, *, category: str, publication_date: date) -> list[dict[str, Any]]:
+    def _index_page(
+        payload: Any, *, category: str, publication_date: date
+    ) -> tuple[list[dict[str, Any]], int]:
         root = payload
         for _ in range(3):
             if isinstance(root, Mapping) and isinstance(root.get("data"), Mapping):
@@ -380,9 +408,11 @@ class SharedOwnershipEvidence:
                     "source_url": url,
                     "file_name": _clean(item.get("fileName")) or url.rsplit("/", 1)[-1],
                 })
-        if not matches:
-            raise RuntimeError(MissingReason.NO_FILE.value)
-        return matches
+        try:
+            total = max(len(values), int(root.get("total") or len(values)))
+        except (TypeError, ValueError):
+            total = len(values)
+        return matches, total
 
     def get_publication(
         self, category: str, publication_date: date
@@ -392,7 +422,13 @@ class SharedOwnershipEvidence:
             return [], {"state": MissingReason.CONTEXT_REJECTED.value, "api_calls": 0, "file_calls": 0}
         if not self.ready:
             return [], {"state": MissingReason.ENVIRONMENT_BLOCKED.value, "api_calls": 0, "file_calls": 0}
-        meta: dict[str, Any] = {"api_calls": 0, "file_calls": 0, "files": 0}
+        meta: dict[str, Any] = {
+            "api_calls": 0,
+            "file_calls": 0,
+            "files": 0,
+            "index_page_cap": MAX_INDEX_PAGES,
+            "file_cap": MAX_FILES_PER_PUBLICATION,
+        }
         pending_files: list[dict[str, Any]] = []
         pending_changes: list[dict[str, Any]] = []
 
@@ -414,24 +450,34 @@ class SharedOwnershipEvidence:
         def fetch() -> list[dict[str, Any]]:
             if not self.api_key:
                 raise RuntimeError(MissingReason.ENVIRONMENT_BLOCKED.value)
-            meta["api_calls"] += 1
-            index_response = self._request(
-                OWNERSHIP_INDEX_URL,
-                params={"category": category, "length": 200, "start": 0},
-                api=True,
-            )
-            try:
-                entries = self._index_entries(index_response.json(), category=category, publication_date=publication_date)
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError(MissingReason.PARSE_FAILURE.value) from exc
+            entries: list[dict[str, Any]] = []
+            for page in range(MAX_INDEX_PAGES):
+                start = page * INDEX_PAGE_SIZE
+                meta["api_calls"] += 1
+                index_response = self._request(
+                    OWNERSHIP_INDEX_URL,
+                    params={"category": category, "length": INDEX_PAGE_SIZE, "start": start},
+                    api=True,
+                )
+                try:
+                    page_entries, total = self._index_page(
+                        index_response.json(), category=category, publication_date=publication_date
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(MissingReason.PARSE_FAILURE.value) from exc
+                entries.extend(page_entries)
+                if entries or start + INDEX_PAGE_SIZE >= total:
+                    break
+            if not entries:
+                raise RuntimeError(MissingReason.NO_FILE.value)
+            if len(entries) > MAX_FILES_PER_PUBLICATION:
+                raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
+
             all_rows: list[dict[str, Any]] = []
             existing = self.backend.read_rows("evidence_ownership_snapshots", {"category": category}, limit=50000)
-            previous_dates = sorted({
-                value for value in (_date(row.get("report_date")) for row in existing)
-                if value is not None and value < publication_date
-            })
-            previous = [row for row in existing if previous_dates and _date(row.get("report_date")) == previous_dates[-1]]
             for entry in entries:
+                if meta["file_calls"] >= MAX_FILES_PER_PUBLICATION:
+                    raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
                 meta["file_calls"] += 1
                 response = self._request(entry["source_url"], api=False)
                 final_url = _clean(getattr(response, "url", entry["source_url"]))
@@ -453,12 +499,25 @@ class SharedOwnershipEvidence:
                     source_url=final_url,
                     source_file_hash=source_hash,
                 )
-                report_dates = [value for value in (_date(row["report_date"]) for row in rows) if value]
+                report_dates = {_date(row.get("report_date")) for row in rows}
+                if None in report_dates or len(report_dates) != 1:
+                    raise RuntimeError(MissingReason.WRONG_PERIOD.value)
+                current_report_date = next(iter(report_dates))
+                if current_report_date > publication_date:
+                    raise RuntimeError(MissingReason.WRONG_PERIOD.value)
+                previous_dates = sorted({
+                    value for value in (_date(row.get("report_date")) for row in existing)
+                    if value is not None and value < current_report_date
+                })
+                previous = [
+                    row for row in existing
+                    if previous_dates and _date(row.get("report_date")) == previous_dates[-1]
+                ]
                 pending_files.append({
                     "source_file_hash": source_hash,
                     "category": category,
                     "publication_date": publication_date.isoformat(),
-                    "report_date": min(report_dates).isoformat() if report_dates else None,
+                    "report_date": current_report_date.isoformat(),
                     "source_url": final_url,
                     "file_name": entry["file_name"],
                     "source_verified": True,
@@ -514,6 +573,10 @@ __all__ = [
     "CATEGORIES",
     "OWNERSHIP_INDEX_URL",
     "PARSER_VERSION",
+    "INDEX_PAGE_SIZE",
+    "MAX_INDEX_PAGES",
+    "MAX_FILES_PER_PUBLICATION",
+    "REQUEST_TIMEOUT_SECONDS",
     "SharedOwnershipEvidence",
     "derive_ownership_changes",
     "parse_ownership_workbook",
