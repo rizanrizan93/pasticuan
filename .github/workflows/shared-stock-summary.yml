@@ -2,9 +2,15 @@ name: Shared IDX stock-summary evidence
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "50 10 * * 1-5"
 
 permissions:
   contents: read
+
+concurrency:
+  group: phase5-6-stock-summary-producer
+  cancel-in-progress: false
 
 jobs:
   refresh:
@@ -13,9 +19,11 @@ jobs:
     env:
       ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
       SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
-      SHARED_EVIDENCE_SUPABASE_SECRET_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SECRET_KEY }}
+      SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
