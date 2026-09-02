@@ -30,6 +30,8 @@ from shared_evidence_hub import (
 TABLE = "evidence_capital_actions"
 PAGE_LENGTH = 200
 ISSUED_HISTORY_LENGTH = 500
+MAX_PAGES_PER_RUN = 10
+REQUEST_TIMEOUT_SECONDS = 20
 
 FEEDS: dict[str, dict[str, Any]] = {
     "issued-history": {
@@ -58,6 +60,8 @@ FEEDS: dict[str, dict[str, Any]] = {
     },
 }
 MONTHLY_FEEDS = frozenset({"additional-listings", "rights-offerings", "stock-splits"})
+EVENT_DATE_FIELDS = ("listingDate", "effectiveDate", "eventDate", "exDate", "date")
+PUBLICATION_DATE_FIELDS = ("publicationDate", "publishedAt", "publishedDate")
 
 
 def _clean(value: Any) -> str:
@@ -93,6 +97,22 @@ def _date(value: Any) -> date | None:
         return date.fromisoformat(text[:10])
     except ValueError:
         return None
+
+
+def _explicit_date_group(item: Mapping[str, Any], names: Iterable[str]) -> date | None:
+    values: list[date] = []
+    for name in names:
+        if name not in item or item.get(name) in (None, ""):
+            continue
+        parsed = _date(item.get(name))
+        if parsed is None:
+            raise RuntimeError(MissingReason.PARSE_FAILURE.value)
+        values.append(parsed)
+    if not values:
+        return None
+    if len(set(values)) != 1:
+        raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
+    return values[0]
 
 
 def _number(value: Any) -> int | float | None:
@@ -146,28 +166,34 @@ def _official_source_url(value: Any, *, fallback: str) -> str:
 
 
 def _event_type(feed: str, raw_action: str) -> str:
+    # Only an explicit provider action field may refine the dedicated feed identity.
+    # Do not classify from titles/descriptions and do not use substring matching.
     action = re.sub(r"[^a-z0-9]+", " ", raw_action.lower()).strip()
-    if "reverse" in action or "stock consolidation" in action:
-        return "REVERSE_STOCK_SPLIT"
-    if "split" in action:
-        return "STOCK_SPLIT"
-    if "waran" in action or "warrant" in action:
-        return "WARRANT_EXERCISE"
-    if "right" in action or "hm etd" in action or "hmetd" in action:
-        return "RIGHTS_ISSUE"
-    if "convert" in action or "konvers" in action:
-        return "CONVERSION"
-    if "bonus" in action:
-        return "BONUS_SHARES"
-    if "private placement" in action or "non preemptive" in action:
-        return "PRIVATE_PLACEMENT"
+    explicit = {
+        "reverse stock split": "REVERSE_STOCK_SPLIT",
+        "stock consolidation": "REVERSE_STOCK_SPLIT",
+        "stock split": "STOCK_SPLIT",
+        "waran": "WARRANT_EXERCISE",
+        "warrant": "WARRANT_EXERCISE",
+        "warrant exercise": "WARRANT_EXERCISE",
+        "rights issue": "RIGHTS_ISSUE",
+        "right issue": "RIGHTS_ISSUE",
+        "hmetd": "RIGHTS_ISSUE",
+        "hm etd": "RIGHTS_ISSUE",
+        "conversion": "CONVERSION",
+        "konversi": "CONVERSION",
+        "bonus shares": "BONUS_SHARES",
+        "saham bonus": "BONUS_SHARES",
+        "private placement": "PRIVATE_PLACEMENT",
+        "non preemptive": "PRIVATE_PLACEMENT",
+    }
     defaults = {
         "issued-history": "ISSUED_SHARES_OTHER",
         "additional-listings": "ADDITIONAL_LISTING",
         "rights-offerings": "RIGHTS_OFFERING",
         "stock-splits": "STOCK_SPLIT",
     }
-    return defaults[feed]
+    return explicit.get(action, defaults[feed])
 
 
 def _share_facts(item: Mapping[str, Any], *, feed: str) -> tuple[Any, Any, Any, Any, str]:
@@ -255,12 +281,12 @@ def normalize_capital_actions(
     normalized: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for item in items:
         ticker = _ticker(_first(item, ("code", "ticker", "stockCode", "KodeEmiten")))
-        event_date = _date(_first(item, ("listingDate", "effectiveDate", "eventDate", "exDate", "date")))
+        event_date = _explicit_date_group(item, EVENT_DATE_FIELDS)
         if not ticker or event_date is None:
             continue
         if feed in MONTHLY_FEEDS and (event_date.year, event_date.month) != (period.year, period.month):
             continue
-        publication_date = _date(_first(item, ("publicationDate", "publishedAt", "publishedDate")))
+        publication_date = _explicit_date_group(item, PUBLICATION_DATE_FIELDS)
         raw_action = _clean(_first(item, ("action", "actionType", "eventType", "type")))
         event_type = _event_type(feed, raw_action)
         pre, post, delta, delta_percent, calculation_state = _share_facts(item, feed=feed)
@@ -332,6 +358,15 @@ def validate_capital_action_rows(
             return False, MissingReason.WRONG_PERIOD.value
         if not _ticker(row.get("ticker")) or not row.get("source_verified") or row.get("validation_state") != "VALID":
             return False, MissingReason.CONTEXT_REJECTED.value
+        publication_date = _date(row.get("publication_date"))
+        if row.get("publication_date") is not None and publication_date is None:
+            return False, MissingReason.PARSE_FAILURE.value
+        if publication_date is not None and publication_date > observed_on:
+            return False, MissingReason.WRONG_PERIOD.value
+        try:
+            _official_source_url(row.get("source_url"), fallback=FEEDS[feed]["url"])
+        except RuntimeError:
+            return False, MissingReason.CONTEXT_REJECTED.value
         numeric = [row.get(name) for name in ("pre_shares", "post_shares", "delta_shares", "delta_percent", "ratio_before", "ratio_after")]
         if any(value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value))) for value in numeric):
             return False, MissingReason.PARSE_FAILURE.value
@@ -378,14 +413,24 @@ class SharedCapitalActionEvidence:
             raise RuntimeError(MissingReason.ENVIRONMENT_BLOCKED.value)
         try:
             response = self.session.request(
-                "GET", FEEDS[feed]["url"], params=dict(params),
-                headers={"Accept": "application/json", "x-api-key": self.api_key}, timeout=30,
+                "GET",
+                FEEDS[feed]["url"],
+                params=dict(params),
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Shared-IDX-Evidence-Hub/capital-actions",
+                    "x-api-key": self.api_key,
+                },
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                allow_redirects=False,
             )
         except requests.Timeout as exc:
             raise RuntimeError(MissingReason.TIMEOUT.value) from exc
         except requests.ConnectionError as exc:
             raise RuntimeError(MissingReason.CONNECTION_ERROR.value) from exc
         status = int(getattr(response, "status_code", 0) or 0)
+        if 300 <= status < 400:
+            raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
         if not 200 <= status < 300:
             raise RuntimeError(f"HTTP_{status}")
         if not getattr(response, "content", b""):
@@ -402,7 +447,15 @@ class SharedCapitalActionEvidence:
             return [], {"state": MissingReason.CONTEXT_REJECTED.value, "api_calls": 0}
         if not self.ready:
             return [], {"state": MissingReason.ENVIRONMENT_BLOCKED.value, "api_calls": 0}
-        meta: dict[str, Any] = {"api_calls": 0, "pages": 0, "feed": feed}
+        page_budget = min(MAX_PAGES_PER_RUN, max(1, int(max_pages)))
+        meta: dict[str, Any] = {
+            "api_calls": 0,
+            "pages": 0,
+            "feed": feed,
+            "page_budget": page_budget,
+            "bounded_complete": False,
+            "provider_rows": 0,
+        }
 
         def read_current() -> list[dict[str, Any]]:
             filters = {
@@ -415,7 +468,8 @@ class SharedCapitalActionEvidence:
             if not self.api_key:
                 raise RuntimeError(MissingReason.ENVIRONMENT_BLOCKED.value)
             items: list[Mapping[str, Any]] = []
-            for page_index in range(max(1, int(max_pages))):
+            bounded_complete = False
+            for page_index in range(page_budget):
                 if feed == "issued-history":
                     params = {"length": ISSUED_HISTORY_LENGTH, "start": page_index * ISSUED_HISTORY_LENGTH}
                 else:
@@ -423,13 +477,23 @@ class SharedCapitalActionEvidence:
                         "year": source_period.year, "month": source_period.month,
                         "page": page_index + 1, "length": PAGE_LENGTH,
                     }
-                payload = self._request(feed, params)
+                # Count attempted provider calls even if timeout/HTTP failure occurs.
                 meta["api_calls"] += 1
+                payload = self._request(feed, params)
                 meta["pages"] = page_index + 1
                 page_rows, has_more = _feed_rows(payload, feed=feed)
+                meta["provider_rows"] += len(page_rows)
+                if has_more and not page_rows:
+                    raise RuntimeError(MissingReason.PARSE_FAILURE.value)
                 items.extend(page_rows)
-                if not has_more or not page_rows:
+                if not has_more:
+                    bounded_complete = True
                     break
+            if not bounded_complete:
+                # Never persist a truncated global/monthly feed when the page
+                # budget is exhausted while the provider says more data exists.
+                raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
+            meta["bounded_complete"] = True
             rows = normalize_capital_actions(
                 items, feed=feed, source_period=source_period, observed_on=observed_on
             )
@@ -483,7 +547,8 @@ class SharedCapitalActionEvidence:
 
 
 __all__ = [
-    "FEEDS", "ISSUED_HISTORY_LENGTH", "MONTHLY_FEEDS", "PAGE_LENGTH",
+    "FEEDS", "ISSUED_HISTORY_LENGTH", "MAX_PAGES_PER_RUN", "MONTHLY_FEEDS", "PAGE_LENGTH",
+    "REQUEST_TIMEOUT_SECONDS",
     "SharedCapitalActionEvidence", "normalize_capital_actions",
     "validate_capital_action_rows",
 ]
