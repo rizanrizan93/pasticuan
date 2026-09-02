@@ -430,14 +430,34 @@ class SharedEvidenceCoordinator:
         max_age: timedelta | None = None,
         minimum_rows: int = 1,
         lease_seconds: int = 300,
+        allow_empty_valid: bool = False,
+        read_empty_current: Callable[[], bool] | None = None,
     ) -> RefreshResult:
         normalized = key.normalized()
+
+        def empty_cache_hit() -> bool:
+            return bool(
+                allow_empty_valid
+                and read_empty_current is not None
+                and read_empty_current()
+            )
+
         current = read_current()
         state = self.classify(current, max_age=max_age, minimum_rows=minimum_rows)
         if state is EvidenceState.VALID:
             self._inc("cache_hits")
             self._inc("calls_avoided")
             return RefreshResult(state, "CACHE_HIT", tuple(current), cache_hit=True, request_avoided=True)
+        if not current and empty_cache_hit():
+            self._inc("cache_hits")
+            self._inc("calls_avoided")
+            return RefreshResult(
+                EvidenceState.VALID,
+                "CACHE_HIT_EMPTY",
+                (),
+                cache_hit=True,
+                request_avoided=True,
+            )
 
         self._inc("cache_misses")
         lease = dict(self.backend.acquire_lease(normalized, self.worker_id, lease_seconds))
@@ -452,6 +472,17 @@ class SharedEvidenceCoordinator:
                     readback_state, "CACHE_FILLED_BY_OTHER_CLIENT", tuple(readback),
                     cache_hit=True, request_avoided=True, lease_state="LOCKED_REUSED",
                 )
+            if not readback and empty_cache_hit():
+                self._inc("cache_hits")
+                self._inc("calls_avoided")
+                return RefreshResult(
+                    EvidenceState.VALID,
+                    "CACHE_FILLED_EMPTY_BY_OTHER_CLIENT",
+                    (),
+                    cache_hit=True,
+                    request_avoided=True,
+                    lease_state="LOCKED_REUSED_EMPTY",
+                )
             return RefreshResult(
                 state, MissingReason.REFRESH_LOCKED.value, tuple(current),
                 request_avoided=True, lease_state="LOCKED",
@@ -461,6 +492,29 @@ class SharedEvidenceCoordinator:
         attempted_at = datetime.now(timezone.utc)
         try:
             fetched = [dict(row) for row in fetch()]
+            if allow_empty_valid and not fetched:
+                if not self.backend.complete_lease(normalized, self.worker_id, "COMPLETED_EMPTY"):
+                    raise RuntimeError(MissingReason.REFRESH_LEASE_EXPIRED.value)
+                self.backend.record_provider_state({
+                    "provider": normalized.provider,
+                    "endpoint_family": normalized.family,
+                    "scope": normalized.scope,
+                    "target_date": normalized.target_date.isoformat(),
+                    "last_attempt_at": attempted_at.isoformat(),
+                    "last_success_at": datetime.now(timezone.utc).isoformat(),
+                    "latest_source_date": normalized.target_date.isoformat(),
+                    "response_state": "VALID_EMPTY",
+                    "error_classification": None,
+                })
+                self._inc("success")
+                return RefreshResult(
+                    EvidenceState.VALID,
+                    "REFRESHED_EMPTY",
+                    (),
+                    provider_called=True,
+                    lease_state="COMPLETED_EMPTY",
+                )
+
             valid, reason = validate(fetched)
             if not valid:
                 self._inc("failure")
