@@ -235,6 +235,7 @@ class BoundedZapiTransport:
                     "x-api-key": self._api_key,
                 },
                 timeout=self.timeout_seconds,
+                allow_redirects=False,
             )
         except requests.Timeout as exc:
             self.ledger.finish_attempt(index, "TIMEOUT")

@@ -28,6 +28,7 @@ from tools.phase5_6_bounded_live_validation import (
     execute_gate,
     facts_hash,
     fetch_foreign_flow,
+    fetch_stock_summary,
     verify_delta_allowlist,
 )
 
@@ -232,6 +233,23 @@ def test_stock_summary_transport_cap_is_exactly_one():
     assert ledger.attempts == 1 and ledger.refused_attempts == 1
 
 
+def test_redirect_is_not_followed_or_accepted_as_valid_evidence():
+    ledger = RequestLedger("PASTICUAN", 0, {STOCK_SUMMARY_FAMILY: 1})
+    session = FakeSession([
+        FakeResponse(stock_payload(), status_code=302),
+        FakeResponse(stock_payload()),
+    ])
+    transport = BoundedZapiTransport("fake", ledger, session=session)
+
+    with pytest.raises(GateFailure, match="CONTEXT_REJECTED"):
+        fetch_stock_summary(transport, DAY)
+
+    assert len(session.calls) == 1
+    assert session.calls[0][2]["allow_redirects"] is False
+    assert ledger.attempts == 1
+    assert ledger.entries[0]["result"] == "HTTP_302"
+
+
 def test_foreign_flow_is_one_session_and_at_most_two_attempts():
     assert FOREIGN_FLOW_ATTEMPT_CAP == 2
     ledger = RequestLedger("EMIR", 1, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
@@ -266,6 +284,37 @@ def test_foreign_flow_allows_exactly_two_bounded_pages_for_one_date():
     assert {row["ticker"] for row in rows} == set(COHORT)
     assert ledger.attempts == 2
     assert [call[2]["params"]["start"] for call in session.calls] == [0, 2]
+
+
+def test_malformed_provider_payload_fails_closed():
+    ledger = RequestLedger("EMIR", 0, {FOREIGN_FLOW_FAMILY: 2})
+    session = FakeSession([
+        FakeResponse({"data": {"date": DAY.isoformat(), "data": {"malformed": True}}})
+    ])
+
+    with pytest.raises(GateFailure, match="PARSE_FAILURE"):
+        fetch_foreign_flow(BoundedZapiTransport("fake", ledger, session=session), DAY)
+
+    assert len(session.calls) == 1
+    assert ledger.attempts == 1
+    assert ledger.entries[0]["result"] == "HTTP_200"
+
+
+def test_wrong_date_session_is_rejected():
+    wrong_day = date(2026, 8, 28)
+    payload = foreign_payload()
+    payload["data"]["date"] = wrong_day.isoformat()
+    for row in payload["data"]["data"]:
+        row["date"] = wrong_day.isoformat()
+    ledger = RequestLedger("EMIR", 0, {FOREIGN_FLOW_FAMILY: 2})
+    session = FakeSession([FakeResponse(payload)])
+
+    with pytest.raises(GateFailure, match="WRONG_PERIOD"):
+        fetch_foreign_flow(BoundedZapiTransport("fake", ledger, session=session), DAY)
+
+    assert len(session.calls) == 1
+    assert session.calls[0][2]["params"]["date"] == DAY.isoformat()
+    assert ledger.attempts == 1
 
 
 def test_cache_only_transport_hard_denies_before_network():
@@ -340,6 +389,39 @@ def test_provider_error_remains_error(monkeypatch):
     assert report["mode"] == "ERROR"
     assert report["evidence"]["classification"] == "ERROR"
     assert report["request_ledger"]["per_run_attempts"] == 1
+
+
+def test_exact_db_readback_mismatch_fails_closed(monkeypatch):
+    class CorruptingReadbackBackend(MemoryBackend):
+        def __init__(self):
+            super().__init__()
+            self.corrupt_readback = False
+
+        def upsert_rows(self, table, rows, *, conflict):
+            written = super().upsert_rows(table, rows, conflict=conflict)
+            self.corrupt_readback = True
+            return written
+
+        def read_rows(self, table, filters, *, select="*", limit=10000):
+            rows = super().read_rows(table, filters, select=select, limit=limit)
+            if self.corrupt_readback and table == STOCK_SPEC.table and rows:
+                rows[0]["close"] = (rows[0].get("close") or 0) + 1
+            return rows
+
+    configure_fake_credentials(monkeypatch)
+    backend = CorruptingReadbackBackend()
+    session = FakeSession([FakeResponse(stock_payload())])
+
+    with pytest.raises(GateFailure, match="READBACK_FAILURE"):
+        execute_gate(
+            "PASTICUAN",
+            0,
+            backend=backend,
+            transport_session=session,
+            target_date=DAY,
+        )
+
+    assert len(session.calls) == 1
 
 
 def test_three_run_state_machine_proves_two_family_reuse(monkeypatch):
