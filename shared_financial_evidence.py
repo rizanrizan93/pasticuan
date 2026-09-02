@@ -31,9 +31,10 @@ from shared_evidence_hub import (
 
 ZAPI_FINANCIAL_REPORT_URL = "https://api.zpi.web.id/v1/finance:idx/financial-report"
 IDX_ATTACHMENT_BASE = "https://www.idx.co.id/"
-PARSER_VERSION = "phase5.6-idx-xbrl-v1"
+PARSER_VERSION = "phase5.6-idx-xbrl-v2"
 MAX_ATTACHMENT_BYTES = 25_000_000
 MAX_UNCOMPRESSED_BYTES = 60_000_000
+REQUEST_TIMEOUT_SECONDS = 30
 PERIODS = {"tw1": ("Q1", 3, 31), "tw2": ("Q2", 6, 30), "tw3": ("Q3", 9, 30), "audit": ("FY", 12, 31)}
 
 FACT_ALIASES: dict[str, tuple[str, ...]] = {
@@ -64,6 +65,7 @@ FACT_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 DURATION_FACTS = frozenset({"revenue", "net_income", "operating_cash_flow", "capex", "free_cash_flow"})
+MONETARY_FACTS = frozenset(FACT_ALIASES)
 
 
 def _clean(value: Any) -> str:
@@ -154,6 +156,24 @@ def _fact_number(element: Any, *, inline: bool) -> float | None:
         if _attribute(element, "sign") == "-":
             value = -abs(value)
     return value
+
+
+def _currency_from_unit(unit: Any) -> str | None:
+    upper = _clean(unit).upper()
+    has_idr = "IDR" in upper
+    has_usd = "USD" in upper
+    if has_idr == has_usd:
+        return None
+    return "IDR" if has_idr else "USD"
+
+
+def _is_ytd_start(value: date | None, period_end: date) -> bool:
+    return bool(
+        value is not None
+        and value.year == period_end.year
+        and value.month == 1
+        and 1 <= value.day <= 7
+    )
 
 
 def _official_idx_url(value: Any) -> bool:
@@ -299,10 +319,10 @@ def parse_idx_xbrl_facts(
             raise RuntimeError(MissingReason.ISSUER_MISMATCH.value)
         raise RuntimeError(MissingReason.ISSUER_IDENTITY_MISSING.value)
 
-    selected: dict[str, tuple[float, float, str, str]] = {}
-    capex_components: dict[str, tuple[float, float, str, str]] = {}
+    selected: dict[str, tuple[float, float, str, str, date | None, date | None]] = {}
+    capex_components: dict[str, tuple[float, float, str, str, date | None, date | None]] = {}
     for canonical, aliases in FACT_ALIASES.items():
-        candidates: list[tuple[float, float, str, str]] = []
+        candidates: list[tuple[float, float, str, str, date | None, date | None]] = []
         for fact in facts:
             concept_score = _concept_score(fact["concept"], (canonical, *aliases))
             context = fact["context"]
@@ -317,12 +337,22 @@ def parse_idx_xbrl_facts(
             score += 8 if "current" in context_id else 0
             score += 6 if "consolidat" in context_id else 0
             score -= 25 if any(token in context_id for token in ("prior", "previous", "comparative")) else 0
+            start = context.get("start")
+            end = context.get("end")
             if canonical in DURATION_FACTS:
-                start = context.get("start")
-                score += 30 if start and start.year == period_end.year and start.month == 1 and start.day <= 7 else -20
+                if not _is_ytd_start(start, period_end) or end is None:
+                    continue
+                score += 30
             elif context.get("instant"):
                 score += 12
-            candidates.append((score, float(fact["value"]), _clean(fact["unit"]), _clean(fact["concept"])))
+            candidates.append((
+                score,
+                float(fact["value"]),
+                _clean(fact["unit"]),
+                _clean(fact["concept"]),
+                start,
+                end,
+            ))
         if canonical == "capex":
             for candidate in candidates:
                 concept = _concept_key(candidate[3])
@@ -331,12 +361,49 @@ def parse_idx_xbrl_facts(
                     if current is None or candidate[0] > current[0]:
                         capex_components[concept] = candidate
             if capex_components:
+                starts = {item[4] for item in capex_components.values()}
+                ends = {item[5] for item in capex_components.values()}
+                currencies = {_currency_from_unit(item[2]) for item in capex_components.values()}
+                if None in starts or len(starts) != 1 or None in ends or len(ends) != 1:
+                    raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
+                if None in currencies or len(currencies) != 1:
+                    raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
                 first = max(capex_components.values(), key=lambda item: item[0])
-                selected[canonical] = (first[0], sum(abs(item[1]) for item in capex_components.values()), first[2], "SUM_COMPONENTS")
+                selected[canonical] = (
+                    first[0],
+                    sum(abs(item[1]) for item in capex_components.values()),
+                    first[2],
+                    "SUM_COMPONENTS",
+                    first[4],
+                    first[5],
+                )
                 continue
         if candidates:
             selected[canonical] = max(candidates, key=lambda item: item[0])
     if len(selected) < 3:
+        raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
+
+    selected_currencies = {
+        _currency_from_unit(item[2])
+        for name, item in selected.items()
+        if name in MONETARY_FACTS
+    }
+    if None in selected_currencies or len(selected_currencies) != 1:
+        raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
+
+    duration_starts = {
+        item[4]
+        for name, item in selected.items()
+        if name in DURATION_FACTS
+    }
+    duration_ends = {
+        item[5]
+        for name, item in selected.items()
+        if name in DURATION_FACTS
+    }
+    if None in duration_starts or len(duration_starts) != 1:
+        raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
+    if None in duration_ends or len(duration_ends) != 1:
         raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
 
     issuer_identity = " | ".join(sorted({_clean(context["identifier"]) for context in matched if context.get("identifier")}))
@@ -360,9 +427,10 @@ def parse_idx_xbrl_facts(
         "fetched_at": fetched_at,
     }
     normalized: list[dict[str, Any]] = []
-    for name, (_, value, unit, _) in sorted(selected.items()):
-        upper_unit = unit.upper()
-        currency = "USD" if "USD" in upper_unit and "IDR" not in upper_unit else "IDR" if "IDR" in upper_unit else None
+    for name, (_, value, unit, _, _, _) in sorted(selected.items()):
+        currency = _currency_from_unit(unit)
+        if currency is None:
+            raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
         normalized.append({
             "ticker": code,
             "report_period": report_period,
@@ -404,7 +472,12 @@ def validate_financial_facts(
             return False, MissingReason.CONTEXT_REJECTED.value
         if not _official_idx_url(row.get("source_url")):
             return False, MissingReason.CONTEXT_REJECTED.value
+        currency = _clean(row.get("currency")).upper()
+        if currency not in {"IDR", "USD"} or row.get("unit_scale") != 1:
+            return False, MissingReason.CONTEXT_REJECTED.value
         names.add(name)
+    if len({_clean(row.get("currency")).upper() for row in records}) != 1:
+        return False, MissingReason.CONTEXT_REJECTED.value
     return True, "VALID"
 
 
@@ -431,23 +504,46 @@ class SharedFinancialEvidence:
     def ready(self) -> bool:
         return self.backend is not None and self.coordinator is not None
 
-    def _request(self, url: str, *, params: Mapping[str, Any] | None = None, api: bool) -> Any:
+    def _request(
+        self,
+        url: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        api: bool,
+        stage: str,
+    ) -> Any:
         if api and not self.api_key:
             raise RuntimeError(MissingReason.ENVIRONMENT_BLOCKED.value)
-        headers = {"Accept": "application/json" if api else "application/zip,application/xml,text/xml,text/html,*/*"}
+        stage = _clean(stage).upper() or ("ZAPI_MANIFEST" if api else "OFFICIAL_ATTACHMENT")
+        headers = {
+            "Accept": "application/json" if api else "application/zip,application/xml,text/xml,text/html,*/*",
+            "User-Agent": (
+                "Shared-IDX-Evidence-Hub/financial-manifest"
+                if api else "Shared-IDX-Evidence-Hub/financial-attachment"
+            ),
+        }
         if api:
             headers["x-api-key"] = self.api_key
         try:
-            response = self.session.request("GET", url, params=dict(params or {}), headers=headers, timeout=30)
+            response = self.session.request(
+                "GET",
+                url,
+                params=dict(params or {}),
+                headers=headers,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                allow_redirects=False,
+            )
         except requests.Timeout as exc:
-            raise RuntimeError(MissingReason.TIMEOUT.value) from exc
+            raise RuntimeError(f"{stage}_TIMEOUT") from exc
         except requests.ConnectionError as exc:
-            raise RuntimeError(MissingReason.CONNECTION_ERROR.value) from exc
+            raise RuntimeError(f"{stage}_CONNECTION_ERROR") from exc
         status = int(getattr(response, "status_code", 0) or 0)
+        if 300 <= status < 400:
+            raise RuntimeError(f"{stage}_REDIRECT_BLOCKED")
         if status in {401, 403, 404, 429}:
-            raise RuntimeError(f"HTTP_{status}")
+            raise RuntimeError(f"{stage}_HTTP_{status}")
         if not 200 <= status < 300:
-            raise RuntimeError(f"HTTP_{status}")
+            raise RuntimeError(f"{stage}_HTTP_{status}")
         if not getattr(response, "content", b""):
             raise RuntimeError(MissingReason.EMPTY_RESPONSE.value)
         return response
@@ -545,13 +641,16 @@ class SharedFinancialEvidence:
                 ZAPI_FINANCIAL_REPORT_URL,
                 params={"year": int(year), "period": period_code.lower(), "code": code, "length": 100, "start": 0},
                 api=True,
+                stage="ZAPI_MANIFEST",
             )
             try:
                 manifest = self._manifest(response.json(), ticker=code, year=year, period_code=period_code)
             except (TypeError, ValueError) as exc:
                 raise RuntimeError(MissingReason.PARSE_FAILURE.value) from exc
             meta["attachment_calls"] += 1
-            attachment = self._request(manifest["url"], api=False)
+            attachment = self._request(
+                manifest["url"], api=False, stage="OFFICIAL_ATTACHMENT"
+            )
             final_url = _clean(getattr(attachment, "url", manifest["url"])) or manifest["url"]
             content = bytes(attachment.content)
             content_type = _clean((getattr(attachment, "headers", {}) or {}).get("Content-Type")).lower()
@@ -610,6 +709,7 @@ class SharedFinancialEvidence:
 __all__ = [
     "FACT_ALIASES",
     "PARSER_VERSION",
+    "REQUEST_TIMEOUT_SECONDS",
     "SharedFinancialEvidence",
     "ZAPI_FINANCIAL_REPORT_URL",
     "parse_idx_xbrl_facts",
