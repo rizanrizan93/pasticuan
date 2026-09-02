@@ -292,3 +292,58 @@ def test_migration_is_scanner_neutral_secured_and_additive() -> None:
     assert "drop table" not in sql
     assert "emir_score" not in sql and "pasticuan_score" not in sql
     assert IDX_FLOW_SUPABASE_PROJECT_REF not in sql
+
+
+def test_valid_empty_payload_can_be_cached_without_duplicate_provider_call() -> None:
+    backend = MemoryBackend()
+    empty_marker = {"ready": False}
+    calls = 0
+
+    def fetch() -> list[Mapping[str, Any]]:
+        nonlocal calls
+        calls += 1
+        empty_marker["ready"] = True
+        return []
+
+    first = _coordinator(backend, "PASTICUAN").get_or_refresh(
+        KEY,
+        read_current=backend.read,
+        fetch=fetch,
+        persist=backend.persist,
+        validate=_validate,
+        allow_empty_valid=True,
+        read_empty_current=lambda: empty_marker["ready"],
+    )
+    assert first.state is EvidenceState.VALID
+    assert first.reason == "REFRESHED_EMPTY"
+    assert first.provider_called and first.rows == ()
+    assert backend.leases[backend._key(KEY)]["state"] == "COMPLETED"
+    assert backend.provider_states[-1]["response_state"] == "VALID_EMPTY"
+    assert backend.provider_states[-1]["error_classification"] is None
+
+    second = _coordinator(backend, "EMIR").get_or_refresh(
+        KEY,
+        read_current=backend.read,
+        fetch=lambda: (_ for _ in ()).throw(AssertionError("duplicate provider call")),
+        persist=backend.persist,
+        validate=_validate,
+        allow_empty_valid=True,
+        read_empty_current=lambda: empty_marker["ready"],
+    )
+    assert second.state is EvidenceState.VALID
+    assert second.reason == "CACHE_HIT_EMPTY"
+    assert second.cache_hit and second.request_avoided and not second.provider_called
+    assert calls == 1
+
+
+def test_empty_payload_still_errors_without_explicit_empty_contract() -> None:
+    backend = MemoryBackend()
+    result = _coordinator(backend, "EMIR").get_or_refresh(
+        KEY,
+        read_current=backend.read,
+        fetch=list,
+        persist=backend.persist,
+        validate=_validate,
+    )
+    assert result.state is EvidenceState.ERROR
+    assert result.reason == MissingReason.EMPTY_RESPONSE.value
