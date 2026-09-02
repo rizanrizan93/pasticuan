@@ -12,7 +12,11 @@ import requests
 from shared_evidence_hub import EvidenceKey, SharedEvidenceCoordinator
 from shared_ownership_evidence import (
     CATEGORIES,
+    INDEX_PAGE_SIZE,
+    MAX_FILES_PER_PUBLICATION,
+    MAX_INDEX_PAGES,
     OWNERSHIP_INDEX_URL,
+    REQUEST_TIMEOUT_SECONDS,
     SharedOwnershipEvidence,
     derive_ownership_changes,
     parse_ownership_workbook,
@@ -42,13 +46,19 @@ def _frame(category: str, *, holder: str = "PT Contoh", shares: Any = "1.234.567
     ])
 
 
-def _index(category: str = "lima-persen", published: str = "2026-07-30", url: str = OFFICIAL_URL) -> dict[str, Any]:
+def _index(
+    category: str = "lima-persen",
+    published: str = "2026-07-30",
+    url: str = OFFICIAL_URL,
+    *,
+    total: int = 1,
+) -> dict[str, Any]:
     return {"data": [{
         "url": url,
         "category": category,
         "fileName": "ownership.xlsx",
         "publishedAt": published,
-    }], "total": 1}
+    }], "total": total}
 
 
 class Response:
@@ -61,12 +71,13 @@ class Response:
         url: str = "",
         content_type: str = "application/json",
         malformed: bool = False,
+        headers: Mapping[str, str] | None = None,
     ):
         self.payload = payload
         self.content = content
         self.status_code = status
         self.url = url
-        self.headers = {"Content-Type": content_type}
+        self.headers = {"Content-Type": content_type, **dict(headers or {})}
         self.malformed = malformed
 
     def json(self) -> Any:
@@ -210,10 +221,118 @@ def test_pipeline_fetches_one_index_and_only_matching_official_file() -> None:
     assert len(rows) == 1 and meta["state"] == "REFRESHED"
     assert meta["api_calls"] == 1 and meta["file_calls"] == 1 and len(session.calls) == 2
     assert session.calls[0]["url"] == OWNERSHIP_INDEX_URL
-    assert session.calls[0]["params"] == {"category": "lima-persen", "length": 200, "start": 0}
+    assert session.calls[0]["params"] == {
+        "category": "lima-persen", "length": INDEX_PAGE_SIZE, "start": 0
+    }
+    assert session.calls[0]["allow_redirects"] is False
+    assert session.calls[0]["timeout"] == REQUEST_TIMEOUT_SECONDS
     assert len(backend.tables["evidence_ownership_files"]) == 1
     assert len(backend.tables["evidence_ownership_snapshots"]) == 1
     assert "test-key" not in str(meta)
+
+
+def test_index_pagination_is_bounded_and_stops_when_target_is_found() -> None:
+    first_page = _index(published="2026-07-31", total=400)
+    second_page = _index(published="2026-07-30", total=400)
+    session = Session([
+        Response(payload=first_page),
+        Response(payload=second_page),
+        Response(content=FILE_BYTES, url=OFFICIAL_URL, content_type="application/octet-stream"),
+    ])
+    rows, meta = _producer(MemoryBackend(), session).get_publication("lima-persen", PUBLICATION)
+    assert len(rows) == 1 and meta["state"] == "REFRESHED"
+    assert meta["api_calls"] == 2 and meta["file_calls"] == 1
+    assert [call["params"]["start"] for call in session.calls[:2]] == [0, INDEX_PAGE_SIZE]
+
+
+def test_index_page_cap_fails_closed_without_downloading_files() -> None:
+    outcomes = [
+        Response(payload=_index(published="2026-08-01", total=1000))
+        for _ in range(MAX_INDEX_PAGES)
+    ]
+    session = Session(outcomes)
+    rows, meta = _producer(MemoryBackend(), session).get_publication("lima-persen", PUBLICATION)
+    assert not rows and meta["state"] == "NO_FILE"
+    assert meta["api_calls"] == MAX_INDEX_PAGES
+    assert meta["file_calls"] == 0
+    assert len(session.calls) == MAX_INDEX_PAGES
+
+
+def test_multiple_matching_files_fail_closed_before_download() -> None:
+    payload = {
+        "data": [
+            {
+                "url": OFFICIAL_URL,
+                "category": "lima-persen",
+                "fileName": "a.xlsx",
+                "publishedAt": "2026-07-30",
+            },
+            {
+                "url": "https://www.idx.co.id/Media/example/ownership-2.xlsx",
+                "category": "lima-persen",
+                "fileName": "b.xlsx",
+                "publishedAt": "2026-07-30",
+            },
+        ],
+        "total": 2,
+    }
+    session = Session([Response(payload=payload)])
+    rows, meta = _producer(MemoryBackend(), session).get_publication("lima-persen", PUBLICATION)
+    assert not rows and meta["state"] == "CONTEXT_REJECTED"
+    assert meta["file_calls"] == 0
+    assert MAX_FILES_PER_PUBLICATION == 1
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        pd.DataFrame([
+            ["Kode Emiten", "Nama Pemegang Saham", "Jumlah Saham", "Persentase Kepemilikan", "Tanggal Posisi"],
+            ["BBCA", "PT Contoh", 100, 5.0, None],
+        ]),
+        pd.DataFrame([
+            ["Kode Emiten", "Nama Pemegang Saham", "Jumlah Saham", "Persentase Kepemilikan", "Tanggal Posisi"],
+            ["BBCA", "PT Contoh", 100, 5.0, "2026-07-31"],
+        ]),
+    ],
+)
+def test_parser_rejects_missing_or_future_report_date(frame: pd.DataFrame) -> None:
+    with pytest.raises(RuntimeError, match="WRONG_PERIOD"):
+        parse_ownership_workbook(
+            {"Sheet1": frame},
+            category="lima-persen",
+            publication_date=PUBLICATION,
+            source_url=OFFICIAL_URL,
+            source_file_hash="a" * 64,
+        )
+
+
+def test_parser_rejects_mixed_report_dates_in_one_publication() -> None:
+    frame = _frame("lima-persen")
+    frame.loc[len(frame)] = ["BBRI", "PT Lain", "2.000", "5,10%", "Lokal", "2026-07-28"]
+    with pytest.raises(RuntimeError, match="WRONG_PERIOD"):
+        parse_ownership_workbook(
+            {"Sheet1": frame},
+            category="lima-persen",
+            publication_date=PUBLICATION,
+            source_url=OFFICIAL_URL,
+            source_file_hash="a" * 64,
+        )
+
+
+def test_redirect_is_not_followed_implicitly() -> None:
+    session = Session([
+        Response(payload=_index()),
+        Response(
+            status=302,
+            url=OFFICIAL_URL,
+            headers={"Location": "https://www.idx.co.id/Media/example/redirected.xlsx"},
+        ),
+    ])
+    rows, meta = _producer(MemoryBackend(), session).get_publication("lima-persen", PUBLICATION)
+    assert not rows and meta["state"] == "CONTEXT_REJECTED"
+    assert len(session.calls) == 2
+    assert session.calls[-1]["allow_redirects"] is False
 
 
 @pytest.mark.parametrize("first,second", [("PASTICUAN", "EMIR"), ("EMIR", "PASTICUAN")])
