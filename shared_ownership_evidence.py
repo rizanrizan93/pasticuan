@@ -381,16 +381,16 @@ class SharedOwnershipEvidence:
                 allow_redirects=False,
             )
         except requests.Timeout as exc:
-            raise RuntimeError(f"{stage}_TIMEOUT") from exc
+            raise RuntimeError(MissingReason.TIMEOUT.value) from exc
         except requests.ConnectionError as exc:
-            raise RuntimeError(f"{stage}_CONNECTION_ERROR") from exc
+            raise RuntimeError(MissingReason.CONNECTION_ERROR.value) from exc
         status = int(getattr(response, "status_code", 0) or 0)
         if 300 <= status < 400:
-            raise RuntimeError(f"{stage}_REDIRECT_BLOCKED")
+            raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
         if status in {401, 403, 404, 429}:
-            raise RuntimeError(f"{stage}_HTTP_{status}")
+            raise RuntimeError(f"HTTP_{status}")
         if not 200 <= status < 300:
-            raise RuntimeError(f"{stage}_HTTP_{status}")
+            raise RuntimeError(f"HTTP_{status}")
         if not getattr(response, "content", b""):
             raise RuntimeError(MissingReason.EMPTY_RESPONSE.value)
         return response
@@ -468,12 +468,16 @@ class SharedOwnershipEvidence:
             for page in range(MAX_INDEX_PAGES):
                 start = page * INDEX_PAGE_SIZE
                 meta["api_calls"] += 1
-                index_response = self._request(
-                    OWNERSHIP_INDEX_URL,
-                    params={"category": category, "length": INDEX_PAGE_SIZE, "start": start},
-                    api=True,
-                    stage="ZAPI_INDEX",
-                )
+                try:
+                    index_response = self._request(
+                        OWNERSHIP_INDEX_URL,
+                        params={"category": category, "length": INDEX_PAGE_SIZE, "start": start},
+                        api=True,
+                        stage="ZAPI_INDEX",
+                    )
+                except Exception:
+                    meta["failure_stage"] = "ZAPI_INDEX"
+                    raise
                 try:
                     page_entries, total = self._index_page(
                         index_response.json(), category=category, publication_date=publication_date
@@ -494,9 +498,13 @@ class SharedOwnershipEvidence:
                 if meta["file_calls"] >= MAX_FILES_PER_PUBLICATION:
                     raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
                 meta["file_calls"] += 1
-                response = self._request(
-                    entry["source_url"], api=False, stage="OFFICIAL_FILE"
-                )
+                try:
+                    response = self._request(
+                        entry["source_url"], api=False, stage="OFFICIAL_FILE"
+                    )
+                except Exception:
+                    meta["failure_stage"] = "OFFICIAL_FILE"
+                    raise
                 final_url = _clean(getattr(response, "url", entry["source_url"]))
                 content = bytes(response.content)
                 content_type = _clean((getattr(response, "headers", {}) or {}).get("Content-Type")).lower()
