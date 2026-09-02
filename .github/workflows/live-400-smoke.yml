@@ -1,47 +1,12 @@
 name: Super live 400 cold smoke
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/live-400-smoke.yml'
-      - 'tools/live_scan_400_smoke.py'
-      - 'tools/idx_400_production_universe_2026-07.txt'
-      - 'live_forward_evidence.py'
-      - 'live_forward_runtime_patch.py'
-      - 'future_fundamental_ui_patch.py'
-      - 'evidence_governance.py'
-      - 'official_evidence_bridge.py'
-      - 'runtime_integrity_patch.py'
-      - 'runtime_release.py'
-      - 'fast_scan_engine.py'
-      - 'scanner.py'
-      - 'simple_focus.py'
-      - 'release_contract.py'
-      - 'resumable_app_engine.py'
-      - 'scanner_database.py'
-      - 'tests/**'
-  pull_request:
-    branches: [main]
-    paths:
-      - '.github/workflows/live-400-smoke.yml'
-      - 'tools/live_scan_400_smoke.py'
-      - 'tools/idx_400_production_universe_2026-07.txt'
-      - 'live_forward_evidence.py'
-      - 'live_forward_runtime_patch.py'
-      - 'future_fundamental_ui_patch.py'
-      - 'evidence_governance.py'
-      - 'official_evidence_bridge.py'
-      - 'runtime_integrity_patch.py'
-      - 'runtime_release.py'
-      - 'fast_scan_engine.py'
-      - 'scanner.py'
-      - 'simple_focus.py'
-      - 'release_contract.py'
-      - 'resumable_app_engine.py'
-      - 'scanner_database.py'
-      - 'tests/**'
   workflow_dispatch:
+    inputs:
+      selected_ref:
+        description: Exact branch, tag, or commit SHA to run deliberately
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -56,7 +21,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout explicitly selected ref without push credentials
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.selected_ref }}
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -95,6 +64,11 @@ jobs:
         run: |
           set -o pipefail
           python tools/live_scan_400_smoke.py | tee /tmp/live-scan.log
+      - name: Record selected revision
+        if: always()
+        run: |
+          mkdir -p live_scan_output
+          git rev-parse HEAD > live_scan_output/selected-commit-sha.txt
       - name: Upload scanner outputs
         if: always()
         uses: actions/upload-artifact@v6
