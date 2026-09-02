@@ -39,14 +39,14 @@ def _init_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def test_workflows_use_exact_status_detection_and_exact_staging() -> None:
-    for workflow, paths in WORKFLOWS.items():
+def test_workflows_do_not_persist_runtime_cache_files() -> None:
+    for workflow in WORKFLOWS:
         source = workflow.read_text(encoding="utf-8")
-        exact = " ".join(paths)
-        assert f"git status --porcelain -- {exact}" in source
-        assert f"git add {exact}" in source
-        assert "git diff --quiet --" not in source
-        assert "git add ." not in source
+        assert "contents: write" not in source
+        assert "git status --porcelain --" not in source
+        assert "git add " not in source
+        assert "git commit" not in source
+        assert "git push" not in source
 
 
 def test_first_untracked_cache_is_detected(tmp_path: Path) -> None:
