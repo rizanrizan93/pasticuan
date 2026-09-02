@@ -1,13 +1,7 @@
-name: Pasticuan-owned IDX participant flow verify
+name: Pasticuan participant cache manual verify
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '45 13 * * 1-5'
-  push:
-    paths:
-      - '.github/workflows/verify-canonical-participant-flow.yml'
-      - 'broker_runtime_patch.py'
 
 permissions:
   contents: read
@@ -18,11 +12,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - run: pip install pandas requests
-      - name: Verify Pasticuan-owned participant cache
+      - name: Verify Pasticuan participant cache
         run: |
           python - <<'PY'
           from io import BytesIO
@@ -31,7 +27,7 @@ jobs:
           import requests
 
           url = 'https://raw.githubusercontent.com/rizanrizan93/pasticuan/main/data/public_broker_flow_30d.csv.gz'
-          r = requests.get(url, timeout=20, headers={'User-Agent':'Pasticuan-Owned-Participant-Verify/1.0'})
+          r = requests.get(url, timeout=20, headers={'User-Agent':'Pasticuan-Participant-Manual-Verify/1.0'})
           r.raise_for_status()
           df = pd.read_csv(BytesIO(gzip.decompress(r.content)))
           required = {'ticker','trade_date','broker_code','buy_value','sell_value','buy_volume','sell_volume','source','provenance_state'}
