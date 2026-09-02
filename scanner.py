@@ -8959,10 +8959,15 @@ def apply_fundamental_gate(signals: pd.DataFrame, config: ScanConfig | None=None
             confidence, tier = (min(78.0, max(52.0, score)), 'PARTIAL')
             _append_pipe(out, idx, 'evidence_warnings', 'Fundamental parsial atau belum mencapai quality threshold')
         else:
-            confidence, tier = (50.0, 'MISSING_NEUTRAL')
-            _append_pipe(out, idx, 'evidence_warnings', 'Fundamental belum lengkap; bobot confidence dikurangi')
+            # Missing provider evidence is not a bearish fundamental observation.
+            # Keep it explicitly unavailable and exclude it from score aggregation.
+            confidence, tier = (np.nan, 'MISSING_NOT_SCORED')
+            _append_pipe(
+                out, idx, 'evidence_warnings',
+                'Fundamental tidak tersedia/terverifikasi; dikeluarkan dari scoring, bukan diberi nilai nol',
+            )
         if data_conflicts:
-            confidence = min(confidence, 55.0)
+            confidence = min(confidence, 55.0) if np.isfinite(confidence) else 55.0
             tier = 'DATA_CONFLICT'
             _append_pipe(out, idx, 'evidence_warnings', 'Laporan fundamental berbeda antar-sumber; wajib review manual')
         elif data_grade in {'A', 'B'} and tier == 'STRONG':
@@ -9773,7 +9778,7 @@ def _finalize_execution_integrity_v431(signals: pd.DataFrame, config: ScanConfig
     if signals.empty:
         return signals.copy()
     out = signals.copy()
-    for column, default in (('critical_blockers', ''), ('evidence_warnings', ''), ('market_status_confidence', 45.0), ('news_confidence', 52.0), ('fundamental_confidence', 50.0), ('validation_confidence', 45.0), ('quote_confidence', 68.0), ('universe_confidence', 48.0), ('portfolio_selected', False), ('independent_price_verified', False), ('independent_price_state', 'MISSING_INDEPENDENT'), ('independent_source_family', '')):
+    for column, default in (('critical_blockers', ''), ('evidence_warnings', ''), ('market_status_confidence', 45.0), ('news_confidence', 52.0), ('fundamental_confidence', np.nan), ('validation_confidence', 45.0), ('quote_confidence', 68.0), ('universe_confidence', 48.0), ('portfolio_selected', False), ('independent_price_verified', False), ('independent_price_state', 'MISSING_INDEPENDENT'), ('independent_source_family', '')):
         if column not in out:
             out[column] = default
     for idx, row in out.iterrows():
@@ -9782,8 +9787,14 @@ def _finalize_execution_integrity_v431(signals: pd.DataFrame, config: ScanConfig
         risk_conf = _risk_layer_confidence(row, cfg)
         market_conf = _finite(row.get('market_status_confidence'), 45)
         news_conf = _finite(row.get('news_confidence'), 52)
-        fundamental_conf = _finite(row.get('fundamental_confidence'), 50)
+        fundamental_conf = _finite(row.get('fundamental_confidence'), np.nan)
         fundamental_coverage = _finite(row.get('fundamental_coverage'), 0)
+        fundamental_score_value = _finite(row.get('fundamental_score'), np.nan)
+        fundamental_observed = bool(
+            fundamental_coverage > 0
+            and np.isfinite(fundamental_score_value)
+            and not _truthy(row.get('fundamental_critical_blocker', False))
+        )
         validation_conf = _finite(row.get('validation_confidence'), 45)
         quote_conf = _finite(row.get('quote_confidence'), 68)
         universe_conf = _finite(row.get('universe_confidence'), 48)
@@ -9791,16 +9802,44 @@ def _finalize_execution_integrity_v431(signals: pd.DataFrame, config: ScanConfig
             market_conf = 70.0
             out.at[idx, 'market_status_confidence'] = market_conf
             _append_pipe(out, idx, 'evidence_warnings', 'Status IDX memakai provisional quote/OHLCV fallback')
-        confidence_weights = {'technical': (technical_conf, 0.35), 'risk': (risk_conf, 0.2), 'market_status': (market_conf, 0.1), 'news': (news_conf, 0.08), 'fundamental': (fundamental_conf, 0.1), 'validation': (validation_conf, 0.07), 'quote': (quote_conf, 0.05), 'universe': (universe_conf, 0.05)}
-        confidence = round(sum((value * weight for value, weight in confidence_weights.values())), 1)
+        confidence_weights = {
+            'technical': (technical_conf, 0.35),
+            'risk': (risk_conf, 0.20),
+            'market_status': (market_conf, 0.10),
+            'news': (news_conf, 0.08),
+            'validation': (validation_conf, 0.07),
+            'quote': (quote_conf, 0.05),
+            'universe': (universe_conf, 0.05),
+        }
+        if fundamental_observed and np.isfinite(fundamental_conf):
+            confidence_weights['fundamental'] = (fundamental_conf, 0.10)
+        confidence_weight_total = sum(weight for value, weight in confidence_weights.values() if np.isfinite(value))
+        confidence = round(
+            sum(value * weight for value, weight in confidence_weights.values() if np.isfinite(value))
+            / confidence_weight_total,
+            1,
+        ) if confidence_weight_total > 0 else 0.0
         coverages = _layer_data_coverage(row, cfg)
-        completeness = round(sum((coverages[name] * weight for name, weight in _DATA_LAYER_WEIGHTS.items())), 1)
+        completeness_weights = dict(_DATA_LAYER_WEIGHTS)
+        if not fundamental_observed:
+            completeness_weights.pop('fundamental', None)
+        completeness_weight_total = sum(completeness_weights.values())
+        completeness = round(
+            sum(coverages[name] * weight for name, weight in completeness_weights.items())
+            / completeness_weight_total,
+            1,
+        ) if completeness_weight_total > 0 else 0.0
         for name, value in coverages.items():
             out.at[idx, f'{name}_data_coverage'] = value
         out.at[idx, 'data_completeness_score'] = completeness
         out.at[idx, 'data_completeness_tier'] = 'HIGH' if completeness >= 90 else 'SUFFICIENT' if completeness >= cfg.min_data_completeness else 'PARTIAL' if completeness >= 60 else 'LOW'
         missing_layers = [name for name, value in coverages.items() if value < 60]
-        direct_fundamental_ok = bool(not cfg.real_money_mode or fundamental_coverage >= cfg.min_direct_fundamental_coverage)
+        # Missing financial evidence is not an adverse observation. Only an
+        # explicit fundamental distress flag may block execution.
+        direct_fundamental_ok = bool(not _truthy(row.get('fundamental_critical_blocker', False)))
+        out.at[idx, 'fundamental_scoring_state'] = (
+            'OBSERVED_SCORED' if fundamental_observed else 'MISSING_NOT_SCORED'
+        )
         daily_source_tier = _safe_text(row.get('ohlcv_source_tier')).upper()
         direct_daily_source_ok = bool(not cfg.real_money_mode or daily_source_tier not in {'CACHE_FALLBACK', 'UNAVAILABLE'})
         independent_verified = _truthy(row.get('independent_price_verified', False))
@@ -9814,8 +9853,13 @@ def _finalize_execution_integrity_v431(signals: pd.DataFrame, config: ScanConfig
         out.at[idx, 'data_missing_layers'] = ' | '.join(missing_layers)
         if completeness < cfg.min_data_completeness:
             _append_pipe(out, idx, 'evidence_warnings', f'Data completeness {completeness:.1f}% di bawah minimum {cfg.min_data_completeness:.0f}%')
-        if not direct_fundamental_ok:
-            _append_pipe(out, idx, 'evidence_warnings', f'Fundamental coverage {fundamental_coverage:.1f}% di bawah minimum direct-order {cfg.min_direct_fundamental_coverage:.0f}%')
+        if not fundamental_observed:
+            _append_pipe(
+                out, idx, 'evidence_warnings',
+                'Fundamental missing tidak memblok setup; faktor ini dikeluarkan dari scoring dan completeness denominator',
+            )
+        elif not direct_fundamental_ok:
+            _append_pipe(out, idx, 'evidence_warnings', 'Fundamental distress terverifikasi memblok execution')
         if not direct_daily_source_ok:
             _append_pipe(out, idx, 'evidence_warnings', 'OHLCV daily bukan hasil live; cache hanya boleh dipakai untuk riset/watchlist')
         if not independent_price_ok:
@@ -9837,8 +9881,27 @@ def _finalize_execution_integrity_v431(signals: pd.DataFrame, config: ScanConfig
         base_direct_gates = bool(technical_ready and (not critical) and (risk_conf == 100.0) and portfolio_ok and direct_fundamental_ok and direct_daily_source_ok)
         projected_market_conf = 70.0 if market_conf < 60 else market_conf
         projected_quote_conf = max(100.0, quote_conf)
-        projected_completeness = round(min(100.0, completeness + _DATA_LAYER_WEIGHTS['quote'] * (100.0 - coverages['quote'])), 1)
-        projected_confidence = round(confidence + 0.1 * (projected_market_conf - market_conf) + 0.05 * (projected_quote_conf - quote_conf), 1)
+        projected_coverages = dict(coverages)
+        projected_coverages['quote'] = 100.0
+        projected_completeness = round(
+            sum(projected_coverages[name] * weight for name, weight in completeness_weights.items())
+            / completeness_weight_total,
+            1,
+        ) if completeness_weight_total > 0 else completeness
+        projected_confidence_weights = dict(confidence_weights)
+        projected_confidence_weights['market_status'] = (projected_market_conf, 0.10)
+        projected_confidence_weights['quote'] = (projected_quote_conf, 0.05)
+        projected_confidence_weight_total = sum(
+            weight for value, weight in projected_confidence_weights.values() if np.isfinite(value)
+        )
+        projected_confidence = round(
+            sum(
+                value * weight
+                for value, weight in projected_confidence_weights.values()
+                if np.isfinite(value)
+            ) / projected_confidence_weight_total,
+            1,
+        ) if projected_confidence_weight_total > 0 else confidence
         ready_except_independent = bool(base_direct_gates and projected_completeness >= cfg.min_data_completeness and (projected_confidence >= cfg.min_execution_confidence))
         direct = bool(base_direct_gates and independent_price_ok and (completeness >= cfg.min_data_completeness) and (confidence >= cfg.min_execution_confidence))
         if direct:
@@ -9867,8 +9930,8 @@ def _finalize_execution_integrity_v431(signals: pd.DataFrame, config: ScanConfig
         out.at[idx, 'order_instruction'] = 'BUY_LIMIT' if direct else 'DO_NOT_BUY'
         out.at[idx, 'stockbit_order_price'] = row.get('entry') if direct else np.nan
         out.at[idx, 'stockbit_order_lots'] = int(_finite(row.get('suggested_lots'), 0)) if direct else 0
-        gate_checks = {'technical': technical_ready, 'risk': risk_conf == 100.0, 'context': not bool(critical), 'portfolio': portfolio_ok, 'fundamental': direct_fundamental_ok, 'live_daily': direct_daily_source_ok, 'independent_price': independent_price_ok, 'completeness': completeness >= cfg.min_data_completeness or (not independent_price_ok and projected_completeness >= cfg.min_data_completeness), 'confidence': confidence >= cfg.min_execution_confidence or (not independent_price_ok and projected_confidence >= cfg.min_execution_confidence)}
-        failure_labels = {'technical': 'TECHNICAL_TRIGGER_OR_DISTANCE', 'risk': 'RISK_LEVELS_OR_SIZING', 'context': 'CRITICAL_CONTEXT', 'portfolio': 'PORTFOLIO_BUDGET', 'fundamental': 'FUNDAMENTAL_COVERAGE', 'live_daily': 'DAILY_SOURCE_NOT_LIVE', 'independent_price': 'INDEPENDENT_PRICE_REQUIRED', 'completeness': 'DATA_COMPLETENESS', 'confidence': 'EXECUTION_CONFIDENCE'}
+        gate_checks = {'technical': technical_ready, 'risk': risk_conf == 100.0, 'context': not bool(critical), 'portfolio': portfolio_ok, 'fundamental_safety': direct_fundamental_ok, 'live_daily': direct_daily_source_ok, 'independent_price': independent_price_ok, 'completeness': completeness >= cfg.min_data_completeness or (not independent_price_ok and projected_completeness >= cfg.min_data_completeness), 'confidence': confidence >= cfg.min_execution_confidence or (not independent_price_ok and projected_confidence >= cfg.min_execution_confidence)}
+        failure_labels = {'technical': 'TECHNICAL_TRIGGER_OR_DISTANCE', 'risk': 'RISK_LEVELS_OR_SIZING', 'context': 'CRITICAL_CONTEXT', 'portfolio': 'PORTFOLIO_BUDGET', 'fundamental_safety': 'FUNDAMENTAL_DISTRESS', 'live_daily': 'DAILY_SOURCE_NOT_LIVE', 'independent_price': 'INDEPENDENT_PRICE_REQUIRED', 'completeness': 'DATA_COMPLETENESS', 'confidence': 'EXECUTION_CONFIDENCE'}
         failures = [failure_labels[name] for name, passed in gate_checks.items() if not passed]
         out.at[idx, 'execution_gate_failures'] = ' | '.join(failures)
         out.at[idx, 'primary_execution_blocker'] = failures[0] if failures else 'NONE'
@@ -11350,9 +11413,8 @@ def _autopilot_gate_evaluation(
             not _truthy(row.get('validation_critical_blocker', False))
             and (validation_score >= cfg.min_autopilot_validation_score or validation_tier in {'USABLE', 'ROBUST'})
         ),
-        'FUNDAMENTAL_COVERAGE': bool(
+        'FUNDAMENTAL_SAFETY': bool(
             not _truthy(row.get('fundamental_critical_blocker', False))
-            and fundamental_coverage >= cfg.min_direct_fundamental_coverage
         ),
         'PORTFOLIO_BUDGET': budget_ok,
         'ORDER_SEMANTICS': _autopilot_order_is_valid(row, semantics),
@@ -11442,9 +11504,8 @@ def _signal_first_execution_evaluation(
             not _truthy(row.get('validation_critical_blocker', False))
             and (validation_score >= cfg.min_autopilot_validation_score or validation_tier in {'USABLE', 'ROBUST'})
         ),
-        'FUNDAMENTAL_COVERAGE': bool(
+        'FUNDAMENTAL_SAFETY': bool(
             not _truthy(row.get('fundamental_critical_blocker', False))
-            and fundamental_coverage >= cfg.min_direct_fundamental_coverage
         ),
         'MATERIAL_NEWS': not _truthy(row.get('news_critical_blocker', False)),
         'ORDER_SEMANTICS': _autopilot_order_is_valid(row, semantics),
