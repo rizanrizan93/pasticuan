@@ -13,6 +13,7 @@ from tools.phase5_6_bounded_live_validation import (
     COHORT,
     FOREIGN_FLOW_ATTEMPT_CAP,
     FOREIGN_FLOW_FAMILY,
+    FOREIGN_FLOW_MAX_LENGTH,
     FOREIGN_SPEC,
     STOCK_SUMMARY_ATTEMPT_CAP,
     STOCK_SUMMARY_FAMILY,
@@ -131,22 +132,24 @@ def stock_payload():
     }
 
 
-def foreign_payload(*, total=None, rows=None):
-    values = rows if rows is not None else [
-        {
-            "code": ticker,
-            "date": DAY.isoformat(),
-            "foreignBuyShares": 1000 + index,
-            "foreignSellShares": 700 + index,
-            "netForeignShares": 300,
-            "volume": 10000 + index,
-            "value": 1000000 + index,
-        }
-        for index, ticker in enumerate(COHORT)
-    ]
+def foreign_row(ticker, *, target_date=DAY):
+    index = COHORT.index(ticker)
+    return {
+        "code": ticker,
+        "date": target_date.isoformat(),
+        "foreignBuyShares": 1000 + index,
+        "foreignSellShares": 700 + index,
+        "netForeignShares": 300,
+        "volume": 10000 + index,
+        "value": 1000000 + index,
+    }
+
+
+def foreign_payload(*, total=None, rows=None, target_date=DAY):
+    values = rows if rows is not None else [foreign_row(ticker, target_date=target_date) for ticker in COHORT]
     return {
         "data": {
-            "date": DAY.isoformat(),
+            "date": target_date.isoformat(),
             "recordsTotal": len(values) if total is None else total,
             "data": values,
         }
@@ -250,44 +253,112 @@ def test_redirect_is_not_followed_or_accepted_as_valid_evidence():
     assert ledger.entries[0]["result"] == "HTTP_302"
 
 
-def test_foreign_flow_is_one_session_and_at_most_two_attempts():
-    assert FOREIGN_FLOW_ATTEMPT_CAP == 2
+def test_foreign_flow_bulk_first_all_cohort_needs_no_delta_or_full_market_completion():
+    assert FOREIGN_FLOW_ATTEMPT_CAP == 6
+    assert FOREIGN_FLOW_MAX_LENGTH == 200
     ledger = RequestLedger("EMIR", 1, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
-    session = FakeSession([FakeResponse(foreign_payload())])
+    session = FakeSession([FakeResponse(foreign_payload(total=1000))])
     rows = fetch_foreign_flow(BoundedZapiTransport("fake", ledger, session=session), DAY)
     assert {row["ticker"] for row in rows} == set(COHORT)
     assert ledger.attempts == 1
-    assert {call[2]["params"]["date"] for call in session.calls} == {DAY.isoformat()}
-    assert all("session" not in call[2]["params"] for call in session.calls)
+    assert session.calls[0][2]["params"] == {
+        "date": DAY.isoformat(), "length": 200, "start": 0, "sort": "code",
+    }
 
 
-def test_foreign_flow_refuses_third_page_without_hidden_retry():
-    filler = [{"code": "OTHER", "date": DAY.isoformat()} for _ in range(1000)]
-    ledger = RequestLedger("EMIR", 1, {FOREIGN_FLOW_FAMILY: 2})
+def test_foreign_flow_missing_one_uses_exactly_one_delta_and_never_duplicates_bulk_ticker():
+    bulk_rows = [foreign_row(ticker) for ticker in COHORT if ticker != "TLKM"]
+    ledger = RequestLedger("EMIR", 1, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
     session = FakeSession([
-        FakeResponse(foreign_payload(total=3000, rows=filler)),
-        FakeResponse(foreign_payload(total=3000, rows=filler)),
-    ])
-    with pytest.raises(GateFailure, match="ZAPI_CIRCUIT_BREAKER"):
-        fetch_foreign_flow(BoundedZapiTransport("fake", ledger, session=session), DAY)
-    assert len(session.calls) == 2 and ledger.attempts == 2
-
-
-def test_foreign_flow_allows_exactly_two_bounded_pages_for_one_date():
-    all_rows = foreign_payload()["data"]["data"]
-    ledger = RequestLedger("EMIR", 1, {FOREIGN_FLOW_FAMILY: 2})
-    session = FakeSession([
-        FakeResponse(foreign_payload(total=5, rows=all_rows[:2])),
-        FakeResponse(foreign_payload(total=5, rows=all_rows[2:])),
+        FakeResponse(foreign_payload(total=900, rows=bulk_rows)),
+        FakeResponse(foreign_payload(rows=[foreign_row("TLKM")])),
     ])
     rows = fetch_foreign_flow(BoundedZapiTransport("fake", ledger, session=session), DAY)
     assert {row["ticker"] for row in rows} == set(COHORT)
     assert ledger.attempts == 2
-    assert [call[2]["params"]["start"] for call in session.calls] == [0, 2]
+    assert "code" not in session.calls[0][2]["params"]
+    assert [call[2]["params"].get("code") for call in session.calls[1:]] == ["TLKM"]
+
+
+def test_foreign_flow_missing_multiple_requests_only_missing_tickers_for_one_session():
+    present = {"ASII", "BBRI", "TLKM"}
+    bulk_rows = [foreign_row(ticker) for ticker in COHORT if ticker in present]
+    ledger = RequestLedger("EMIR", 1, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
+    session = FakeSession([
+        FakeResponse(foreign_payload(total=900, rows=bulk_rows)),
+        FakeResponse(foreign_payload(rows=[foreign_row("BBCA")])),
+        FakeResponse(foreign_payload(rows=[foreign_row("BMRI")])),
+    ])
+    rows = fetch_foreign_flow(BoundedZapiTransport("fake", ledger, session=session), DAY)
+    assert {row["ticker"] for row in rows} == set(COHORT)
+    assert [call[2]["params"].get("code") for call in session.calls] == [None, "BBCA", "BMRI"]
+    assert {call[2]["params"]["date"] for call in session.calls} == {DAY.isoformat()}
+    assert all(call[2]["params"]["start"] == 0 for call in session.calls)
+    assert all(call[2]["params"]["length"] <= 200 for call in session.calls)
+    assert all(call[2]["params"]["sort"] == "code" for call in session.calls)
+
+
+def test_foreign_flow_incomplete_bounded_result_fails_closed_after_six_attempts():
+    ledger = RequestLedger("EMIR", 2, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
+    session = FakeSession([FakeResponse(foreign_payload(rows=[])) for _ in range(6)])
+    with pytest.raises(GateFailure, match="INSUFFICIENT_HISTORY"):
+        fetch_foreign_flow(BoundedZapiTransport("fake", ledger, session=session), DAY)
+    assert len(session.calls) == 6
+    assert ledger.attempts == 6
+    assert ledger.declared_cumulative_after == 8
+    assert [call[2]["params"].get("code") for call in session.calls] == [None, *COHORT]
+    assert all(call[2]["params"]["length"] <= FOREIGN_FLOW_MAX_LENGTH for call in session.calls)
+
+
+def test_foreign_flow_seventh_attempt_is_refused_before_transport():
+    ledger = RequestLedger("EMIR", 0, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
+    session = FakeSession([FakeResponse(foreign_payload()) for _ in range(7)])
+    transport = BoundedZapiTransport("fake", ledger, session=session)
+    params = {"date": DAY.isoformat(), "length": 200, "start": 0, "sort": "code"}
+    for _ in range(6):
+        transport.get_json(FOREIGN_FLOW_FAMILY, "https://example.invalid/foreign-flow", params=params)
+    with pytest.raises(GateFailure, match="ZAPI_CIRCUIT_BREAKER"):
+        transport.get_json(FOREIGN_FLOW_FAMILY, "https://example.invalid/foreign-flow", params=params)
+    assert len(session.calls) == 6
+    assert ledger.attempts == 6 and ledger.refused_attempts == 1
+
+
+def test_foreign_flow_delta_wrong_ticker_fails_closed():
+    bulk_rows = [foreign_row(ticker) for ticker in COHORT if ticker != "TLKM"]
+    ledger = RequestLedger("EMIR", 0, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
+    session = FakeSession([
+        FakeResponse(foreign_payload(rows=bulk_rows)),
+        FakeResponse(foreign_payload(rows=[foreign_row("BMRI")])),
+    ])
+    with pytest.raises(GateFailure, match="TICKER_MISMATCH"):
+        fetch_foreign_flow(BoundedZapiTransport("fake", ledger, session=session), DAY)
+    assert session.calls[1][2]["params"]["code"] == "TLKM"
+
+
+def test_foreign_flow_missing_factual_value_is_not_coerced_to_zero():
+    bulk_rows = [foreign_row(ticker) for ticker in COHORT if ticker != "TLKM"]
+    malformed_delta = foreign_row("TLKM")
+    malformed_delta.pop("netForeignShares")
+    ledger = RequestLedger("EMIR", 0, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
+    session = FakeSession([
+        FakeResponse(foreign_payload(rows=bulk_rows)),
+        FakeResponse(foreign_payload(rows=[malformed_delta])),
+    ])
+    with pytest.raises(GateFailure, match="PARSE_FAILURE"):
+        fetch_foreign_flow(BoundedZapiTransport("fake", ledger, session=session), DAY)
+
+
+def test_foreign_flow_redirect_is_disabled_and_fails_closed():
+    ledger = RequestLedger("EMIR", 0, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
+    session = FakeSession([FakeResponse(foreign_payload(), status_code=302)])
+    with pytest.raises(GateFailure, match="CONTEXT_REJECTED"):
+        fetch_foreign_flow(BoundedZapiTransport("fake", ledger, session=session), DAY)
+    assert len(session.calls) == 1
+    assert session.calls[0][2]["allow_redirects"] is False
 
 
 def test_malformed_provider_payload_fails_closed():
-    ledger = RequestLedger("EMIR", 0, {FOREIGN_FLOW_FAMILY: 2})
+    ledger = RequestLedger("EMIR", 0, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
     session = FakeSession([
         FakeResponse({"data": {"date": DAY.isoformat(), "data": {"malformed": True}}})
     ])
@@ -306,7 +377,7 @@ def test_wrong_date_session_is_rejected():
     payload["data"]["date"] = wrong_day.isoformat()
     for row in payload["data"]["data"]:
         row["date"] = wrong_day.isoformat()
-    ledger = RequestLedger("EMIR", 0, {FOREIGN_FLOW_FAMILY: 2})
+    ledger = RequestLedger("EMIR", 0, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
     session = FakeSession([FakeResponse(payload)])
 
     with pytest.raises(GateFailure, match="WRONG_PERIOD"):
@@ -457,9 +528,9 @@ def test_three_run_state_machine_proves_two_family_reuse(monkeypatch):
 
 
 def test_ledger_is_deterministic_and_machine_readable():
-    first = RequestLedger("EMIR", 1, {FOREIGN_FLOW_FAMILY: 2})
-    second = RequestLedger("EMIR", 1, {FOREIGN_FLOW_FAMILY: 2})
-    params = {"date": DAY.isoformat(), "length": 1000, "start": 0}
+    first = RequestLedger("EMIR", 1, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
+    second = RequestLedger("EMIR", 1, {FOREIGN_FLOW_FAMILY: FOREIGN_FLOW_ATTEMPT_CAP})
+    params = {"date": DAY.isoformat(), "length": 200, "start": 0, "sort": "code"}
     for ledger in (first, second):
         index = ledger.before_attempt(FOREIGN_FLOW_FAMILY, "/foreign-flow", params)
         ledger.finish_attempt(index, "HTTP_200")

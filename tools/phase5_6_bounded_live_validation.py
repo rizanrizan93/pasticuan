@@ -38,7 +38,8 @@ GATE_BRANCH = "gate/phase5-6-bounded-live-validation"
 GLOBAL_ZAPI_ATTEMPT_LIMIT = 12
 SHARED_EVIDENCE_PROJECT_REF = "mbtsvflwszcgdtijdgas"
 STOCK_SUMMARY_ATTEMPT_CAP = 1
-FOREIGN_FLOW_ATTEMPT_CAP = 2
+FOREIGN_FLOW_ATTEMPT_CAP = 6
+FOREIGN_FLOW_MAX_LENGTH = 200
 COHORT = ("ASII", "BBCA", "BBRI", "BMRI", "TLKM")
 PROVIDER = "ZAPI"
 STOCK_SUMMARY_FAMILY = "STOCK_SUMMARY"
@@ -159,6 +160,7 @@ class RequestLedger:
             "trade_date": str(params.get("date") or ""),
             "start": int(params.get("start") or 0),
             "length": int(params.get("length") or 0),
+            "code": str(params.get("code") or "").strip().upper(),
             "result": "ATTEMPTED",
         }
         self.entries.append(entry)
@@ -515,31 +517,43 @@ def fetch_stock_summary(
 def _foreign_page_rows(
     payload: Mapping[str, Any],
     target_date: date,
-) -> tuple[list[dict[str, Any]], int, int]:
+    *,
+    requested_ticker: str | None = None,
+) -> list[dict[str, Any]]:
     root = _unwrap(payload)
     raw = root.get("data")
     if not isinstance(raw, list):
         raise GateFailure("PARSE_FAILURE")
-    root_date = _date_value(root.get("date") or root.get("Date"))
+    root_date_value = root.get("date") or root.get("Date")
+    root_date = _date_value(root_date_value)
+    if root_date_value and root_date is None:
+        raise GateFailure("PARSE_FAILURE")
     if root_date is not None and root_date != target_date:
         raise GateFailure("WRONG_PERIOD")
-    total_candidates = (root.get("total"), root.get("recordsFiltered"), root.get("recordsTotal"))
-    total = next((int(value) for value in total_candidates if str(value or "").isdigit()), len(raw))
+    expected = str(requested_ticker or "").strip().upper().removesuffix(".JK")
     rows: list[dict[str, Any]] = []
     for item in raw:
         if not isinstance(item, Mapping):
-            continue
+            raise GateFailure("PARSE_FAILURE")
         ticker = str(item.get("code") or item.get("StockCode") or "").strip().upper().removesuffix(".JK")
+        if not ticker:
+            raise GateFailure("PARSE_FAILURE")
+        item_date_value = item.get("date") or item.get("Date")
+        item_date = _date_value(item_date_value)
+        if item_date_value and item_date is None:
+            raise GateFailure("PARSE_FAILURE")
+        item_date = item_date or root_date
+        if item_date is None or item_date != target_date:
+            raise GateFailure("WRONG_PERIOD")
+        if expected and ticker != expected:
+            raise GateFailure("TICKER_MISMATCH")
         if ticker not in COHORT:
             continue
-        item_date = _date_value(item.get("date") or item.get("Date")) or root_date or target_date
-        if item_date != target_date:
-            raise GateFailure("WRONG_PERIOD")
         buy = _number(item.get("foreignBuyShares"))
         sell = _number(item.get("foreignSellShares"))
         net = _number(item.get("netForeignShares"))
-        if net is None and buy is not None and sell is not None:
-            net = buy - sell
+        if buy is None or sell is None or net is None:
+            raise GateFailure("PARSE_FAILURE")
         rows.append(
             {
                 "provider": PROVIDER,
@@ -561,34 +575,55 @@ def _foreign_page_rows(
                 "validation_state": "VALID",
             }
         )
-    return rows, len(raw), max(total, len(raw))
+    return rows
 
 
 def fetch_foreign_flow(
     transport: ProviderTransport,
     target_date: date,
 ) -> list[dict[str, Any]]:
-    page_size = 1000
-    start = 0
-    rows: list[dict[str, Any]] = []
-    complete = False
-    for _ in range(FOREIGN_FLOW_ATTEMPT_CAP):
+    common_params = {
+        "date": target_date.isoformat(),
+        "length": FOREIGN_FLOW_MAX_LENGTH,
+        "start": 0,
+        "sort": "code",
+    }
+    bulk_payload = transport.get_json(
+        FOREIGN_FLOW_FAMILY,
+        FOREIGN_FLOW_URL,
+        params=common_params,
+    )
+    rows_by_ticker: dict[str, dict[str, Any]] = {}
+
+    def retain_unique(rows: Iterable[dict[str, Any]]) -> None:
+        for row in rows:
+            ticker = row["ticker"]
+            if ticker in rows_by_ticker:
+                raise GateFailure("PARSE_FAILURE")
+            rows_by_ticker[ticker] = row
+
+    retain_unique(_foreign_page_rows(bulk_payload, target_date))
+    for ticker in COHORT:
+        if ticker in rows_by_ticker:
+            continue
         payload = transport.get_json(
             FOREIGN_FLOW_FAMILY,
             FOREIGN_FLOW_URL,
-            params={"date": target_date.isoformat(), "length": page_size, "start": start},
+            params={**common_params, "length": 1, "code": ticker},
         )
-        page, returned, total = _foreign_page_rows(payload, target_date)
-        rows.extend(page)
-        if returned == 0 or start + returned >= total:
-            complete = True
+        delta_rows = _foreign_page_rows(
+            payload,
+            target_date,
+            requested_ticker=ticker,
+        )
+        if len(delta_rows) > 1:
+            raise GateFailure("PARSE_FAILURE")
+        retain_unique(delta_rows)
+        if len(rows_by_ticker) == len(COHORT):
             break
-        start += returned
-    if not complete:
-        raise GateFailure("ZAPI_CIRCUIT_BREAKER")
-    tickers = [row["ticker"] for row in rows]
-    if len(tickers) != len(set(tickers)):
-        raise GateFailure("PARSE_FAILURE")
+    rows = [rows_by_ticker[ticker] for ticker in COHORT if ticker in rows_by_ticker]
+    if len(rows) != len(COHORT):
+        raise GateFailure("INSUFFICIENT_HISTORY")
     canonical = [
         {name: value for name, value in row.items() if name not in {"payload_hash", "fetched_at"}}
         for row in sorted(rows, key=lambda value: value["ticker"])
