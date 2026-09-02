@@ -11,7 +11,9 @@ import requests
 from shared_capital_action_evidence import (
     FEEDS,
     ISSUED_HISTORY_LENGTH,
+    MAX_PAGES_PER_RUN,
     PAGE_LENGTH,
+    REQUEST_TIMEOUT_SECONDS,
     SharedCapitalActionEvidence,
     normalize_capital_actions,
     validate_capital_action_rows,
@@ -388,3 +390,91 @@ def test_migration_contract_and_module_remain_scanner_neutral() -> None:
     assert "enable row level security" in migration
     lowered = module.lower()
     assert "score" not in lowered and "ranking" not in lowered and "production_gate" not in lowered
+
+
+def test_request_is_bounded_and_redirects_are_disabled() -> None:
+    session = Session([Response(_issued_payload([_issued()]))])
+    rows, meta = _producer(MemoryBackend(), session).get_issued_history(OBSERVED)
+    assert rows and meta["state"] == "REFRESHED"
+    call = session.calls[0]
+    assert call["timeout"] == REQUEST_TIMEOUT_SECONDS
+    assert call["allow_redirects"] is False
+    assert call["headers"]["User-Agent"] == "Shared-IDX-Evidence-Hub/capital-actions"
+
+
+def test_redirect_response_is_rejected_and_attempt_is_counted() -> None:
+    rows, meta = _producer(MemoryBackend(), Session([Response(status=302)])).get_issued_history(OBSERVED)
+    assert not rows
+    assert meta["state"] == "CONTEXT_REJECTED"
+    assert meta["api_calls"] == 1
+
+
+def test_page_budget_exhaustion_never_persists_partial_month() -> None:
+    backend = MemoryBackend()
+    item = {
+        "id": "rights-1",
+        "code": "BBRI",
+        "eventDate": "2026-08-20",
+        "publicationDate": "2026-08-05",
+        "ratioBefore": 4,
+        "ratioAfter": 1,
+    }
+    session = Session([Response(_monthly("rights-offerings", [item], has_more=True))])
+    rows, meta = _producer(backend, session).get_month(
+        2026, 8, feed="rights-offerings", observed_on=OBSERVED, max_pages=1
+    )
+    assert not rows and backend.rows == []
+    assert meta["state"] == "CONTEXT_REJECTED"
+    assert meta["page_budget"] == 1 and meta["api_calls"] == 1
+    assert meta["bounded_complete"] is False
+
+
+def test_empty_page_with_has_more_is_parse_failure_not_partial_success() -> None:
+    backend = MemoryBackend()
+    session = Session([Response(_monthly("rights-offerings", [], total=2, has_more=True))])
+    rows, meta = _producer(backend, session).get_month(
+        2026, 8, feed="rights-offerings", observed_on=OBSERVED, max_pages=1
+    )
+    assert not rows and backend.rows == []
+    assert meta["state"] == "PARSE_FAILURE"
+    assert meta["api_calls"] == 1
+
+
+def test_conflicting_explicit_event_dates_fail_closed() -> None:
+    item = _issued(effectiveDate="2026-08-13")
+    with pytest.raises(RuntimeError, match="CONTEXT_REJECTED"):
+        normalize_capital_actions(
+            [item], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+        )
+
+
+def test_free_text_action_does_not_refine_event_identity_by_substring() -> None:
+    item = {
+        "id": "split-free-text",
+        "code": "BBCA",
+        "effectiveDate": "2026-08-10",
+        "action": "Proposed Reverse Stock Split Plan",
+    }
+    row = normalize_capital_actions(
+        [item], feed="stock-splits", source_period=PERIOD, observed_on=OBSERVED
+    )[0]
+    assert row["event_type"] == "STOCK_SPLIT"
+
+
+def test_validation_rejects_nonofficial_source_url_and_future_publication_date() -> None:
+    row = normalize_capital_actions(
+        [_issued()], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    )[0]
+    bad_url = dict(row, source_url="https://evil.example/action")
+    assert validate_capital_action_rows(
+        [bad_url], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    )[1] == "CONTEXT_REJECTED"
+
+    future_publication = dict(row, publication_date="2026-09-02")
+    assert validate_capital_action_rows(
+        [future_publication], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    )[1] == "WRONG_PERIOD"
+
+
+def test_default_page_budget_is_bounded() -> None:
+    assert 1 <= MAX_PAGES_PER_RUN <= 10
