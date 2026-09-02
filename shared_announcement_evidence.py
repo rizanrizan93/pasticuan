@@ -31,6 +31,9 @@ ZAPI_ANNOUNCEMENTS_URL = "https://api.zpi.web.id/v1/finance:idx/announcements"
 ZAPI_PRESS_RELEASE_URL = "https://api.zpi.web.id/v1/finance:idx/press-release"
 TABLE = "evidence_announcements"
 PAGE_LENGTH = 100
+MAX_PAGES_PER_RUN = 5
+REQUEST_TIMEOUT_SECONDS = 20
+JAKARTA_TZ = timezone(timedelta(hours=7))
 CONFIRMATION_STATE = "METADATA_ONLY_NOT_DOCUMENT_CONFIRMED"
 
 FEEDS: dict[str, dict[str, str]] = {
@@ -78,7 +81,11 @@ def _timestamp(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone(timedelta(hours=7)))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=JAKARTA_TZ)
+
+
+def _publication_day(value: datetime) -> date:
+    return value.astimezone(JAKARTA_TZ).date()
 
 
 def _official_idx_url(value: Any) -> bool:
@@ -138,7 +145,7 @@ def normalize_feed_items(
         published_at = _timestamp(item.get("publishedAt"))
         if published_at is None:
             continue
-        if published_at.date() != publication_date:
+        if _publication_day(published_at) != publication_date:
             continue
         raw_id = _clean(item.get("id"))
         title = _clean(item.get("title"))
@@ -188,7 +195,7 @@ def normalize_feed_items(
             "subject": canonical["subject"] or None,
             "summary": canonical["summary"] or None,
             # Never substitute createdAt/publishedAt for the underlying event date.
-            "event_date": explicit_event_at.date().isoformat() if explicit_event_at else None,
+            "event_date": _publication_day(explicit_event_at).isoformat() if explicit_event_at else None,
             "event_at": canonical["event_at"],
             "publication_date": publication_date.isoformat(),
             "published_at": canonical["published_at"],
@@ -269,14 +276,24 @@ class SharedAnnouncementEvidence:
             params["locale"] = "id"
         try:
             response = self.session.request(
-                "GET", FEEDS[feed]["url"], params=params,
-                headers={"Accept": "application/json", "x-api-key": self.api_key}, timeout=30,
+                "GET",
+                FEEDS[feed]["url"],
+                params=params,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Shared-IDX-Evidence-Hub/announcement-metadata",
+                    "x-api-key": self.api_key,
+                },
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                allow_redirects=False,
             )
         except requests.Timeout as exc:
             raise RuntimeError(MissingReason.TIMEOUT.value) from exc
         except requests.ConnectionError as exc:
             raise RuntimeError(MissingReason.CONNECTION_ERROR.value) from exc
         status = int(getattr(response, "status_code", 0) or 0)
+        if 300 <= status < 400:
+            raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
         if status in {401, 403, 404, 429}:
             raise RuntimeError(f"HTTP_{status}")
         if not 200 <= status < 300:
@@ -289,13 +306,25 @@ class SharedAnnouncementEvidence:
             raise RuntimeError(MissingReason.PARSE_FAILURE.value) from exc
 
     def get_day(
-        self, publication_date: date, *, feed: str = "announcements", max_pages: int = 10
+        self,
+        publication_date: date,
+        *,
+        feed: str = "announcements",
+        max_pages: int = MAX_PAGES_PER_RUN,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if feed not in FEEDS:
             return [], {"state": MissingReason.CONTEXT_REJECTED.value, "api_calls": 0}
         if not self.ready:
             return [], {"state": MissingReason.ENVIRONMENT_BLOCKED.value, "api_calls": 0}
-        meta: dict[str, Any] = {"api_calls": 0, "pages": 0, "feed": feed, "attachment_calls": 0}
+        page_budget = min(MAX_PAGES_PER_RUN, max(1, int(max_pages)))
+        meta: dict[str, Any] = {
+            "api_calls": 0,
+            "pages": 0,
+            "feed": feed,
+            "attachment_calls": 0,
+            "page_budget": page_budget,
+            "bounded_complete": False,
+        }
 
         def read_current() -> list[dict[str, Any]]:
             return self.backend.read_rows(
@@ -308,15 +337,37 @@ class SharedAnnouncementEvidence:
             if not self.api_key:
                 raise RuntimeError(MissingReason.ENVIRONMENT_BLOCKED.value)
             all_items: list[Mapping[str, Any]] = []
-            for page in range(1, max(1, int(max_pages)) + 1):
-                payload = self._request_page(feed, page)
+            bounded_complete = False
+            for page in range(1, page_budget + 1):
+                # Count attempted provider requests, including timeout/HTTP failure.
                 meta["api_calls"] += 1
+                payload = self._request_page(feed, page)
                 meta["pages"] = page
                 items, has_more = _feed_rows(payload, feed=feed)
+                if items:
+                    stamps = [_timestamp(item.get("publishedAt")) for item in items]
+                    if any(stamp is None for stamp in stamps):
+                        raise RuntimeError(MissingReason.PARSE_FAILURE.value)
+                    observed = [_publication_day(stamp) for stamp in stamps if stamp is not None]
+                else:
+                    observed = []
                 all_items.extend(items)
-                observed = [stamp.date() for stamp in (_timestamp(item.get("publishedAt")) for item in items) if stamp]
-                if not has_more or not items or (observed and min(observed) < publication_date):
+
+                if not has_more:
+                    bounded_complete = True
                     break
+                if not items:
+                    raise RuntimeError(MissingReason.PARSE_FAILURE.value)
+                if observed and min(observed) < publication_date:
+                    bounded_complete = True
+                    break
+
+            if not bounded_complete:
+                # The page budget ended before the feed crossed the target day.
+                # Persisting would silently create partial-day evidence.
+                raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
+            meta["bounded_complete"] = True
+
             rows = normalize_feed_items(all_items, feed=feed, publication_date=publication_date)
             if not rows:
                 raise RuntimeError(MissingReason.NO_REPORT.value)
@@ -351,6 +402,8 @@ __all__ = [
     "CONFIRMATION_STATE",
     "FEEDS",
     "PAGE_LENGTH",
+    "MAX_PAGES_PER_RUN",
+    "REQUEST_TIMEOUT_SECONDS",
     "SharedAnnouncementEvidence",
     "ZAPI_ANNOUNCEMENTS_URL",
     "ZAPI_PRESS_RELEASE_URL",
