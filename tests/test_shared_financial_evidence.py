@@ -337,38 +337,38 @@ def test_missing_key_on_cache_miss_makes_no_request() -> None:
 @pytest.mark.parametrize(
     "status,reason",
     [
-        (401, "ZAPI_MANIFEST_HTTP_401"),
-        (403, "ZAPI_MANIFEST_HTTP_403"),
-        (404, "ZAPI_MANIFEST_HTTP_404"),
-        (429, "ZAPI_MANIFEST_HTTP_429"),
+        (401, "HTTP_401"),
+        (403, "HTTP_403"),
+        (404, "HTTP_404"),
+        (429, "HTTP_429"),
     ],
 )
 def test_discovery_http_failures_are_explicit(status: int, reason: str) -> None:
     rows, meta = _producer(MemoryBackend(), Session([Response(status=status)])).get_period("TEST", 2026, "tw1")
     assert not rows and meta["state"] == reason
+    assert meta["failure_stage"] == "ZAPI_MANIFEST"
 
 
 @pytest.mark.parametrize(
     "outcome,reason",
     [
-        (requests.Timeout("slow"), "ZAPI_MANIFEST_TIMEOUT"),
-        (requests.ConnectionError("offline"), "ZAPI_MANIFEST_CONNECTION_ERROR"),
+        (requests.Timeout("slow"), "TIMEOUT"),
+        (requests.ConnectionError("offline"), "CONNECTION_ERROR"),
     ],
 )
 def test_network_failures_are_explicit(outcome: Exception, reason: str) -> None:
     rows, meta = _producer(MemoryBackend(), Session([outcome])).get_period("TEST", 2026, "tw1")
     assert not rows and meta["state"] == reason
-
-
+    assert meta["failure_stage"] == "ZAPI_MANIFEST"
 
 
 @pytest.mark.parametrize(
     "status,reason",
     [
-        (401, "OFFICIAL_ATTACHMENT_HTTP_401"),
-        (403, "OFFICIAL_ATTACHMENT_HTTP_403"),
-        (404, "OFFICIAL_ATTACHMENT_HTTP_404"),
-        (429, "OFFICIAL_ATTACHMENT_HTTP_429"),
+        (401, "HTTP_401"),
+        (403, "HTTP_403"),
+        (404, "HTTP_404"),
+        (429, "HTTP_429"),
     ],
 )
 def test_attachment_http_failures_are_stage_specific(status: int, reason: str) -> None:
@@ -378,6 +378,7 @@ def test_attachment_http_failures_are_stage_specific(status: int, reason: str) -
     ])
     rows, meta = _producer(MemoryBackend(), session).get_period("TEST", 2026, "tw1")
     assert not rows and meta["state"] == reason
+    assert meta["failure_stage"] == "OFFICIAL_ATTACHMENT"
     assert meta["api_calls"] == 1 and meta["attachment_calls"] == 1
 
 
@@ -387,7 +388,8 @@ def test_attachment_redirect_is_blocked() -> None:
         Response(status=302, url=OFFICIAL_URL),
     ])
     rows, meta = _producer(MemoryBackend(), session).get_period("TEST", 2026, "tw1")
-    assert not rows and meta["state"] == "OFFICIAL_ATTACHMENT_REDIRECT_BLOCKED"
+    assert not rows and meta["state"] == "CONTEXT_REJECTED"
+    assert meta["failure_stage"] == "OFFICIAL_ATTACHMENT"
     assert session.calls[-1]["allow_redirects"] is False
 
 
