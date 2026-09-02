@@ -367,9 +367,11 @@ def test_bad_responses_fail_closed(response: Response, reason: str) -> None:
     assert not rows and meta["state"] == reason
 
 
-def test_empty_valid_feed_is_explicit_no_report() -> None:
+def test_empty_valid_feed_is_explicit_valid_empty() -> None:
     rows, meta = _producer(MemoryBackend(), Session([Response(_issued_payload([]))])).get_issued_history(OBSERVED)
-    assert not rows and meta["state"] == "NO_REPORT"
+    assert not rows and meta["state"] == "REFRESHED_EMPTY"
+    assert meta["bounded_complete"] is True
+    assert meta["provider_rows"] == 0
 
 
 def test_invalid_feed_and_month_make_no_request() -> None:
