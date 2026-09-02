@@ -10,7 +10,9 @@ import requests
 
 from shared_announcement_evidence import (
     CONFIRMATION_STATE,
+    MAX_PAGES_PER_RUN,
     PAGE_LENGTH,
+    REQUEST_TIMEOUT_SECONDS,
     SharedAnnouncementEvidence,
     ZAPI_ANNOUNCEMENTS_URL,
     ZAPI_PRESS_RELEASE_URL,
@@ -210,6 +212,10 @@ def test_global_pipeline_uses_one_feed_call_not_per_ticker() -> None:
     assert len(session.calls) == 1 and meta["api_calls"] == 1 and meta["attachment_calls"] == 0
     assert session.calls[0]["url"] == ZAPI_ANNOUNCEMENTS_URL
     assert session.calls[0]["params"] == {"page": 1, "length": PAGE_LENGTH, "locale": "id"}
+    assert session.calls[0]["allow_redirects"] is False
+    assert session.calls[0]["timeout"] == REQUEST_TIMEOUT_SECONDS
+    assert session.calls[0]["headers"]["User-Agent"] == "Shared-IDX-Evidence-Hub/announcement-metadata"
+    assert meta["page_budget"] == MAX_PAGES_PER_RUN and meta["bounded_complete"] is True
     assert "company-announcements" not in str(session.calls)
 
 
@@ -225,6 +231,39 @@ def test_incremental_pagination_stops_after_crossing_target_day() -> None:
         "IDX_ANNOUNCEMENTS:a", "IDX_ANNOUNCEMENTS:b", "IDX_ANNOUNCEMENTS:c",
     }
     assert meta["pages"] == 2 and meta["api_calls"] == 2
+
+
+def test_publication_day_is_normalized_to_idx_local_date() -> None:
+    row = normalize_feed_items(
+        [_announcement(published="2026-08-01T18:30:00Z")],
+        feed="announcements",
+        publication_date=DAY,
+    )[0]
+    assert row["publication_date"] == "2026-08-02"
+    assert row["published_at"].startswith("2026-08-01T18:30:00")
+
+
+def test_page_budget_exhaustion_rejects_partial_day() -> None:
+    page_one = _announcement_payload([_announcement(identity="a")], page=1, total=999)
+    page_two = _announcement_payload([_announcement(identity="b")], page=2, total=999)
+    backend = MemoryBackend()
+    rows, meta = _producer(
+        backend, Session([Response(page_one), Response(page_two)])
+    ).get_day(DAY, max_pages=2)
+    assert rows == []
+    assert backend.rows == []
+    assert meta["state"] == "CONTEXT_REJECTED"
+    assert meta["api_calls"] == 2
+    assert meta["bounded_complete"] is False
+
+
+def test_redirect_is_blocked_and_counted_as_attempted_request() -> None:
+    session = Session([Response(status=302)])
+    rows, meta = _producer(MemoryBackend(), session).get_day(DAY)
+    assert rows == []
+    assert meta["state"] == "CONTEXT_REJECTED"
+    assert meta["api_calls"] == 1
+    assert session.calls[0]["allow_redirects"] is False
 
 
 def test_press_release_pipeline_uses_global_press_feed() -> None:
@@ -256,7 +295,7 @@ def test_missing_key_on_cache_miss_makes_no_request() -> None:
 @pytest.mark.parametrize("status,reason", [(401, "HTTP_401"), (403, "HTTP_403"), (404, "HTTP_404"), (429, "HTTP_429")])
 def test_http_failures_are_explicit(status: int, reason: str) -> None:
     rows, meta = _producer(MemoryBackend(), Session([Response(status=status)])).get_day(DAY)
-    assert not rows and meta["state"] == reason
+    assert not rows and meta["state"] == reason and meta["api_calls"] == 1
 
 
 @pytest.mark.parametrize(
@@ -265,7 +304,7 @@ def test_http_failures_are_explicit(status: int, reason: str) -> None:
 )
 def test_network_failures_are_explicit(outcome: Exception, reason: str) -> None:
     rows, meta = _producer(MemoryBackend(), Session([outcome])).get_day(DAY)
-    assert not rows and meta["state"] == reason
+    assert not rows and meta["state"] == reason and meta["api_calls"] == 1
 
 
 @pytest.mark.parametrize(
