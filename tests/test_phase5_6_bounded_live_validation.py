@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,37 +16,69 @@ from tools.phase5_6_bounded_live_validation import (
     FOREIGN_FLOW_FAMILY,
     FOREIGN_FLOW_MAX_LENGTH,
     FOREIGN_SPEC,
+    OFFICIAL_DOWNLOAD_CAP,
+    OFFICIAL_HOSTS,
+    OFFICIAL_HTTP_CAP,
+    OFFICIAL_INDEX_URL,
+    PARTICIPANT_PROVENANCE,
+    PARTICIPANT_SOURCE,
+    PARTICIPANT_SPEC,
+    PARTICIPANT_TARGET_DATE,
     STOCK_SUMMARY_ATTEMPT_CAP,
     STOCK_SUMMARY_FAMILY,
     STOCK_SPEC,
+    BoundedOfficialTransport,
     BoundedZapiTransport,
+    DenyOfficialTransport,
     DenyZapiTransport,
     GateFailure,
+    OfficialRequestLedger,
     RequestLedger,
     cache_only_consume,
+    classify_participant_rows,
     classify_rows,
     credentials_from_environment,
+    discover_participant_url,
+    download_participant_file,
     ensure_scanner_neutral,
     execute_gate,
+    execute_participant_gate,
     facts_hash,
     fetch_foreign_flow,
     fetch_stock_summary,
+    parse_participant_rows,
     verify_delta_allowlist,
 )
 
 
 DAY = date(2026, 8, 31)
+PARTICIPANT_DAY = date(2026, 9, 1)
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "full-forward-coverage.yml"
 
 
 class FakeResponse:
-    def __init__(self, payload=None, status_code=200):
+    def __init__(
+        self,
+        payload=None,
+        status_code=200,
+        *,
+        content=b"",
+        text="",
+        content_type="application/json",
+    ):
         self._payload = payload if payload is not None else {}
         self.status_code = status_code
+        self.content = content
+        self.text = text or (content.decode("utf-8") if content else "")
+        self.headers = {"content-type": content_type, "content-length": str(len(content))}
+        self.closed = False
 
     def json(self):
         return self._payload
+
+    def close(self):
+        self.closed = True
 
 
 class FakeSession:
@@ -154,6 +187,32 @@ def foreign_payload(*, total=None, rows=None, target_date=DAY):
             "data": values,
         }
     }
+
+
+def participant_csv(*, target_date=PARTICIPANT_DAY, tickers=COHORT):
+    lines = ["asset|participant_buy|participant_sell|volume|value|tradingdate"]
+    for index, ticker in enumerate(tickers):
+        lines.append(
+            f"{ticker}|B{index:02d}|S{index:02d}|{100 + index}|{10000 + index}|{target_date.isoformat()}"
+        )
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def participant_url(target_date=PARTICIPANT_DAY):
+    return (
+        "https://www.idxdata3.co.id/IDX%20Reporting%20PSPP/Revitalisasi/PUBLIK/"
+        f"Trade-Detail-Publik_{target_date:%Y%m%d}.csv"
+    )
+
+
+def cached_participant_rows(body=None):
+    payload = body or participant_csv()
+    return parse_participant_rows(
+        payload,
+        PARTICIPANT_DAY,
+        participant_url(),
+        hashlib.sha256(payload).hexdigest(),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -543,3 +602,295 @@ def test_delta_contains_no_schema_acl_or_migration_file():
         path.startswith("database/") or path.endswith(".sql")
         for path in ALLOWED_DELTA_PATHS
     )
+
+
+def test_participant_workflow_selector_is_explicit_and_zapi_isolated():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "validation_family:" in text
+    assert "- zapi" in text and "- participant" in text
+    assert 'default: "2026-09-01"' in text
+    participant_step = text.split(
+        "- name: Execute bounded official participant state machine", 1
+    )[1]
+    assert "ZAPI_KEY" not in participant_step
+    assert "--validation-family participant" in participant_step
+    assert "--target-date" in participant_step
+
+
+def test_participant_target_is_exactly_one_explicit_session():
+    assert PARTICIPANT_TARGET_DATE == PARTICIPANT_DAY
+    body = participant_csv()
+    rows = parse_participant_rows(
+        body, PARTICIPANT_DAY, participant_url(), hashlib.sha256(body).hexdigest()
+    )
+    assert {row["trade_date"] for row in rows} == {"2026-09-01"}
+
+
+def test_official_host_allowlist_rejects_before_transport():
+    assert OFFICIAL_HOSTS == {"idxdata3.co.id", "www.idxdata3.co.id"}
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([])
+    transport = BoundedOfficialTransport(ledger, session=session)
+    with pytest.raises(GateFailure, match="CONTEXT_REJECTED"):
+        transport.request("https://example.invalid/file.csv", "DOWNLOAD", file_download=True)
+    assert session.calls == [] and ledger.entries == [] and ledger.downloads == 0
+
+
+def test_official_transport_disables_redirects_has_finite_timeout_and_no_retries():
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([
+        FakeResponse(status_code=302, content_type="text/plain"),
+    ])
+    transport = BoundedOfficialTransport(ledger, session=session, timeout_seconds=12)
+    with pytest.raises(GateFailure, match="HTTP_302"):
+        transport.request(OFFICIAL_INDEX_URL, "DIRECTORY_INDEX")
+    assert session.calls[0][2]["allow_redirects"] is False
+    assert session.calls[0][2]["timeout"] == 12
+    mounted = BoundedOfficialTransport(OfficialRequestLedger("P")).session.adapters
+    assert mounted["https://"].max_retries.total == 0
+
+
+def test_official_request_count_occurs_before_transport_and_sixth_is_refused():
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([
+        FakeResponse(text="index", content_type="text/plain") for _ in range(OFFICIAL_HTTP_CAP + 1)
+    ])
+    transport = BoundedOfficialTransport(ledger, session=session)
+    for _ in range(OFFICIAL_HTTP_CAP):
+        response = transport.request(OFFICIAL_INDEX_URL, "DIRECTORY_INDEX")
+        response.close()
+    with pytest.raises(GateFailure, match="OFFICIAL_HTTP_CIRCUIT_BREAKER"):
+        transport.request(OFFICIAL_INDEX_URL, "DIRECTORY_INDEX")
+    assert len(session.calls) == OFFICIAL_HTTP_CAP
+    assert len(ledger.entries) == OFFICIAL_HTTP_CAP and ledger.refused_attempts == 1
+
+
+def test_official_file_download_cap_refuses_second_before_transport():
+    assert OFFICIAL_DOWNLOAD_CAP == 1
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([
+        FakeResponse(content=b"first", content_type="text/csv"),
+        FakeResponse(content=b"second", content_type="text/csv"),
+    ])
+    transport = BoundedOfficialTransport(ledger, session=session)
+    transport.request(participant_url(), "DOWNLOAD", file_download=True).close()
+    with pytest.raises(GateFailure, match="OFFICIAL_DOWNLOAD_CIRCUIT_BREAKER"):
+        transport.request(participant_url(), "DOWNLOAD", file_download=True)
+    assert len(session.calls) == 1 and ledger.downloads == 1 and ledger.refused_downloads == 1
+
+
+def test_directory_index_discovery_and_single_download_success():
+    href = participant_url()
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([
+        FakeResponse(text=f'<a href="{href}">file</a>', content_type="text/plain"),
+        FakeResponse(content=participant_csv(), content_type="text/csv"),
+    ])
+    body, source_url, digest = download_participant_file(
+        BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
+    )
+    assert body == participant_csv() and source_url == href
+    assert digest == hashlib.sha256(body).hexdigest()
+    assert len(session.calls) == 2 and ledger.downloads == 1
+
+
+def test_documented_path_probe_success_within_five_request_envelope():
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([
+        FakeResponse(text="no matching link", content_type="text/plain"),
+        FakeResponse(status_code=404, content_type="text/csv"),
+        FakeResponse(content_type="text/csv"),
+    ])
+    found = discover_participant_url(
+        BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
+    )
+    assert found.startswith("https://idxdata3.co.id/")
+    assert len(session.calls) == 3 and ledger.downloads == 0
+
+
+def test_all_documented_paths_404_fail_closed_without_download():
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([
+        FakeResponse(text="none", content_type="text/plain"),
+        *[FakeResponse(status_code=404, content_type="text/csv") for _ in range(3)],
+    ])
+    with pytest.raises(GateFailure, match="HTTP_404"):
+        discover_participant_url(
+            BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
+        )
+    assert len(session.calls) == 4 and ledger.downloads == 0
+
+
+@pytest.mark.parametrize("status", [403, 429])
+def test_official_403_and_429_fail_closed(status):
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([FakeResponse(status_code=status, content_type="text/plain")])
+    with pytest.raises(GateFailure, match=f"HTTP_{status}"):
+        discover_participant_url(
+            BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
+        )
+    assert len(session.calls) == 1 and ledger.downloads == 0
+
+
+@pytest.mark.parametrize(
+    "error,reason",
+    [(requests.ConnectionError("offline"), "CONNECTION_ERROR"), (requests.Timeout("late"), "TIMEOUT")],
+)
+def test_official_connection_and_timeout_fail_closed(error, reason):
+    ledger = OfficialRequestLedger("PASTICUAN")
+    session = FakeSession([error])
+    with pytest.raises(GateFailure, match=reason):
+        discover_participant_url(
+            BoundedOfficialTransport(ledger, session=session), PARTICIPANT_DAY
+        )
+    assert len(session.calls) == 1 and ledger.entries[0]["result"] == reason
+
+
+def test_invalid_content_type_and_empty_file_body_fail_closed():
+    invalid = BoundedOfficialTransport(
+        OfficialRequestLedger("P"),
+        session=FakeSession([FakeResponse(text="html", content_type="text/html")]),
+    )
+    with pytest.raises(GateFailure, match="PARSE_FAILURE"):
+        discover_participant_url(invalid, PARTICIPANT_DAY)
+
+    href = participant_url()
+    empty_ledger = OfficialRequestLedger("P")
+    empty = BoundedOfficialTransport(
+        empty_ledger,
+        session=FakeSession([
+            FakeResponse(text=f'<a href="{href}">file</a>', content_type="text/plain"),
+            FakeResponse(content=b"", content_type="text/csv"),
+        ]),
+    )
+    with pytest.raises(GateFailure, match="EMPTY_RESPONSE"):
+        download_participant_file(empty, PARTICIPANT_DAY)
+    assert empty_ledger.downloads == 1
+
+
+def test_malformed_csv_and_wrong_trade_date_fail_closed():
+    with pytest.raises(GateFailure, match="PARSE_FAILURE"):
+        parse_participant_rows(
+            b"not,a,trade,detail\n", PARTICIPANT_DAY, participant_url(), "a" * 64
+        )
+    wrong = participant_csv(target_date=date(2026, 8, 31))
+    with pytest.raises(GateFailure, match="WRONG_PERIOD"):
+        parse_participant_rows(
+            wrong, PARTICIPANT_DAY, participant_url(), hashlib.sha256(wrong).hexdigest()
+        )
+
+
+def test_participant_requires_all_five_tickers_without_inventing_zero_rows():
+    four = participant_csv(tickers=COHORT[:-1])
+    with pytest.raises(GateFailure, match="INSUFFICIENT_HISTORY"):
+        parse_participant_rows(
+            four, PARTICIPANT_DAY, participant_url(), hashlib.sha256(four).hexdigest()
+        )
+
+
+def test_participant_aggregation_and_file_hash_are_deterministic():
+    body = participant_csv()
+    digest = hashlib.sha256(body).hexdigest()
+    first = parse_participant_rows(body, PARTICIPANT_DAY, participant_url(), digest)
+    second = parse_participant_rows(body, PARTICIPANT_DAY, participant_url(), digest)
+    assert facts_hash(first, PARTICIPANT_SPEC) == facts_hash(second, PARTICIPANT_SPEC)
+    assert {row["source_file_hash"] for row in first} == {digest}
+    assert {row["ticker"] for row in first} == set(COHORT)
+
+
+def test_participant_semantics_reject_scanner_conclusions_and_preserve_disclaimer():
+    rows = cached_participant_rows()
+    assert all(row["provenance_state"] == PARTICIPANT_PROVENANCE for row in rows)
+    assert "NOT_BENEFICIAL_OWNER" in PARTICIPANT_PROVENANCE
+    contaminated = {**rows[0], "recommendation": "BUY"}
+    with pytest.raises(GateFailure, match="SCANNER_SEMANTIC_FIELD_REJECTED"):
+        ensure_scanner_neutral([contaminated], PARTICIPANT_SPEC)
+
+
+def test_participant_cache_only_transport_hard_denies_before_network():
+    ledger = OfficialRequestLedger("EMIR")
+    with pytest.raises(GateFailure, match="CACHE_ONLY_OFFICIAL_ACCESS_DENIED"):
+        DenyOfficialTransport(ledger).request(participant_url(), "DOWNLOAD", file_download=True)
+    assert ledger.entries == [] and ledger.downloads == 0 and ledger.refused_attempts == 1
+
+
+def test_pasticuan_producer_persists_exact_readback_without_zapi(monkeypatch):
+    configure_fake_credentials(monkeypatch)
+    monkeypatch.setattr(
+        "tools.phase5_6_bounded_live_validation.BoundedZapiTransport",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ZAPI_FORBIDDEN")),
+    )
+    backend = MemoryBackend()
+    href = participant_url()
+    session = FakeSession([
+        FakeResponse(text=f'<a href="{href}">file</a>', content_type="text/plain"),
+        FakeResponse(content=participant_csv(), content_type="text/csv"),
+    ])
+    report, code = execute_participant_gate(
+        "PASTICUAN", backend=backend, official_session=session,
+        target_date=PARTICIPANT_DAY, declared_cumulative_zapi=4,
+    )
+    assert code == 0 and report["mode"] == "OFFICIAL_LIVE_PRODUCER"
+    assert report["evidence"]["ticker_breadth"] == 5
+    assert report["evidence"]["identical_readback"]
+    assert report["zapi_ledger"]["declared_cumulative_after"] == 4
+    assert report["zapi_ledger"]["per_run_attempts"] == 0
+    assert report["official_request_ledger"]["official_downloads"] == 1
+
+
+def test_participant_readback_mismatch_fails_closed(monkeypatch):
+    class CorruptingBackend(MemoryBackend):
+        def __init__(self):
+            super().__init__()
+            self.corrupt = False
+
+        def upsert_rows(self, table, rows, *, conflict):
+            written = super().upsert_rows(table, rows, conflict=conflict)
+            if table == PARTICIPANT_SPEC.table:
+                self.corrupt = True
+            return written
+
+        def read_rows(self, table, filters, *, select="*", limit=10000):
+            rows = super().read_rows(table, filters, select=select, limit=limit)
+            if self.corrupt and table == PARTICIPANT_SPEC.table and rows:
+                rows[0]["buy_value"] += 1
+            return rows
+
+    configure_fake_credentials(monkeypatch)
+    href = participant_url()
+    with pytest.raises(GateFailure, match="READBACK_FAILURE"):
+        execute_participant_gate(
+            "PASTICUAN",
+            backend=CorruptingBackend(),
+            official_session=FakeSession([
+                FakeResponse(text=f'<a href="{href}">file</a>', content_type="text/plain"),
+                FakeResponse(content=participant_csv(), content_type="text/csv"),
+            ]),
+            target_date=PARTICIPANT_DAY,
+        )
+
+
+def test_pasticuan_producer_then_emir_cache_only_identical_hash(monkeypatch):
+    configure_fake_credentials(monkeypatch)
+    backend = MemoryBackend()
+    href = participant_url()
+    producer, producer_code = execute_participant_gate(
+        "PASTICUAN", backend=backend,
+        official_session=FakeSession([
+            FakeResponse(text=f'<a href="{href}">file</a>', content_type="text/plain"),
+            FakeResponse(content=participant_csv(), content_type="text/csv"),
+        ]),
+        target_date=PARTICIPANT_DAY, declared_cumulative_zapi=4,
+    )
+    consumer_session = FakeSession([])
+    consumer, consumer_code = execute_participant_gate(
+        "EMIR", backend=backend, official_session=consumer_session,
+        target_date=PARTICIPANT_DAY, declared_cumulative_zapi=4,
+    )
+    assert producer_code == consumer_code == 0
+    assert consumer["mode"] == "CACHE_ONLY_CONSUMER"
+    assert consumer_session.calls == []
+    assert consumer["official_request_ledger"]["official_http_attempts"] == 0
+    assert consumer["official_request_ledger"]["official_downloads"] == 0
+    assert producer["evidence"]["facts_hash"] == consumer["evidence"]["facts_hash"]
+    assert consumer["zapi_ledger"]["declared_cumulative_after"] == 4

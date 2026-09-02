@@ -3,6 +3,19 @@ name: Phase 5.6 bounded live validation gate — Pasticuan
 on:
   workflow_dispatch:
     inputs:
+      validation_family:
+        description: Isolated evidence family to validate
+        required: true
+        default: zapi
+        type: choice
+        options:
+          - zapi
+          - participant
+      target_trade_date:
+        description: Single completed IDX session for participant validation
+        required: true
+        default: "2026-09-01"
+        type: string
       declared_cumulative_zapi_attempts:
         description: Previously consumed attempts in the release-controlled 0/12 ledger
         required: true
@@ -51,7 +64,8 @@ jobs:
       - name: Run targeted fake-only harness tests
         run: pytest -q -p no:cacheprovider tests/test_phase5_6_bounded_live_validation.py
 
-      - name: Execute bounded state machine
+      - name: Execute bounded ZAPI state machine
+        if: ${{ inputs.validation_family == 'zapi' }}
         env:
           ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
           SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
@@ -60,4 +74,18 @@ jobs:
         run: >-
           python tools/phase5_6_bounded_live_validation.py run
           --client PASTICUAN
+          --validation-family zapi
+          --declared-cumulative-attempts "${{ inputs.declared_cumulative_zapi_attempts }}"
+
+      - name: Execute bounded official participant state machine
+        if: ${{ inputs.validation_family == 'participant' }}
+        env:
+          SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+          SHARED_EVIDENCE_SUPABASE_SECRET_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SECRET_KEY }}
+          SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
+        run: >-
+          python tools/phase5_6_bounded_live_validation.py run
+          --client PASTICUAN
+          --validation-family participant
+          --target-date "${{ inputs.target_trade_date }}"
           --declared-cumulative-attempts "${{ inputs.declared_cumulative_zapi_attempts }}"

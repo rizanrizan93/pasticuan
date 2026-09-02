@@ -10,15 +10,19 @@ ranking, recommendation, migration, schema, or ACL behavior.
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+from io import BytesIO
 import argparse
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
+import tempfile
 from typing import Any, Iterable, Mapping, Protocol
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
+import pandas as pd
 import requests
 
 from idx_trading_calendar import latest_expected_completed_session
@@ -31,6 +35,11 @@ from shared_evidence_hub import (
     SupabaseEvidenceBackend,
 )
 from shared_stock_summary_evidence import normalize_stock_summary
+
+try:
+    from idx_public_participant_provider import aggregate_trade_detail
+except ImportError:
+    from public_idx_broker_flow import aggregate_trade_detail
 
 
 VERSION = "1.0.0-phase5.6-bounded-live-gate"
@@ -47,6 +56,21 @@ FOREIGN_FLOW_FAMILY = "FOREIGN_FLOW"
 STOCK_SUMMARY_URL = "https://api.zpi.web.id/v1/finance:idx/stock-summary"
 FOREIGN_FLOW_URL = "https://api.zpi.web.id/v1/finance:idx/foreign-flow"
 SCOPE = "IDX_COHORT_5_PHASE5_6_LIVE_GATE"
+PARTICIPANT_FAMILY = "PARTICIPANT"
+PARTICIPANT_SOURCE = "IDX_PUBLIC_TRADE_DETAIL_PUBLIK"
+PARTICIPANT_SCOPE = "IDX_COHORT_5_PHASE5_6_PARTICIPANT_GATE"
+PARTICIPANT_TARGET_DATE = date(2026, 9, 1)
+PARTICIPANT_TABLE = "evidence_participant_flow"
+OFFICIAL_HTTP_CAP = 5
+OFFICIAL_DOWNLOAD_CAP = 1
+OFFICIAL_HOSTS = frozenset({"idxdata3.co.id", "www.idxdata3.co.id"})
+OFFICIAL_INDEX_URL = (
+    "https://www.idxdata3.co.id/INET_Specification/Market_Summary/Market_Indices/"
+    "IX200720.TXT?directory=.%2FIDX+Reporting+PSPP%2FRevitalisasi%2FPUBLIK%2F"
+)
+PARTICIPANT_PROVENANCE = (
+    "VERIFIED_IDX_PUBLIC_TRADE_DETAIL_PARTICIPANT_FLOW_NOT_BENEFICIAL_OWNER"
+)
 
 ALLOWED_DELTA_PATHS = frozenset(
     {
@@ -105,6 +129,26 @@ FOREIGN_FIELDS = (
 )
 STOCK_ALLOWED_WRITE_FIELDS = frozenset((*STOCK_FIELDS, "fetched_at"))
 FOREIGN_ALLOWED_WRITE_FIELDS = frozenset((*FOREIGN_FIELDS, "fetched_at"))
+PARTICIPANT_FIELDS = (
+    "source",
+    "trade_date",
+    "ticker",
+    "broker_code",
+    "buy_value",
+    "sell_value",
+    "buy_volume",
+    "sell_volume",
+    "net_value",
+    "net_volume",
+    "buy_avg",
+    "sell_avg",
+    "source_url",
+    "source_file_hash",
+    "source_verified",
+    "provenance_state",
+    "validation_state",
+)
+PARTICIPANT_ALLOWED_WRITE_FIELDS = frozenset((*PARTICIPANT_FIELDS, "fetched_at"))
 
 
 class GateFailure(RuntimeError):
@@ -281,6 +325,128 @@ class DenyZapiTransport:
         raise GateFailure("CACHE_ONLY_PROVIDER_ACCESS_DENIED")
 
 
+@dataclass
+class OfficialRequestLedger:
+    client_id: str
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    downloads: int = 0
+    refused_attempts: int = 0
+    refused_downloads: int = 0
+
+    def before_attempt(self, url: str, method: str, *, file_download: bool = False) -> int:
+        if len(self.entries) >= OFFICIAL_HTTP_CAP:
+            self.refused_attempts += 1
+            raise GateFailure("OFFICIAL_HTTP_CIRCUIT_BREAKER")
+        if file_download and self.downloads >= OFFICIAL_DOWNLOAD_CAP:
+            self.refused_downloads += 1
+            raise GateFailure("OFFICIAL_DOWNLOAD_CIRCUIT_BREAKER")
+        if file_download:
+            self.downloads += 1
+        self.entries.append({
+            "sequence": len(self.entries) + 1,
+            "method": str(method).strip().upper(),
+            "url": str(url),
+            "file_download": bool(file_download),
+            "result": "ATTEMPTED",
+        })
+        return len(self.entries) - 1
+
+    def finish_attempt(self, index: int, result: str) -> None:
+        self.entries[index]["result"] = str(result).strip().upper()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "client_id": str(self.client_id).strip().upper(),
+            "official_http_attempts": len(self.entries),
+            "official_http_cap": OFFICIAL_HTTP_CAP,
+            "official_downloads": self.downloads,
+            "official_download_cap": OFFICIAL_DOWNLOAD_CAP,
+            "refused_attempts": self.refused_attempts,
+            "refused_downloads": self.refused_downloads,
+            "attempts": [dict(item) for item in self.entries],
+        }
+
+
+class BoundedOfficialTransport:
+    """Official IDX-only HTTP with a separate pre-transport request ledger."""
+
+    def __init__(
+        self,
+        ledger: OfficialRequestLedger,
+        *,
+        session: Any | None = None,
+        timeout_seconds: float = 20.0,
+    ):
+        self.ledger = ledger
+        self.timeout_seconds = max(2.0, min(float(timeout_seconds), 45.0))
+        self.session = session or requests.Session()
+        if session is None:
+            adapter = requests.adapters.HTTPAdapter(max_retries=0)
+            self.session.mount("https://", adapter)
+            self.session.mount("http://", adapter)
+
+    @staticmethod
+    def _validate_url(url: str) -> None:
+        parsed = urlparse(str(url))
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() not in OFFICIAL_HOSTS:
+            raise GateFailure("CONTEXT_REJECTED")
+
+    def request(self, url: str, method: str, *, file_download: bool = False) -> Any:
+        self._validate_url(url)
+        index = self.ledger.before_attempt(url, method, file_download=file_download)
+        try:
+            response = self.session.request(
+                "GET",
+                url,
+                headers={
+                    "Accept": "text/csv,text/plain,application/octet-stream,application/vnd.ms-excel",
+                    "User-Agent": "Phase5.6-Bounded-Official-IDX-Gate/1.0",
+                },
+                timeout=self.timeout_seconds,
+                allow_redirects=False,
+                stream=method != "DIRECTORY_INDEX",
+            )
+        except requests.Timeout as exc:
+            self.ledger.finish_attempt(index, "TIMEOUT")
+            raise GateFailure("TIMEOUT") from exc
+        except requests.ConnectionError as exc:
+            self.ledger.finish_attempt(index, "CONNECTION_ERROR")
+            raise GateFailure("CONNECTION_ERROR") from exc
+        except Exception as exc:
+            self.ledger.finish_attempt(index, "CONNECTION_ERROR")
+            raise GateFailure("CONNECTION_ERROR") from exc
+
+        status = int(getattr(response, "status_code", 0) or 0)
+        self.ledger.finish_attempt(index, f"HTTP_{status}")
+        if not 200 <= status < 300:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+            if status:
+                raise GateFailure(f"HTTP_{status}")
+            raise GateFailure("CONNECTION_ERROR")
+        content_type = str(getattr(response, "headers", {}).get("content-type", "")).lower()
+        allowed = ("text/csv", "text/plain", "octet-stream", "application/vnd.ms-excel")
+        if not any(token in content_type for token in allowed):
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+            raise GateFailure("PARSE_FAILURE")
+        return response
+
+
+class DenyOfficialTransport:
+    """Cache-only participant capability that refuses before any network call."""
+
+    def __init__(self, ledger: OfficialRequestLedger):
+        self.ledger = ledger
+
+    def request(self, url: str, method: str, *, file_download: bool = False) -> Any:
+        del url, method, file_download
+        self.ledger.refused_attempts += 1
+        raise GateFailure("CACHE_ONLY_OFFICIAL_ACCESS_DENIED")
+
+
 @dataclass(frozen=True)
 class FamilySpec:
     family: str
@@ -300,6 +466,12 @@ FOREIGN_SPEC = FamilySpec(
     "evidence_foreign_flow",
     FOREIGN_FIELDS,
     FOREIGN_ALLOWED_WRITE_FIELDS,
+)
+PARTICIPANT_SPEC = FamilySpec(
+    PARTICIPANT_FAMILY,
+    PARTICIPANT_TABLE,
+    PARTICIPANT_FIELDS,
+    PARTICIPANT_ALLOWED_WRITE_FIELDS,
 )
 
 
@@ -388,7 +560,7 @@ def facts_hash(rows: Iterable[Mapping[str, Any]], spec: FamilySpec) -> str:
         {field: _canonical_value(row.get(field)) for field in spec.fields}
         for row in rows
     ]
-    canonical.sort(key=lambda row: str(row.get("ticker") or ""))
+    canonical.sort(key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")))
     payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -491,6 +663,326 @@ def cache_only_consume(
         "facts_hash": first_hash,
         "rows": len(rows),
         "identical_readback": True,
+    }
+
+
+def _expected_participant_filename(target_date: date) -> str:
+    return f"Trade-Detail-Publik_{target_date:%Y%m%d}.csv"
+
+
+def _response_bytes(response: Any) -> bytes:
+    raw = getattr(response, "content", None)
+    if isinstance(raw, bytes):
+        return raw
+    iterator = getattr(response, "iter_content", None)
+    if callable(iterator):
+        return b"".join(chunk for chunk in iterator(chunk_size=1024 * 1024) if chunk)
+    text = getattr(response, "text", "")
+    return str(text).encode("utf-8")
+
+
+def discover_participant_url(
+    transport: BoundedOfficialTransport,
+    target_date: date,
+) -> str:
+    filename = _expected_participant_filename(target_date)
+    response = transport.request(OFFICIAL_INDEX_URL, "DIRECTORY_INDEX")
+    try:
+        index_text = str(getattr(response, "text", ""))
+        if not index_text:
+            index_text = _response_bytes(response).decode("utf-8", errors="replace")
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+    matches = re.findall(
+        r"href=[\"']([^\"']*" + re.escape(filename) + r")[\"']",
+        index_text,
+        flags=re.I,
+    )
+    for href in matches:
+        candidate = urljoin(OFFICIAL_INDEX_URL, href)
+        BoundedOfficialTransport._validate_url(candidate)
+        if urlparse(candidate).path.rsplit("/", 1)[-1].lower() == filename.lower():
+            return candidate
+
+    candidates = (
+        f"https://www.idxdata3.co.id/IDX%20Reporting%20PSPP/Revitalisasi/PUBLIK/{filename}",
+        f"https://idxdata3.co.id/IDX%20Reporting%20PSPP/Revitalisasi/PUBLIK/{filename}",
+        f"https://www.idxdata3.co.id/Market_Summary/Market_Summary/{filename}",
+    )
+    for candidate in candidates:
+        try:
+            response = transport.request(candidate, "DOCUMENTED_PATH_PROBE")
+        except GateFailure as exc:
+            if exc.code == "HTTP_404":
+                continue
+            raise
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+        return candidate
+    raise GateFailure("HTTP_404")
+
+
+def download_participant_file(
+    transport: BoundedOfficialTransport,
+    target_date: date,
+) -> tuple[bytes, str, str]:
+    source_url = discover_participant_url(transport, target_date)
+    if urlparse(source_url).path.rsplit("/", 1)[-1] != _expected_participant_filename(target_date):
+        raise GateFailure("CONTEXT_REJECTED")
+    response = transport.request(source_url, "DOWNLOAD", file_download=True)
+    try:
+        body = _response_bytes(response)
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+    if not body:
+        raise GateFailure("EMPTY_RESPONSE")
+    return body, source_url, hashlib.sha256(body).hexdigest()
+
+
+def _read_participant_csv(body: bytes, target_date: date) -> pd.DataFrame:
+    aliases = {
+        "seccode": "asset", "code": "asset", "ticker": "asset",
+        "brokersellid": "participant_sell", "brokerbuyid": "participant_buy",
+        "sellbrokerid": "participant_sell", "buybrokerid": "participant_buy",
+        "quantity": "volume", "tradedate": "tradingdate",
+    }
+    required = {"asset", "participant_buy", "participant_sell", "volume", "value", "tradingdate"}
+    parsed: pd.DataFrame | None = None
+    for separator in ("|", ","):
+        try:
+            candidate = pd.read_csv(BytesIO(body), sep=separator, dtype=str, low_memory=False)
+        except Exception:
+            continue
+        candidate.columns = [str(column).strip().lower() for column in candidate.columns]
+        candidate = candidate.rename(columns={
+            old: new for old, new in aliases.items()
+            if old in candidate.columns and new not in candidate.columns
+        })
+        if required.issubset(candidate.columns):
+            parsed = candidate
+            break
+    if parsed is None or parsed.empty:
+        raise GateFailure("PARSE_FAILURE")
+    dates = pd.to_datetime(parsed["tradingdate"], errors="coerce").dt.date
+    if dates.isna().any():
+        raise GateFailure("PARSE_FAILURE")
+    if set(dates) != {target_date}:
+        raise GateFailure("WRONG_PERIOD")
+    parsed["asset"] = parsed["asset"].astype(str).str.strip().str.upper().str.removesuffix(".JK")
+    for name in ("participant_buy", "participant_sell"):
+        parsed[name] = parsed[name].fillna("").astype(str).str.strip().str.upper()
+    if ((parsed["participant_buy"] == "") & (parsed["participant_sell"] == "")).any():
+        raise GateFailure("PARSE_FAILURE")
+    for name in ("volume", "value"):
+        numeric = pd.to_numeric(parsed[name], errors="coerce")
+        if numeric.isna().any():
+            raise GateFailure("PARSE_FAILURE")
+    cohort_rows = parsed[parsed["asset"].isin(COHORT)]
+    if set(cohort_rows["asset"]) != set(COHORT):
+        raise GateFailure("INSUFFICIENT_HISTORY")
+    return parsed
+
+
+def parse_participant_rows(
+    body: bytes,
+    target_date: date,
+    source_url: str,
+    source_file_hash: str,
+) -> list[dict[str, Any]]:
+    _read_participant_csv(body, target_date)
+    handle = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+    path = Path(handle.name)
+    try:
+        handle.write(body)
+        handle.close()
+        try:
+            frame = aggregate_trade_detail(path, target_date, universe=COHORT)
+        except Exception as exc:
+            raise GateFailure("PARSE_FAILURE") from exc
+    finally:
+        if not handle.closed:
+            handle.close()
+        path.unlink(missing_ok=True)
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        raise GateFailure("PARSE_FAILURE")
+    tickers = {
+        str(value).strip().upper().removesuffix(".JK")
+        for value in frame.get("ticker", pd.Series(dtype=str))
+    }
+    if tickers != set(COHORT):
+        raise GateFailure("INSUFFICIENT_HISTORY")
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    rows: list[dict[str, Any]] = []
+    for item in frame.to_dict(orient="records"):
+        ticker = str(item.get("ticker") or "").strip().upper().removesuffix(".JK")
+        broker = str(item.get("broker_code") or "").strip().upper()
+        if ticker not in COHORT or not broker:
+            continue
+        values = {name: _number(item.get(name)) for name in (
+            "buy_value", "sell_value", "buy_volume", "sell_volume",
+            "net_value", "net_volume",
+        )}
+        for name in ("buy_avg", "sell_avg"):
+            raw = item.get(name)
+            values[name] = None if pd.isna(raw) else _number(raw)
+        if any(values[name] is None for name in (
+            "buy_value", "sell_value", "buy_volume", "sell_volume", "net_value", "net_volume"
+        )):
+            raise GateFailure("PARSE_FAILURE")
+        rows.append({
+            "source": PARTICIPANT_SOURCE,
+            "trade_date": target_date.isoformat(),
+            "ticker": ticker,
+            "broker_code": broker,
+            **values,
+            "source_url": source_url,
+            "source_file_hash": source_file_hash,
+            "source_verified": True,
+            "provenance_state": PARTICIPANT_PROVENANCE,
+            "fetched_at": fetched_at,
+            "validation_state": "VALID",
+        })
+    rows.sort(key=lambda row: (row["ticker"], row["broker_code"]))
+    if {row["ticker"] for row in rows} != set(COHORT):
+        raise GateFailure("INSUFFICIENT_HISTORY")
+    ensure_scanner_neutral(rows, PARTICIPANT_SPEC)
+    return rows
+
+
+def classify_participant_rows(
+    rows: Iterable[Mapping[str, Any]],
+    target_date: date,
+) -> tuple[str, str, list[dict[str, Any]]]:
+    selected = [
+        dict(row) for row in rows
+        if str(row.get("ticker") or "").strip().upper().removesuffix(".JK") in COHORT
+    ]
+    if not selected:
+        return EvidenceState.MISSING.value, "MISSING", []
+    keys = [
+        (str(row.get("ticker") or "").strip().upper(), str(row.get("broker_code") or "").strip().upper())
+        for row in selected
+    ]
+    if len(keys) != len(set(keys)):
+        return EvidenceState.ERROR.value, "DUPLICATE_FACT", selected
+    if any(str(row.get("source") or "").upper() != PARTICIPANT_SOURCE for row in selected):
+        return EvidenceState.ERROR.value, "PROVIDER_MISMATCH", selected
+    if any(_date_value(row.get("trade_date")) != target_date for row in selected):
+        return EvidenceState.ERROR.value, "WRONG_PERIOD", selected
+    if any(str(row.get("validation_state") or "").upper() != "VALID" for row in selected):
+        return EvidenceState.ERROR.value, "PROVIDER_ERROR", selected
+    if any(not bool(row.get("source_verified")) for row in selected):
+        return EvidenceState.ERROR.value, "CONTEXT_REJECTED", selected
+    if any(str(row.get("provenance_state") or "") != PARTICIPANT_PROVENANCE for row in selected):
+        return EvidenceState.ERROR.value, "CONTEXT_REJECTED", selected
+    if any(not str(row.get("source_file_hash") or "").strip() for row in selected):
+        return EvidenceState.ERROR.value, "PARSE_FAILURE", selected
+    if len({str(row.get("source_file_hash")) for row in selected}) != 1:
+        return EvidenceState.ERROR.value, "READBACK_FAILURE", selected
+    if {ticker for ticker, _ in keys} != set(COHORT):
+        return EvidenceState.INSUFFICIENT.value, "INSUFFICIENT_HISTORY", selected
+    return EvidenceState.VALID.value, "VALID", selected
+
+
+def read_participant_rows(backend: Any, target_date: date) -> list[dict[str, Any]]:
+    return backend.read_rows(
+        PARTICIPANT_TABLE,
+        {"source": PARTICIPANT_SOURCE, "trade_date": target_date.isoformat()},
+        limit=50000,
+    )
+
+
+def consume_participant_cache(
+    backend: Any,
+    target_date: date,
+    transport: DenyOfficialTransport,
+) -> dict[str, Any]:
+    del transport  # The injected deny transport is the only legal official capability here.
+    state, reason, rows = classify_participant_rows(read_participant_rows(backend, target_date), target_date)
+    if state != EvidenceState.VALID.value:
+        return {
+            "classification": state, "reason": reason, "facts_hash": "",
+            "rows": len(rows), "identical_readback": False,
+        }
+    first_hash = facts_hash(rows, PARTICIPANT_SPEC)
+    second_hash = facts_hash(read_participant_rows(backend, target_date), PARTICIPANT_SPEC)
+    if first_hash != second_hash:
+        raise GateFailure("READBACK_FAILURE")
+    return {
+        "classification": EvidenceState.VALID.value,
+        "reason": "CACHE_ONLY_VALID",
+        "facts_hash": first_hash,
+        "rows": len(rows),
+        "identical_readback": True,
+    }
+
+
+def produce_participant(
+    backend: Any,
+    target_date: date,
+    client_id: str,
+    fetch: Any,
+) -> dict[str, Any]:
+    produced_hash = ""
+
+    def read_current() -> list[dict[str, Any]]:
+        return read_participant_rows(backend, target_date)
+
+    def fetch_once() -> list[dict[str, Any]]:
+        nonlocal produced_hash
+        rows = [dict(row) for row in fetch()]
+        ensure_scanner_neutral(rows, PARTICIPANT_SPEC)
+        produced_hash = facts_hash(rows, PARTICIPANT_SPEC)
+        return rows
+
+    def persist(rows: list[Mapping[str, Any]]) -> int:
+        written = backend.upsert_rows(
+            PARTICIPANT_TABLE,
+            rows,
+            conflict=("source", "trade_date", "ticker", "broker_code"),
+        )
+        return len(written)
+
+    def validate(rows: list[Mapping[str, Any]]) -> tuple[bool, str]:
+        state, reason, _ = classify_participant_rows(rows, target_date)
+        return state == EvidenceState.VALID.value, reason
+
+    coordinator = SharedEvidenceCoordinator(
+        backend,
+        client_id=client_id,
+        worker_id=f"{client_id}-phase5-6-participant-gate",
+    )
+    result = coordinator.get_or_refresh(
+        EvidenceKey("IDX", "TRADE_DETAIL", PARTICIPANT_SCOPE, target_date),
+        read_current=read_current,
+        fetch=fetch_once,
+        persist=persist,
+        validate=validate,
+        minimum_rows=len(COHORT),
+        lease_seconds=600,
+    )
+    rows = [dict(row) for row in result.rows]
+    state, reason, selected = classify_participant_rows(rows, target_date)
+    if result.state is EvidenceState.ERROR:
+        state, reason = EvidenceState.ERROR.value, result.reason
+    readback_hash = facts_hash(selected, PARTICIPANT_SPEC) if state == EvidenceState.VALID.value else ""
+    exact = bool(readback_hash and (not produced_hash or produced_hash == readback_hash))
+    if result.reason == "REFRESHED" and not exact:
+        raise GateFailure("READBACK_FAILURE")
+    return {
+        "classification": state,
+        "reason": result.reason if state == EvidenceState.VALID.value else reason,
+        "facts_hash": readback_hash,
+        "rows": len(selected),
+        "ticker_breadth": len({row.get("ticker") for row in selected}),
+        "identical_readback": exact,
+        "lease_state": result.lease_state,
+        "official_called": result.provider_called,
     }
 
 
@@ -702,6 +1194,86 @@ def produce_family(
         "lease_state": result.lease_state,
         "provider_called": result.provider_called,
     }
+
+
+def execute_participant_gate(
+    client_id: str,
+    *,
+    backend: Any | None = None,
+    official_session: Any | None = None,
+    target_date: date = PARTICIPANT_TARGET_DATE,
+    declared_cumulative_zapi: int = 4,
+) -> tuple[dict[str, Any], int]:
+    client = str(client_id).strip().upper()
+    if client not in {"PASTICUAN", "EMIR"}:
+        raise GateFailure("INVALID_CLIENT")
+    if not isinstance(target_date, date):
+        raise GateFailure("WRONG_PERIOD")
+    declared = parse_declared_cumulative(declared_cumulative_zapi)
+    config, credential_status = credentials_from_environment(client)
+    ledger = OfficialRequestLedger(client)
+    base_report: dict[str, Any] = {
+        "version": VERSION,
+        "validation_family": "participant",
+        "client_id": client,
+        "trade_date": target_date.isoformat(),
+        "cohort": list(COHORT),
+        "credential_status": credential_status,
+        "schema_mutations": 0,
+        "zapi_ledger": {
+            "declared_cumulative_before": declared,
+            "declared_cumulative_after": declared,
+            "per_run_attempts": 0,
+        },
+    }
+    if backend is None and config is None:
+        return {
+            **base_report,
+            "state": "CREDENTIAL_MISSING",
+            "mode": "FAIL_CLOSED",
+            "official_request_ledger": ledger.as_dict(),
+        }, 2
+    active_backend = backend or SupabaseEvidenceBackend(config)
+    state, reason, _ = classify_participant_rows(
+        read_participant_rows(active_backend, target_date), target_date
+    )
+    if state in {EvidenceState.ERROR.value, EvidenceState.STALE.value}:
+        return {
+            **base_report,
+            "state": state,
+            "reason": reason,
+            "mode": "FAIL_CLOSED",
+            "official_request_ledger": ledger.as_dict(),
+        }, 1
+
+    if client == "EMIR" or state == EvidenceState.VALID.value:
+        result = consume_participant_cache(
+            active_backend, target_date, DenyOfficialTransport(ledger)
+        )
+        ok = result["classification"] == EvidenceState.VALID.value
+        return {
+            **base_report,
+            "state": "EMIR_PARTICIPANT_CONSUMER" if client == "EMIR" else "PASTICUAN_PARTICIPANT_CACHE",
+            "mode": "CACHE_ONLY_CONSUMER",
+            "evidence": result,
+            "official_request_ledger": ledger.as_dict(),
+        }, 0 if ok else 1
+
+    transport = BoundedOfficialTransport(ledger, session=official_session)
+
+    def fetch() -> list[dict[str, Any]]:
+        body, source_url, source_hash = download_participant_file(transport, target_date)
+        return parse_participant_rows(body, target_date, source_url, source_hash)
+
+    result = produce_participant(active_backend, target_date, client, fetch)
+    ok = result["classification"] == EvidenceState.VALID.value
+    return {
+        **base_report,
+        "state": "PASTICUAN_PARTICIPANT_PRODUCER",
+        "mode": "OFFICIAL_LIVE_PRODUCER" if result["official_called"] else "CACHE_FILLED_BY_OTHER_CLIENT",
+        "evidence": result,
+        "official_request_ledger": ledger.as_dict(),
+    }, 0 if ok else 1
 
 
 def execute_gate(
@@ -940,7 +1512,9 @@ def main(argv: list[str] | None = None) -> int:
     allowlist.add_argument("--baseline", required=True)
     run = subparsers.add_parser("run")
     run.add_argument("--client", required=True, choices=("PASTICUAN", "EMIR"))
+    run.add_argument("--validation-family", required=True, choices=("zapi", "participant"))
     run.add_argument("--declared-cumulative-attempts", required=True)
+    run.add_argument("--target-date", default=PARTICIPANT_TARGET_DATE.isoformat())
     args = parser.parse_args(argv)
     try:
         if args.command == "allowlist":
@@ -949,10 +1523,23 @@ def main(argv: list[str] | None = None) -> int:
             )
             _emit({"version": VERSION, "state": "DELTA_ALLOWLIST_VALID", "changed_files": list(changed)})
             return 0
-        report, exit_code = execute_gate(
-            args.client,
-            parse_declared_cumulative(args.declared_cumulative_attempts),
-        )
+        if args.validation_family == "participant":
+            try:
+                participant_day = date.fromisoformat(args.target_date)
+            except ValueError as exc:
+                raise GateFailure("WRONG_PERIOD") from exc
+            report, exit_code = execute_participant_gate(
+                args.client,
+                target_date=participant_day,
+                declared_cumulative_zapi=parse_declared_cumulative(
+                    args.declared_cumulative_attempts
+                ),
+            )
+        else:
+            report, exit_code = execute_gate(
+                args.client,
+                parse_declared_cumulative(args.declared_cumulative_attempts),
+            )
         _emit(report)
         return exit_code
     except GateFailure as exc:
