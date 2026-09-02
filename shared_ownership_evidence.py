@@ -351,10 +351,24 @@ class SharedOwnershipEvidence:
     def ready(self) -> bool:
         return self.backend is not None and self.coordinator is not None
 
-    def _request(self, url: str, *, params: Mapping[str, Any] | None = None, api: bool) -> Any:
+    def _request(
+        self,
+        url: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        api: bool,
+        stage: str,
+    ) -> Any:
         if api and not self.api_key:
             raise RuntimeError(MissingReason.ENVIRONMENT_BLOCKED.value)
-        headers = {"Accept": "application/json" if api else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+        stage = _clean(stage).upper() or ("ZAPI_INDEX" if api else "OFFICIAL_FILE")
+        headers = {
+            "Accept": "application/json" if api else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "User-Agent": (
+                "Shared-IDX-Evidence-Hub/ownership-index"
+                if api else "Shared-IDX-Evidence-Hub/ownership-file"
+            ),
+        }
         if api:
             headers["x-api-key"] = self.api_key
         try:
@@ -454,11 +468,16 @@ class SharedOwnershipEvidence:
             for page in range(MAX_INDEX_PAGES):
                 start = page * INDEX_PAGE_SIZE
                 meta["api_calls"] += 1
-                index_response = self._request(
-                    OWNERSHIP_INDEX_URL,
-                    params={"category": category, "length": INDEX_PAGE_SIZE, "start": start},
-                    api=True,
-                )
+                try:
+                    index_response = self._request(
+                        OWNERSHIP_INDEX_URL,
+                        params={"category": category, "length": INDEX_PAGE_SIZE, "start": start},
+                        api=True,
+                        stage="ZAPI_INDEX",
+                    )
+                except Exception:
+                    meta["failure_stage"] = "ZAPI_INDEX"
+                    raise
                 try:
                     page_entries, total = self._index_page(
                         index_response.json(), category=category, publication_date=publication_date
@@ -479,7 +498,13 @@ class SharedOwnershipEvidence:
                 if meta["file_calls"] >= MAX_FILES_PER_PUBLICATION:
                     raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
                 meta["file_calls"] += 1
-                response = self._request(entry["source_url"], api=False)
+                try:
+                    response = self._request(
+                        entry["source_url"], api=False, stage="OFFICIAL_FILE"
+                    )
+                except Exception:
+                    meta["failure_stage"] = "OFFICIAL_FILE"
+                    raise
                 final_url = _clean(getattr(response, "url", entry["source_url"]))
                 content = bytes(response.content)
                 content_type = _clean((getattr(response, "headers", {}) or {}).get("Content-Type")).lower()

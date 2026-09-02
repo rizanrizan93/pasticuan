@@ -97,7 +97,8 @@ def main() -> int:
     rows = [dict(row) for row in rows]
 
     if not rows:
-        raise SystemExit(f"OWNERSHIP_ROWS_EMPTY:{meta.get('state')}")
+        stage = str(meta.get("failure_stage") or "UNRESOLVED_STAGE")
+        raise SystemExit(f"OWNERSHIP_ROWS_EMPTY:{stage}:{meta.get('state')}")
     valid, reason = validate_ownership_rows(rows, category=args.category)
     if not valid:
         raise SystemExit(f"OWNERSHIP_VALIDATION_FAILED:{reason}")

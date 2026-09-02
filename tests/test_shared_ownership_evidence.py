@@ -226,6 +226,8 @@ def test_pipeline_fetches_one_index_and_only_matching_official_file() -> None:
     }
     assert session.calls[0]["allow_redirects"] is False
     assert session.calls[0]["timeout"] == REQUEST_TIMEOUT_SECONDS
+    assert session.calls[0]["headers"]["User-Agent"] == "Shared-IDX-Evidence-Hub/ownership-index"
+    assert session.calls[1]["headers"]["User-Agent"] == "Shared-IDX-Evidence-Hub/ownership-file"
     assert len(backend.tables["evidence_ownership_files"]) == 1
     assert len(backend.tables["evidence_ownership_snapshots"]) == 1
     assert "test-key" not in str(meta)
@@ -331,6 +333,7 @@ def test_redirect_is_not_followed_implicitly() -> None:
     ])
     rows, meta = _producer(MemoryBackend(), session).get_publication("lima-persen", PUBLICATION)
     assert not rows and meta["state"] == "CONTEXT_REJECTED"
+    assert meta["failure_stage"] == "OFFICIAL_FILE"
     assert len(session.calls) == 2
     assert session.calls[-1]["allow_redirects"] is False
 
@@ -359,21 +362,54 @@ def test_missing_key_on_miss_makes_no_request() -> None:
     assert meta["api_calls"] == 0 and meta["file_calls"] == 0
 
 
-@pytest.mark.parametrize("status,reason", [(401, "HTTP_401"), (403, "HTTP_403"), (404, "HTTP_404"), (429, "HTTP_429")])
+@pytest.mark.parametrize(
+    "status,reason",
+    [
+        (401, "HTTP_401"),
+        (403, "HTTP_403"),
+        (404, "HTTP_404"),
+        (429, "HTTP_429"),
+    ],
+)
 def test_index_http_failures_are_explicit(status: int, reason: str) -> None:
     rows, meta = _producer(MemoryBackend(), Session([Response(status=status)])).get_publication(
         "lima-persen", PUBLICATION
     )
     assert not rows and meta["state"] == reason
+    assert meta["failure_stage"] == "ZAPI_INDEX"
 
 
 @pytest.mark.parametrize(
     "outcome,reason",
-    [(requests.Timeout("slow"), "TIMEOUT"), (requests.ConnectionError("offline"), "CONNECTION_ERROR")],
+    [
+        (requests.Timeout("slow"), "TIMEOUT"),
+        (requests.ConnectionError("offline"), "CONNECTION_ERROR"),
+    ],
 )
 def test_index_network_failures_are_explicit(outcome: Exception, reason: str) -> None:
     rows, meta = _producer(MemoryBackend(), Session([outcome])).get_publication("lima-persen", PUBLICATION)
     assert not rows and meta["state"] == reason
+    assert meta["failure_stage"] == "ZAPI_INDEX"
+
+
+@pytest.mark.parametrize(
+    "status,reason",
+    [
+        (401, "HTTP_401"),
+        (403, "HTTP_403"),
+        (404, "HTTP_404"),
+        (429, "HTTP_429"),
+    ],
+)
+def test_official_file_http_failures_are_stage_specific(status: int, reason: str) -> None:
+    session = Session([
+        Response(payload=_index()),
+        Response(status=status, url=OFFICIAL_URL),
+    ])
+    rows, meta = _producer(MemoryBackend(), session).get_publication("lima-persen", PUBLICATION)
+    assert not rows and meta["state"] == reason
+    assert meta["failure_stage"] == "OFFICIAL_FILE"
+    assert meta["api_calls"] == 1 and meta["file_calls"] == 1
 
 
 @pytest.mark.parametrize(
