@@ -1,0 +1,83 @@
+name: Phase 5.6 capital action additional-listing live producer - Pasticuan
+
+on:
+  workflow_dispatch:
+    inputs:
+      selected_ref:
+        description: Exact commit SHA to validate
+        required: true
+        type: string
+      year:
+        description: Source year (YYYY)
+        required: true
+        default: "2026"
+        type: string
+      month:
+        description: Source month (1-12)
+        required: true
+        default: "7"
+        type: string
+      observed_on:
+        description: Evidence observation date (YYYY-MM-DD)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase5-6-capital-action-additional-listing-live-validation
+  cancel-in-progress: false
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  additional-listing-producer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
+      SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+      SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - name: Checkout exact selected revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.selected_ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install bounded additional-listing validator dependencies
+        run: python -m pip install --disable-pip-version-check --no-cache-dir requests==2.34.2
+
+      - name: Run bounded additional-listings producer proof
+        run: |
+          mkdir -p capital_action_additional_listing_output
+          set -o pipefail
+          python tools/phase5_6_additional_listing_live_validation.py \
+            --mode producer \
+            --client-id PASTICUAN \
+            --feed additional-listings \
+            --year "${{ inputs.year }}" \
+            --month "${{ inputs.month }}" \
+            --observed-on "${{ inputs.observed_on }}" \
+            | tee capital_action_additional_listing_output/summary.log
+
+      - name: Record selected revision
+        if: always()
+        run: |
+          mkdir -p capital_action_additional_listing_output
+          git rev-parse HEAD > capital_action_additional_listing_output/selected-commit-sha.txt
+
+      - name: Upload bounded proof
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: phase5-6-capital-action-additional-listing-producer-proof
+          path: capital_action_additional_listing_output/
+          if-no-files-found: error
