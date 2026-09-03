@@ -48,8 +48,7 @@ OPERATIONAL_METRICS: Mapping[str, tuple[str, str]] = {
     "net_debt_ebitda": ("net_debt_ebitda", "RATIO"),
     "interest_coverage": ("interest_coverage", "RATIO"),
     "market_cap": ("market_cap", "CURRENCY_NATIVE"),
-    "fundamental_official_source_coverage_pct": ("official_source_coverage_pct", "PERCENT"),
-    "fundamental_cashflow_statement_coverage_pct": ("cashflow_statement_coverage_pct", "PERCENT"),
+    "fundamental_coverage": ("fundamental_coverage_pct", "PERCENT"),
 }
 
 
@@ -371,8 +370,7 @@ class SharedStructuredFundamentalEvidence:
                 "ticker,period_end,statement_date,revenue_growth,earnings_growth,roe,roa,roic_proxy,"
                 "net_margin,operating_margin,operating_cash_flow,free_cash_flow,cash_conversion_ttm,"
                 "debt_equity,net_debt_ebitda,interest_coverage,market_cap,fundamental_source_families,"
-                "fundamental_official_verified,fundamental_official_source_coverage_pct,"
-                "fundamental_cashflow_statement_coverage_pct,fundamental_fetched_at,as_of,updated_at,content_hash"
+                "fundamental_official_verified,fundamental_coverage,fundamental_fetched_at,as_of,updated_at,content_hash"
             ),
             limit=max(1, min(int(limit), 50000)),
         )
