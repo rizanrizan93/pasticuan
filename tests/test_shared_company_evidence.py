@@ -377,3 +377,11 @@ def test_migration_has_reference_table_rls_grants_and_lookup_indexes() -> None:
         "enable row level security",
     ):
         assert fragment in migration
+
+
+def test_company_provider_redirects_fail_closed() -> None:
+    session = Session([Response(status=302)])
+    rows, meta = _producer(MemoryBackend(), session).get_profile("BBCA", OBSERVED)
+    assert rows == []
+    assert meta["state"] == "CONTEXT_REJECTED"
+    assert session.calls[0]["allow_redirects"] is False
