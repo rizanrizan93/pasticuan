@@ -172,7 +172,12 @@ def _event_type(feed: str, raw_action: str) -> str:
     action = re.sub(r"[^a-z0-9]+", " ", raw_action.lower()).strip()
     explicit = {
         "reverse stock split": "REVERSE_STOCK_SPLIT",
+        "reverse stock": "REVERSE_STOCK_SPLIT",
         "stock consolidation": "REVERSE_STOCK_SPLIT",
+        "delisting": "DELISTING",
+        "partial delisting": "PARTIAL_DELISTING",
+        "ipo": "IPO",
+        "transaksi material": "MATERIAL_TRANSACTION",
         "stock split": "STOCK_SPLIT",
         "waran": "WARRANT_EXERCISE",
         "warrant": "WARRANT_EXERCISE",
