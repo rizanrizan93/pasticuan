@@ -210,10 +210,24 @@ def test_ambiguous_new_shares_and_free_text_description_are_not_inferred() -> No
     assert split_row["event_type"] == "STOCK_SPLIT" and split_row["raw_action"] is None
 
 
-def test_additional_listing_uses_explicit_additional_shares() -> None:
-    item = {"id": "add", "code": "TLKM", "listingDate": "2026-08-09", "additionalShares": "1.000.000"}
-    row = normalize_capital_actions([item], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED)[0]
-    assert row["delta_shares"] == 1_000_000 and row["event_type"] == "ADDITIONAL_LISTING"
+def test_additional_listing_preserves_explicit_monthly_date_span_and_shares() -> None:
+    item = {
+        "code": "TLKM",
+        "startDate": "2026-08-03",
+        "lastDate": "2026-08-09",
+        "shares": "1.000.000",
+        "actionType": "Warrant",
+    }
+    row = normalize_capital_actions(
+        [item], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED
+    )[0]
+    assert row["delta_shares"] == 1_000_000
+    assert row["event_type"] == "WARRANT_EXERCISE"
+    assert row["raw_action"] == "Warrant"
+    assert row["event_date"] == "2026-08-09"
+    assert row["event_date_kind"] == "RANGE_END"
+    assert row["event_start_date"] == "2026-08-03"
+    assert row["event_end_date"] == "2026-08-09"
     assert row["pre_shares"] is None and row["post_shares"] is None
 
 
@@ -256,8 +270,11 @@ def test_invalid_ticker_or_missing_event_date_is_skipped() -> None:
 
 
 def test_monthly_rows_outside_source_month_are_skipped() -> None:
-    item = {"code": "BBCA", "listingDate": "2026-07-31", "additionalShares": 100}
-    assert normalize_capital_actions([item], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED) == []
+    item = {"code": "BBCA", "startDate": "2026-07-01", "lastDate": "2026-07-31", "shares": 100}
+    with pytest.raises(RuntimeError, match="WRONG_PERIOD"):
+        normalize_capital_actions(
+            [item], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED
+        )
 
 
 def test_validation_rejects_inconsistent_or_wrong_period_rows() -> None:
@@ -295,7 +312,8 @@ def test_global_issued_history_uses_offset_pagination_without_ticker_calls() -> 
 def test_monthly_feeds_use_one_global_month_call(feed: str) -> None:
     item = {"id": "x", "code": "BBCA", "eventDate": "2026-08-12"}
     if feed == "additional-listings":
-        item["additionalShares"] = 100
+        item.pop("eventDate", None)
+        item.update({"startDate": "2026-08-01", "lastDate": "2026-08-12", "shares": 100})
     session = Session([Response(_monthly(feed, [item]))])
     rows, meta = _producer(MemoryBackend(), session).get_month(2026, 8, feed=feed, observed_on=OBSERVED)
     assert len(rows) == 1 and meta["api_calls"] == 1
@@ -305,8 +323,8 @@ def test_monthly_feeds_use_one_global_month_call(feed: str) -> None:
 
 
 def test_monthly_pagination_follows_explicit_has_more() -> None:
-    one = {"id": "one", "code": "BBCA", "listingDate": "2026-08-01", "additionalShares": 100}
-    two = {"id": "two", "code": "BBRI", "listingDate": "2026-08-02", "additionalShares": 200}
+    one = {"id": "one", "code": "BBCA", "startDate": "2026-08-01", "lastDate": "2026-08-01", "shares": 100}
+    two = {"id": "two", "code": "BBRI", "startDate": "2026-08-02", "lastDate": "2026-08-02", "shares": 200}
     session = Session([
         Response(_monthly("additional-listings", [one], has_more=True)),
         Response(_monthly("additional-listings", [two], page=2, has_more=False)),
@@ -320,7 +338,7 @@ def test_monthly_pagination_follows_explicit_has_more() -> None:
 @pytest.mark.parametrize("first,second", [("PASTICUAN", "EMIR"), ("EMIR", "PASTICUAN")])
 def test_second_scanner_reuses_global_month_without_zapi_key(first: str, second: str) -> None:
     backend = MemoryBackend()
-    item = {"id": "x", "code": "BBCA", "listingDate": "2026-08-12", "additionalShares": 100}
+    item = {"id": "x", "code": "BBCA", "startDate": "2026-08-01", "lastDate": "2026-08-12", "shares": 100}
     first_rows, _ = _producer(backend, Session([Response(_monthly("additional-listings", [item]))]), client=first).get_month(
         2026, 8, feed="additional-listings", observed_on=OBSERVED
     )
@@ -529,3 +547,70 @@ def test_nonempty_provider_page_that_normalizes_to_zero_fails_closed() -> None:
     assert rows == [] and backend.rows == []
     assert meta["provider_rows"] == 1
     assert meta["state"] == "CONTEXT_REJECTED"
+
+
+def test_additional_listing_requires_both_span_dates() -> None:
+    missing_start = {
+        "code": "BBCA", "lastDate": "2026-08-12", "shares": 100, "actionType": "ESOP"
+    }
+    missing_end = {
+        "code": "BBCA", "startDate": "2026-08-01", "shares": 100, "actionType": "ESOP"
+    }
+    for item in (missing_start, missing_end):
+        with pytest.raises(RuntimeError, match="CONTEXT_REJECTED"):
+            normalize_capital_actions(
+                [item], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED
+            )
+
+
+def test_additional_listing_rejects_reversed_or_cross_period_span() -> None:
+    reversed_span = {
+        "code": "BBCA", "startDate": "2026-08-12", "lastDate": "2026-08-01", "shares": 100
+    }
+    with pytest.raises(RuntimeError, match="CONTEXT_REJECTED"):
+        normalize_capital_actions(
+            [reversed_span], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED
+        )
+
+    cross_period = {
+        "code": "BBCA", "startDate": "2026-07-31", "lastDate": "2026-08-01", "shares": 100
+    }
+    with pytest.raises(RuntimeError, match="WRONG_PERIOD"):
+        normalize_capital_actions(
+            [cross_period], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED
+        )
+
+
+def test_point_capital_actions_do_not_invent_date_span() -> None:
+    row = normalize_capital_actions(
+        [_issued()], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    )[0]
+    assert row["event_date_kind"] == "POINT"
+    assert row["event_start_date"] is None
+    assert row["event_end_date"] is None
+
+
+def test_validation_rejects_tampered_additional_listing_span() -> None:
+    item = {
+        "code": "BBCA",
+        "startDate": "2026-08-01",
+        "lastDate": "2026-08-12",
+        "shares": 100,
+        "actionType": "Warrant",
+    }
+    row = normalize_capital_actions(
+        [item], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED
+    )[0]
+    assert validate_capital_action_rows(
+        [row], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED
+    ) == (True, "VALID")
+
+    bad_end = dict(row, event_end_date="2026-08-11")
+    assert validate_capital_action_rows(
+        [bad_end], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED
+    )[1] == "CONTEXT_REJECTED"
+
+    bad_kind = dict(row, event_date_kind="POINT")
+    assert validate_capital_action_rows(
+        [bad_kind], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED
+    )[1] == "CONTEXT_REJECTED"
