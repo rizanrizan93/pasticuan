@@ -177,8 +177,11 @@ def normalize_operational_snapshots(rows: Iterable[Mapping[str, Any]]) -> list[d
             "source_families": families,
             "values": values,
         })
-        official = bool(source.get("fundamental_official_verified"))
-        lineage = "BRIDGED_SOURCE_BACKED_OPERATIONAL_FACTS"
+        # This snapshot may blend IDX and public/vendor sources. Aggregate
+        # source verification must never be promoted to field-level official
+        # verification. Exact operational financial facts are bridged separately.
+        official = False
+        lineage = "BRIDGED_AGGREGATED_OPERATIONAL_METRIC_NOT_FIELD_OFFICIAL"
         for field, value in values.items():
             metric_name, unit = OPERATIONAL_METRICS[field]
             output.append({
@@ -197,6 +200,81 @@ def normalize_operational_snapshots(rows: Iterable[Mapping[str, Any]]) -> list[d
                 "validation_state": "VALID",
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
             })
+    return output
+
+
+def normalize_operational_financial_facts(
+    periods: Iterable[Mapping[str, Any]],
+    facts: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Promote exact source-lineaged operational financial facts into the hub.
+
+    Unlike the aggregate snapshot bridge, this path can retain field-level
+    official verification because financial_facts.source_lineage identifies
+    the source family for each metric.
+    """
+    period_map: dict[str, dict[str, Any]] = {}
+    for raw in periods:
+        row = dict(raw)
+        period_id = _clean(row.get("financial_period_id"))
+        ticker = _ticker(row.get("ticker"))
+        if not period_id or not ticker or not bool(row.get("is_current")):
+            continue
+        row["ticker"] = ticker
+        period_map[period_id] = row
+
+    output: list[dict[str, Any]] = []
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    for raw in facts:
+        fact = dict(raw)
+        period_id = _clean(fact.get("financial_period_id"))
+        period = period_map.get(period_id)
+        if period is None:
+            continue
+        ticker = _ticker(fact.get("ticker") or period.get("ticker"))
+        metric_code = _clean(fact.get("metric_code")).upper()
+        value = _finite(fact.get("normalized_value"))
+        if value is None:
+            value = _finite(fact.get("reported_value"))
+        if not ticker or not metric_code or value is None:
+            continue
+        lineage = fact.get("source_lineage") if isinstance(fact.get("source_lineage"), Mapping) else {}
+        source_family = _clean(period.get("source_family"))
+        source_verified = bool(lineage.get("source_verified")) and source_family.startswith("IDX_OFFICIAL_XBRL")
+        observed_at = (
+            _iso_stamp(fact.get("created_at"))
+            or _iso_stamp(period.get("updated_at"))
+            or _iso_stamp(period.get("created_at"))
+        )
+        if not observed_at or not source_family:
+            continue
+        fact_id = _clean(fact.get("financial_fact_id"))
+        source_record_hash = _hash({
+            "financial_fact_id": fact_id,
+            "financial_period_id": period_id,
+            "document_id": _clean(period.get("document_id")),
+            "document_hash": _clean(period.get("document_hash")),
+            "metric_code": metric_code,
+            "source_family": source_family,
+            "source_lineage": lineage,
+        })
+        currency = _clean(fact.get("currency") or period.get("currency"))
+        output.append({
+            "provider": "OPERATIONAL_FINANCIAL_FACT_BRIDGE",
+            "ticker": ticker,
+            "period_end": _iso_date(period.get("period_end")),
+            "statement_date": _iso_date(period.get("filing_date") or period.get("period_end")),
+            "metric_name": metric_code.lower(),
+            "metric_value": value,
+            "metric_unit": currency or "NORMALIZED_NATIVE_OR_RATIO",
+            "source_families": source_family,
+            "official_verified": source_verified,
+            "source_record_hash": source_record_hash,
+            "lineage_state": "OPERATIONAL_FINANCIAL_FACT_EXACT_LINEAGE",
+            "observed_at": observed_at,
+            "validation_state": "VALID",
+            "fetched_at": fetched_at,
+        })
     return output
 
 
@@ -360,6 +438,43 @@ class SharedStructuredFundamentalEvidence:
     def ready(self) -> bool:
         return bool(self.config.ready)
 
+    def bridge_operational_financial_facts(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        if not self.ready:
+            return [], {"state": MissingReason.ENVIRONMENT_BLOCKED.value, "rows": 0}
+        periods = self.backend.read_rows(
+            "financial_periods",
+            {"is_current": "true"},
+            select=(
+                "financial_period_id,ticker,period_end,period_type,filing_date,currency,unit_multiplier,"
+                "source_family,source_url,document_id,document_hash,is_current,created_at,updated_at"
+            ),
+            limit=5000,
+        )
+        facts = self.backend.read_rows(
+            "financial_facts",
+            {},
+            select=(
+                "financial_fact_id,financial_period_id,ticker,metric_code,reported_value,normalized_value,"
+                "currency,unit_multiplier,fact_context,source_lineage,created_at"
+            ),
+            limit=50000,
+        )
+        rows = normalize_operational_financial_facts(periods, facts)
+        valid, reason = validate_structured_metrics(rows)
+        if not valid:
+            return [], {"state": reason, "rows": 0, "period_rows": len(periods), "fact_rows": len(facts)}
+        written = self.backend.upsert_rows(
+            TABLE, rows, conflict=("provider", "ticker", "metric_name", "source_record_hash")
+        )
+        return [dict(row) for row in written], {
+            "state": "BRIDGED",
+            "period_rows": len(periods),
+            "fact_rows": len(facts),
+            "rows": len(written),
+            "tickers": len({row["ticker"] for row in rows}),
+            "official_rows": sum(bool(row.get("official_verified")) for row in rows),
+        }
+
     def bridge_operational(self, *, limit: int = 5000) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if not self.ready:
             return [], {"state": MissingReason.ENVIRONMENT_BLOCKED.value, "rows": 0}
@@ -370,7 +485,7 @@ class SharedStructuredFundamentalEvidence:
                 "ticker,period_end,statement_date,revenue_growth,earnings_growth,roe,roa,roic_proxy,"
                 "net_margin,operating_margin,operating_cash_flow,free_cash_flow,cash_conversion_ttm,"
                 "debt_equity,net_debt_ebitda,interest_coverage,market_cap,fundamental_source_families,"
-                "fundamental_official_verified,fundamental_coverage,fundamental_fetched_at,as_of,updated_at,content_hash"
+                "fundamental_coverage,fundamental_fetched_at,as_of,updated_at,content_hash"
             ),
             limit=max(1, min(int(limit), 50000)),
         )
@@ -439,6 +554,7 @@ __all__ = [
     "PLUANG_FUNDAMENTALS_URL",
     "SharedStructuredFundamentalEvidence",
     "TABLE",
+    "normalize_operational_financial_facts",
     "normalize_operational_snapshots",
     "validate_structured_metrics",
 ]
