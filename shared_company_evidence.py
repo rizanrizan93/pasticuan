@@ -286,9 +286,18 @@ def normalize_reference_values(
         or _clean(root.get("set")) != set_name
     ):
         raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
-    values = root.get("items")
-    if not isinstance(values, list) or any(not isinstance(value, (str, int, float)) or isinstance(value, bool) for value in values):
-        raise RuntimeError(MissingReason.PARSE_FAILURE.value)
+    scalar_types = (str, int, float)
+    if set_name == "market-time":
+        value = root.get("value")
+        if not isinstance(value, scalar_types) or isinstance(value, bool) or not _clean(value):
+            raise RuntimeError(MissingReason.PARSE_FAILURE.value)
+        values = [value]
+    else:
+        values = root.get("items")
+        if not isinstance(values, list) or any(
+            not isinstance(value, scalar_types) or isinstance(value, bool) for value in values
+        ):
+            raise RuntimeError(MissingReason.PARSE_FAILURE.value)
     stamp = (fetched_at or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     rows: dict[str, dict[str, Any]] = {}
     for value in values:
