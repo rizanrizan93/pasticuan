@@ -1,0 +1,76 @@
+name: Phase 5.6 risk family live producer - Pasticuan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/risk-family-live-validation.yml"
+      - "shared_risk_event_evidence.py"
+      - "tools/phase5_6_risk_family_live_validation.py"
+      - "tests/test_phase5_6_risk_family_live_gate.py"
+  workflow_dispatch:
+    inputs:
+      selected_ref:
+        description: Exact commit SHA to validate
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase5-6-risk-family-live-validation-producer
+  cancel-in-progress: false
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  risk-family-producer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
+      SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+      SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.selected_ref || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install bounded risk validator dependencies
+        run: python -m pip install --disable-pip-version-check --no-cache-dir requests==2.34.2
+
+      - name: Run bounded risk-family producer proof
+        run: |
+          mkdir -p risk_family_output
+          set -o pipefail
+          python tools/phase5_6_risk_family_live_validation.py \
+            --mode producer \
+            --client-id PASTICUAN \
+            --observed-on 2026-09-03 \
+            --notice-from 2026-08-01 \
+            --notice-to 2026-08-31 \
+            --margin-date 2026-07-14 \
+            | tee risk_family_output/summary.log
+
+      - name: Record selected revision
+        if: always()
+        run: |
+          mkdir -p risk_family_output
+          git rev-parse HEAD > risk_family_output/selected-commit-sha.txt
+
+      - name: Upload bounded proof
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: phase5-6-risk-family-producer-proof
+          path: risk_family_output/
+          if-no-files-found: error
