@@ -48,7 +48,8 @@ def test_operational_bridge_keeps_source_backed_metrics_and_rejects_source_less_
     ])
     assert {row["ticker"] for row in rows} == {"BBCA"}
     assert {row["metric_name"] for row in rows} == {"roe_pct", "operating_cash_flow"}
-    assert all(row["official_verified"] for row in rows)
+    assert all(row["official_verified"] is False for row in rows)
+    assert all(row["lineage_state"] == "BRIDGED_AGGREGATED_OPERATIONAL_METRIC_NOT_FIELD_OFFICIAL" for row in rows)
     assert fundamentals.validate_structured_metrics(rows) == (True, "VALID")
 
 
@@ -56,6 +57,40 @@ def test_operational_bridge_keeps_source_backed_metrics_and_rejects_source_less_
     source = (ROOT / "shared_structured_fundamental_evidence.py").read_text(encoding="utf-8")
     select_block = source.split("select=(", 1)[-1] if "select=(" in source else source
     assert "fundamental_official_source_coverage_pct,fundamental_cashflow_statement_coverage_pct" not in select_block
+
+
+def test_exact_operational_financial_facts_keep_field_level_official_lineage() -> None:
+    periods = [{
+        "financial_period_id": "p1",
+        "ticker": "BBCA.JK",
+        "period_end": "2026-06-30",
+        "filing_date": None,
+        "source_family": "IDX_OFFICIAL_XBRL",
+        "document_id": "IDX-XBRL-BBCA-Q2",
+        "document_hash": None,
+        "is_current": True,
+        "created_at": "2026-07-30T00:00:00+00:00",
+        "updated_at": "2026-07-30T00:00:00+00:00",
+    }]
+    facts = [{
+        "financial_fact_id": "f1",
+        "financial_period_id": "p1",
+        "ticker": "BBCA.JK",
+        "metric_code": "REVENUE",
+        "reported_value": 100.0,
+        "normalized_value": 100.0,
+        "currency": "IDR",
+        "source_lineage": {"source_family": "IDX_OFFICIAL_XBRL", "source_verified": True},
+        "created_at": "2026-07-30T00:00:00+00:00",
+    }]
+    rows = fundamentals.normalize_operational_financial_facts(periods, facts)
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "BBCA"
+    assert rows[0]["metric_name"] == "revenue"
+    assert rows[0]["official_verified"] is True
+    assert rows[0]["source_families"] == "IDX_OFFICIAL_XBRL"
+    assert rows[0]["lineage_state"] == "OPERATIONAL_FINANCIAL_FACT_EXACT_LINEAGE"
+    assert fundamentals.validate_structured_metrics(rows) == (True, "VALID")
 
 
 def test_pluang_financials_normalize_cashflow_balance_and_income_without_scanner_scores() -> None:
