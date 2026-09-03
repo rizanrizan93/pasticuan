@@ -67,3 +67,13 @@ def test_auto_proof_tracks_calculation_state_migration() -> None:
         / "capital-action-issued-history-live-validation.yml"
     ).read_text(encoding="utf-8").lower()
     assert '"database/migration_v28_capital_action_calculation_states.sql"' in workflow
+
+
+def test_auto_proof_tracks_shared_hub_readback_changes() -> None:
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "capital-action-issued-history-live-validation.yml"
+    ).read_text(encoding="utf-8").lower()
+    assert '"shared_evidence_hub.py"' in workflow
