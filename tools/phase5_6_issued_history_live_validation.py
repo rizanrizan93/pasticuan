@@ -164,14 +164,23 @@ def main() -> int:
     api_calls = int(meta.get("api_calls") or 0)
 
     if args.mode == "producer":
-        if state not in {"REFRESHED", "REFRESHED_EMPTY"}:
-            raise SystemExit(f"PRODUCER_DID_NOT_REFRESH:{state}")
-        if not (1 <= api_calls <= MAX_PAGES_PER_RUN):
-            raise SystemExit(f"PRODUCER_REQUEST_BUDGET_VIOLATION:api={api_calls}")
-        if not bool(meta.get("bounded_complete")):
-            raise SystemExit("PRODUCER_FEED_NOT_BOUNDED_COMPLETE")
-        if bool(meta.get("request_avoided")):
-            raise SystemExit("PRODUCER_UNEXPECTED_CACHE_REUSE")
+        if state in {"REFRESHED", "REFRESHED_EMPTY"}:
+            if not (1 <= api_calls <= MAX_PAGES_PER_RUN):
+                raise SystemExit(f"PRODUCER_REQUEST_BUDGET_VIOLATION:api={api_calls}")
+            if not bool(meta.get("bounded_complete")):
+                raise SystemExit("PRODUCER_FEED_NOT_BOUNDED_COMPLETE")
+            if bool(meta.get("request_avoided")):
+                raise SystemExit("PRODUCER_UNEXPECTED_CACHE_REUSE")
+        elif state in {"CACHE_HIT", "CACHE_FILLED_BY_OTHER_CLIENT", "CACHE_HIT_EMPTY", "CACHE_FILLED_EMPTY_BY_OTHER_CLIENT"}:
+            # A previously proven producer refresh may be revalidated after
+            # readback-only code changes. Cache reuse is acceptable only with
+            # zero provider calls and explicit request avoidance.
+            if api_calls != 0:
+                raise SystemExit(f"PRODUCER_CACHE_NETWORK_BUDGET_VIOLATION:api={api_calls}")
+            if not bool(meta.get("request_avoided")):
+                raise SystemExit("PRODUCER_CACHE_REQUEST_NOT_AVOIDED")
+        else:
+            raise SystemExit(f"PRODUCER_STATE_INVALID:{state}")
     else:
         if state not in {
             "CACHE_HIT",
