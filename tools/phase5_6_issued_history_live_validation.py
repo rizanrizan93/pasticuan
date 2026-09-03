@@ -44,6 +44,7 @@ def canonical_fact_hash(rows: list[Mapping[str, Any]]) -> str:
         "event_start_date",
         "event_end_date",
         "publication_date",
+        "event_shares",
         "pre_shares",
         "post_shares",
         "delta_shares",
