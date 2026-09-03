@@ -1,15 +1,23 @@
 name: Phase 5.6 ownership live producer - Pasticuan
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/ownership-live-validation.yml"
+      - "tools/phase5_6_ownership_live_validation.py"
+      - "shared_ownership_evidence.py"
+      - "tests/test_phase5_6_ownership_live_gate.py"
+      - "tests/test_shared_ownership_evidence.py"
   workflow_dispatch:
     inputs:
       selected_ref:
         description: Exact commit SHA to validate
-        required: true
+        required: false
         type: string
       category:
         description: Ownership publication category
-        required: true
+        required: false
         default: lima-persen
         type: choice
         options:
@@ -19,7 +27,7 @@ on:
           - tipe
       publication_date:
         description: Exact ZAPI ownership publication date (YYYY-MM-DD)
-        required: true
+        required: false
         default: "2026-07-30"
         type: string
 
@@ -43,10 +51,10 @@ jobs:
       SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
       SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
     steps:
-      - name: Checkout exact selected revision
+      - name: Checkout exact revision
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.selected_ref }}
+          ref: ${{ inputs.selected_ref || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-python@v6
@@ -60,7 +68,12 @@ jobs:
         run: |
           mkdir -p ownership_live_output
           set -o pipefail
-          python tools/phase5_6_ownership_live_validation.py             --mode producer             --client-id PASTICUAN             --category "${{ inputs.category }}"             --publication-date "${{ inputs.publication_date }}"             | tee ownership_live_output/summary.log
+          python tools/phase5_6_ownership_live_validation.py \
+            --mode producer \
+            --client-id PASTICUAN \
+            --category "${{ inputs.category || 'lima-persen' }}" \
+            --publication-date "${{ inputs.publication_date || '2026-07-30' }}" \
+            | tee ownership_live_output/summary.log
 
       - name: Record selected revision
         if: always()
