@@ -47,3 +47,13 @@ def test_issued_history_producer_auto_runs_once_on_relevant_main_merge() -> None
     assert 'ref: ${{ inputs.selected_ref || github.sha }}' in workflow
     assert 'tz=asia/jakarta date +%f' in workflow
     assert "schedule:" not in workflow
+
+
+def test_auto_proof_tracks_shared_issued_history_module_changes() -> None:
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "capital-action-issued-history-live-validation.yml"
+    ).read_text(encoding="utf-8").lower()
+    assert '"shared_capital_action_evidence.py"' in workflow
