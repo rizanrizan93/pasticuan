@@ -637,3 +637,14 @@ def test_issued_history_page_limit_envelope_fallback_is_supported() -> None:
     rows, meta = _producer(MemoryBackend(), session).get_issued_history(OBSERVED)
     assert {row["ticker"] for row in rows} == {"BBCA", "BBRI"}
     assert meta["api_calls"] == 2
+
+
+def test_failed_issued_history_reports_categorical_validation_detail() -> None:
+    bad = _issued(id="bad", code="BBCA", shares=2_000, sharesAfter=1_000)
+    session = Session([Response(_issued_payload([bad]))])
+    rows, meta = _producer(MemoryBackend(), session).get_issued_history(OBSERVED)
+    assert rows == []
+    assert meta["state"] == "CONTEXT_REJECTED"
+    assert meta["validation_valid_rows"] == 0
+    assert meta["validation_failure_counts"] == {"CONTEXT_REJECTED": 1}
+    assert meta["validation_failure_detail_counts"] == {"PRE_SHARES_NEGATIVE": 1}

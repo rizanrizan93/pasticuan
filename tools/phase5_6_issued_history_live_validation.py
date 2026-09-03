@@ -132,6 +132,7 @@ def main() -> int:
             "validation_reason": str(meta.get("validation_reason") or ""),
             "validation_valid_rows": int(meta.get("validation_valid_rows") or 0),
             "validation_failure_counts": dict(meta.get("validation_failure_counts") or {}),
+            "validation_failure_detail_counts": dict(meta.get("validation_failure_detail_counts") or {}),
         }
         print(json.dumps({"diagnostic": diagnostic}, sort_keys=True))
         raise SystemExit(f"CAPITAL_ACTION_ROWS_EMPTY:{args.feed}:{state}")
