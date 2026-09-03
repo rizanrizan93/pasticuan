@@ -202,15 +202,21 @@ def _event_type(feed: str, raw_action: str) -> str:
     return explicit.get(action, defaults[feed])
 
 
-def _share_facts(item: Mapping[str, Any], *, feed: str) -> tuple[Any, Any, Any, Any, Any, str]:
+def _share_facts(item: Mapping[str, Any], *, feed: str) -> tuple[Any, Any, Any, Any, Any, Any, str]:
     pre = _number(_first(item, ("sharesBefore", "preShares", "beforeShares", "previousShares", "oldShares", "totalSharesBefore")))
-    post = _number(_first(item, ("sharesAfter", "postShares", "afterShares", "totalSharesAfter")))
-    # The issued-history contract exposes a generic `shares` field whose factual
-    # meaning is the signed share quantity attached to that listing action. It is
-    # not guaranteed to be an arithmetic delta relative to `sharesAfter` for
-    # every historical action (e.g. delisting/reverse-stock/legacy records).
-    # Preserve it separately and only populate delta_shares from fields that are
-    # explicitly delta-like or from explicit pre/post arithmetic.
+    reported_post = _number(_first(item, ("sharesAfter", "postShares", "afterShares", "totalSharesAfter")))
+    post = reported_post
+    # Issued-history is historical exchange data. A small number of legacy
+    # delisting rows contain a negative source-reported sharesAfter, which
+    # cannot represent a usable post-action outstanding-share total. Preserve
+    # the reported value separately, but do not promote it to post_shares.
+    reported_post_negative = bool(feed == "issued-history" and reported_post is not None and reported_post < 0)
+    if reported_post_negative:
+        post = None
+
+    # The issued-history contract exposes generic `shares` as the share
+    # quantity attached to the listing action. It is not universally an
+    # arithmetic delta relative to sharesAfter. Preserve it as event_shares.
     event_shares = _number(item.get("shares")) if feed == "issued-history" else None
     delta_names: tuple[str, ...]
     if feed == "issued-history":
@@ -249,13 +255,25 @@ def _share_facts(item: Mapping[str, Any], *, feed: str) -> tuple[Any, Any, Any, 
     else:
         state = "NO_SHARE_FACTS"
 
+    if reported_post_negative:
+        if delta is not None and pre is not None:
+            state = "REPORTED_POST_NEGATIVE_EXPLICIT_PRE_DELTA"
+        elif delta is not None:
+            state = "REPORTED_POST_NEGATIVE_EXPLICIT_DELTA"
+        elif pre is not None:
+            state = "REPORTED_POST_NEGATIVE_EXPLICIT_PRE"
+        elif event_shares is not None:
+            state = "REPORTED_POST_NEGATIVE_EVENT_SHARES_ONLY"
+        else:
+            state = "REPORTED_POST_NEGATIVE_NO_USABLE_TOTAL"
+
     delta_percent = explicit_percent
     if delta is not None and pre not in (None, 0):
         derived = float(delta) / float(pre) * 100.0
         if explicit_percent is not None and not math.isclose(float(explicit_percent), derived, rel_tol=1e-9, abs_tol=1e-8):
             raise RuntimeError(MissingReason.PARSE_FAILURE.value)
         delta_percent = derived
-    return event_shares, pre, post, delta, delta_percent, state
+    return event_shares, reported_post, pre, post, delta, delta_percent, state
 
 
 def _feed_rows(payload: Any, *, feed: str) -> tuple[list[Mapping[str, Any]], bool]:
@@ -342,7 +360,7 @@ def normalize_capital_actions(
         publication_date = _explicit_date_group(item, PUBLICATION_DATE_FIELDS)
         raw_action = _clean(_first(item, ("action", "actionType", "eventType", "type")))
         event_type = _event_type(feed, raw_action)
-        event_shares, pre, post, delta, delta_percent, calculation_state = _share_facts(item, feed=feed)
+        event_shares, reported_post, pre, post, delta, delta_percent, calculation_state = _share_facts(item, feed=feed)
         ratio_before = _number(_first(item, ("ratioBefore", "oldRatio", "ratioOld")))
         ratio_after = _number(_first(item, ("ratioAfter", "newRatio", "ratioNew")))
         source_url = _official_source_url(
@@ -360,6 +378,7 @@ def normalize_capital_actions(
             "event_end_date": event_end_date.isoformat() if event_end_date else None,
             "publication_date": publication_date.isoformat() if publication_date else None,
             "event_shares": event_shares,
+            "reported_post_shares": reported_post,
             "pre_shares": pre,
             "post_shares": post,
             "delta_shares": delta,
@@ -445,7 +464,7 @@ def validate_capital_action_rows(
             _official_source_url(row.get("source_url"), fallback=FEEDS[feed]["url"])
         except RuntimeError:
             return False, MissingReason.CONTEXT_REJECTED.value
-        numeric = [row.get(name) for name in ("event_shares", "pre_shares", "post_shares", "delta_shares", "delta_percent", "ratio_before", "ratio_after")]
+        numeric = [row.get(name) for name in ("event_shares", "reported_post_shares", "pre_shares", "post_shares", "delta_shares", "delta_percent", "ratio_before", "ratio_after")]
         if any(value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value))) for value in numeric):
             return False, MissingReason.PARSE_FAILURE.value
         pre, post, delta = row.get("pre_shares"), row.get("post_shares"), row.get("delta_shares")
@@ -512,7 +531,7 @@ def _validation_detail(
         _official_source_url(row.get("source_url"), fallback=FEEDS[feed]["url"])
     except RuntimeError:
         return "SOURCE_URL_INVALID"
-    numeric = [row.get(name) for name in ("event_shares", "pre_shares", "post_shares", "delta_shares", "delta_percent", "ratio_before", "ratio_after")]
+    numeric = [row.get(name) for name in ("event_shares", "reported_post_shares", "pre_shares", "post_shares", "delta_shares", "delta_percent", "ratio_before", "ratio_after")]
     if any(
         value is not None
         and (
