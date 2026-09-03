@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-"""Rate-limit guard for Phase 5.6 structured ZAPI fundamental collection.
+"""Rate-limit guard for Phase 5.6 structured ZAPI fundamental collection."""
 
-ZAPI applies one account-level request window across REST/MCP endpoints. The
-collector therefore paces every structured financial request in-process and
-never fans out to another ZAPI provider after the shared key has returned 429.
-"""
-
+from datetime import datetime, timezone
 import os
 import threading
 import time
@@ -17,13 +13,13 @@ import requests
 from shared_evidence_hub import MissingReason, normalize_failure_reason
 
 
-PATCH_VERSION = "1.0.0-phase5.6-zapi-rate-limit"
+PATCH_VERSION = "1.0.1-phase5.6-zapi-rate-limit"
 _DEFAULT_MIN_INTERVAL_SECONDS = 0.90
 _DEFAULT_MINUTE_COOLDOWN_SECONDS = 61.0
 _LOCK = threading.Lock()
 _LAST_REQUEST_AT = 0.0
 _COOLDOWN_UNTIL = 0.0
-_MONTH_BLOCKED = False
+_MONTH_BLOCKED_UNTIL = 0.0
 
 
 def _float_env(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -32,6 +28,15 @@ def _float_env(name: str, default: float, minimum: float, maximum: float) -> flo
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(maximum, value))
+
+
+def _next_month_epoch() -> float:
+    now = datetime.now(timezone.utc)
+    if now.month == 12:
+        next_month = datetime(now.year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        next_month = datetime(now.year, now.month + 1, 1, tzinfo=timezone.utc)
+    return next_month.timestamp()
 
 
 def _header_int(response: Any, name: str) -> int | None:
@@ -86,28 +91,30 @@ def _rate_state(exc: Exception) -> str:
 
 
 def _patched_zapi_get(self: Any, url: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
-    global _LAST_REQUEST_AT, _COOLDOWN_UNTIL, _MONTH_BLOCKED
+    global _LAST_REQUEST_AT, _COOLDOWN_UNTIL, _MONTH_BLOCKED_UNTIL
     if not getattr(self, "api_key", ""):
         raise RuntimeError(MissingReason.ENVIRONMENT_BLOCKED.value)
 
     with _LOCK:
-        now = time.monotonic()
-        if _MONTH_BLOCKED:
+        now_mono = time.monotonic()
+        now_epoch = time.time()
+        if _MONTH_BLOCKED_UNTIL > now_epoch:
+            setattr(self, "_last_zapi_rate_limit", {
+                "window": "month",
+                "blocked_until_utc": datetime.fromtimestamp(_MONTH_BLOCKED_UNTIL, tz=timezone.utc).isoformat(),
+            })
             raise RuntimeError("ZAPI_RATE_LIMIT_MONTH")
-        if _COOLDOWN_UNTIL > now:
+        if _MONTH_BLOCKED_UNTIL and _MONTH_BLOCKED_UNTIL <= now_epoch:
+            _MONTH_BLOCKED_UNTIL = 0.0
+        if _COOLDOWN_UNTIL > now_mono:
             setattr(self, "_last_zapi_rate_limit", {
                 "window": "minute",
-                "cooldown_remaining_seconds": round(_COOLDOWN_UNTIL - now, 3),
+                "cooldown_remaining_seconds": round(_COOLDOWN_UNTIL - now_mono, 3),
             })
             raise RuntimeError("ZAPI_RATE_LIMIT_MINUTE_COOLDOWN")
 
-        interval = _float_env(
-            "ZAPI_MIN_REQUEST_INTERVAL_SECONDS",
-            _DEFAULT_MIN_INTERVAL_SECONDS,
-            0.25,
-            10.0,
-        )
-        delay = interval - (now - _LAST_REQUEST_AT)
+        interval = _float_env("ZAPI_MIN_REQUEST_INTERVAL_SECONDS", _DEFAULT_MIN_INTERVAL_SECONDS, 0.25, 10.0)
+        delay = interval - (now_mono - _LAST_REQUEST_AT)
         if delay > 0:
             time.sleep(delay)
 
@@ -130,16 +137,13 @@ def _patched_zapi_get(self: Any, url: str, params: Mapping[str, Any]) -> Mapping
             detail = _rate_limit_detail(response)
             setattr(self, "_last_zapi_rate_limit", detail)
             if detail["window"] == "month":
-                _MONTH_BLOCKED = True
+                _MONTH_BLOCKED_UNTIL = _next_month_epoch()
+                detail["blocked_until_utc"] = datetime.fromtimestamp(_MONTH_BLOCKED_UNTIL, tz=timezone.utc).isoformat()
+                setattr(self, "_last_zapi_rate_limit", detail)
                 raise RuntimeError("ZAPI_RATE_LIMIT_MONTH")
             cooldown = detail.get("retry_after")
             if not isinstance(cooldown, (int, float)) or cooldown <= 0:
-                cooldown = _float_env(
-                    "ZAPI_MINUTE_COOLDOWN_SECONDS",
-                    _DEFAULT_MINUTE_COOLDOWN_SECONDS,
-                    5.0,
-                    120.0,
-                )
+                cooldown = _float_env("ZAPI_MINUTE_COOLDOWN_SECONDS", _DEFAULT_MINUTE_COOLDOWN_SECONDS, 5.0, 120.0)
             _COOLDOWN_UNTIL = time.monotonic() + float(cooldown)
             raise RuntimeError("ZAPI_RATE_LIMIT_MINUTE")
         if response.status_code in {401, 403, 404}:
@@ -172,17 +176,11 @@ def _patched_refresh_structured(self: Any, ticker: str) -> tuple[list[dict[str, 
                     "attempts": attempts,
                     "rate_limit": dict(getattr(self, "_last_zapi_rate_limit", {}) or {}),
                 }
-    return [], {
-        "state": "STRUCTURED_PROVIDERS_EXHAUSTED",
-        "ticker": bare_ticker(ticker),
-        "rows": 0,
-        "attempts": attempts,
-    }
+    return [], {"state": "STRUCTURED_PROVIDERS_EXHAUSTED", "ticker": bare_ticker(ticker), "rows": 0, "attempts": attempts}
 
 
 def install() -> None:
     from shared_fundamental_runtime import SharedFundamentalRuntime
-
     if getattr(SharedFundamentalRuntime, "_phase56_rate_limit_patch", "") == PATCH_VERSION:
         return
     SharedFundamentalRuntime._zapi_get = _patched_zapi_get
@@ -191,11 +189,11 @@ def install() -> None:
 
 
 def _reset_for_tests() -> None:
-    global _LAST_REQUEST_AT, _COOLDOWN_UNTIL, _MONTH_BLOCKED
+    global _LAST_REQUEST_AT, _COOLDOWN_UNTIL, _MONTH_BLOCKED_UNTIL
     with _LOCK:
         _LAST_REQUEST_AT = 0.0
         _COOLDOWN_UNTIL = 0.0
-        _MONTH_BLOCKED = False
+        _MONTH_BLOCKED_UNTIL = 0.0
 
 
 __all__ = ["PATCH_VERSION", "install", "_rate_limit_detail", "_reset_for_tests"]
