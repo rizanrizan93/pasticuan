@@ -390,12 +390,15 @@ class SharedRiskEventEvidence:
             response = self.session.request(
                 "GET", FEEDS[feed]["url"], params=dict(params),
                 headers={"Accept": "application/json", "x-api-key": self.api_key}, timeout=30,
+                allow_redirects=False,
             )
         except requests.Timeout as exc:
             raise RuntimeError(MissingReason.TIMEOUT.value) from exc
         except requests.ConnectionError as exc:
             raise RuntimeError(MissingReason.CONNECTION_ERROR.value) from exc
         status = int(getattr(response, "status_code", 0) or 0)
+        if 300 <= status < 400:
+            raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
         if not 200 <= status < 300:
             raise RuntimeError(f"HTTP_{status}")
         if not getattr(response, "content", b""):
