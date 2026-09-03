@@ -280,7 +280,13 @@ def test_monthly_rows_outside_source_month_are_skipped() -> None:
 def test_validation_rejects_inconsistent_or_wrong_period_rows() -> None:
     row = normalize_capital_actions([_issued()], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)[0]
     assert validate_capital_action_rows([row], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED) == (True, "VALID")
-    bad = dict(row, delta_shares=999)
+    bad = dict(
+        row,
+        pre_shares=1_000,
+        post_shares=1_200,
+        delta_shares=999,
+        calculation_state="EXPLICIT_PRE_POST",
+    )
     assert validate_capital_action_rows([bad], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)[1] == "PARSE_FAILURE"
     wrong = dict(row, observed_on="2026-08-31")
     assert validate_capital_action_rows([wrong], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)[1] == "WRONG_PERIOD"
