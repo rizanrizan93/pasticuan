@@ -46,6 +46,7 @@ def _install_integrity_patch(expected: str) -> None:
     _try_optional_patch("live_forward_runtime_patch", "install_runtime")
     _try_optional_patch("live_forward_evidence", "install_dashboard_cost_integrity")
     _try_optional_patch("future_fundamental_ui_patch", "install")
+    _try_optional_patch("pasticuan_shared_hub_config_patch", "install")
     _try_optional_patch("shared_fundamental_runtime_patch", "install")
 
 
