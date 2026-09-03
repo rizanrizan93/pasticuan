@@ -392,3 +392,11 @@ def test_validation_and_migration_remain_factual_without_new_gates() -> None:
         assert fragment in migration.lower()
     for forbidden in ("production_gate", "rejection_gate", "scanner_score", "recommendation"):
         assert forbidden not in module
+
+
+def test_risk_provider_redirects_fail_closed() -> None:
+    session = Session([Response(status=302)])
+    rows, meta = _producer(MemoryBackend(), session).get_lendable(OBSERVED)
+    assert rows == []
+    assert meta["state"] == "CONTEXT_REJECTED"
+    assert session.calls[0]["allow_redirects"] is False
