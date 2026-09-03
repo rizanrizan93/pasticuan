@@ -40,6 +40,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install bounded dependencies
-        run: python -m pip install --disable-pip-version-check --no-cache-dir yfinance==0.2.66 pandas==2.3.3 requests==2.34.2 curl-cffi>=0.16,<1
+        run: python -m pip install --disable-pip-version-check --no-cache-dir yfinance==0.2.66 pandas==2.3.3 requests==2.34.2 'curl-cffi>=0.16,<1'
       - name: Bootstrap Yahoo direct fundamentals
         run: python tools/phase5_6_yahoo_direct_bootstrap.py --limit "${{ inputs.limit || '160' }}" --sleep 0.75
