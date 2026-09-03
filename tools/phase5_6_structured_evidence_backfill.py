@@ -32,6 +32,7 @@ def main() -> int:
         "PASTICUAN", config=config, backend=backend
     )
 
+    _, exact_bridge_meta = fundamentals.bridge_operational_financial_facts()
     _, bridge_meta = fundamentals.bridge_operational(limit=5000)
 
     source_rows = backend.read_rows(
@@ -103,6 +104,7 @@ def main() -> int:
                 ownership_results["failed"] += 1
 
     summary = {
+        "exact_operational_financial_bridge": exact_bridge_meta,
         "structured_fundamental_bridge": bridge_meta,
         "pluang_fundamental_gap_fill": fundamental_results,
         "structured_ownership": ownership_results,
