@@ -695,3 +695,27 @@ def test_issued_history_signed_event_shares_are_factual_not_invalid_delta() -> N
     assert validate_capital_action_rows(
         [row], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
     ) == (True, "VALID")
+
+
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        ("Reverse Stock", "REVERSE_STOCK_SPLIT"),
+        ("Delisting", "DELISTING"),
+        ("Partial Delisting", "PARTIAL_DELISTING"),
+        ("IPO", "IPO"),
+        ("Private Placement", "PRIVATE_PLACEMENT"),
+        ("Transaksi Material", "MATERIAL_TRANSACTION"),
+    ],
+)
+def test_explicit_issued_history_action_labels_normalize_without_title_inference(
+    action: str, expected: str
+) -> None:
+    row = normalize_capital_actions(
+        [_issued(action=action)],
+        feed="issued-history",
+        source_period=OBSERVED,
+        observed_on=OBSERVED,
+    )[0]
+    assert row["event_type"] == expected
+    assert row["raw_action"] == action
