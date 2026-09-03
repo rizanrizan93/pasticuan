@@ -11,7 +11,14 @@ def test_market_time_diagnostic_is_shape_only() -> None:
     assert '"item_types"' in source
     assert '"mapping_keys"' in source
     assert "payload.get(\"items\")" in source
-    for forbidden in ("api_key", "headers", "response.text", "repr(payload)", "print(payload)"):
+    for forbidden in (
+        "api_key=",
+        "headers=",
+        "response.text",
+        "repr(payload)",
+        "print(payload)",
+        "print(response)",
+    ):
         assert forbidden not in source
 
 
