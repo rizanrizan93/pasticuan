@@ -133,6 +133,9 @@ def main() -> int:
             "validation_valid_rows": int(meta.get("validation_valid_rows") or 0),
             "validation_failure_counts": dict(meta.get("validation_failure_counts") or {}),
             "validation_failure_detail_counts": dict(meta.get("validation_failure_detail_counts") or {}),
+            "validation_failure_action_counts": dict(meta.get("validation_failure_action_counts") or {}),
+            "validation_failure_calculation_state_counts": dict(meta.get("validation_failure_calculation_state_counts") or {}),
+            "validation_failure_share_relation_counts": dict(meta.get("validation_failure_share_relation_counts") or {}),
         }
         print(json.dumps({"diagnostic": diagnostic}, sort_keys=True))
         raise SystemExit(f"CAPITAL_ACTION_ROWS_EMPTY:{args.feed}:{state}")
