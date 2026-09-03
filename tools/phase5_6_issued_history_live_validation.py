@@ -129,6 +129,9 @@ def main() -> int:
             "page_budget": int(meta.get("page_budget") or MAX_PAGES_PER_RUN),
             "provider_rows": int(meta.get("provider_rows") or 0),
             "bounded_complete": bool(meta.get("bounded_complete")),
+            "validation_reason": str(meta.get("validation_reason") or ""),
+            "validation_valid_rows": int(meta.get("validation_valid_rows") or 0),
+            "validation_failure_counts": dict(meta.get("validation_failure_counts") or {}),
         }
         print(json.dumps({"diagnostic": diagnostic}, sort_keys=True))
         raise SystemExit(f"CAPITAL_ACTION_ROWS_EMPTY:{args.feed}:{state}")

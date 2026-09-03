@@ -294,7 +294,7 @@ def test_wrapped_zapi_content_envelope_is_supported() -> None:
     assert len(rows) == 1 and meta["state"] == "REFRESHED"
 
 
-def test_global_issued_history_uses_offset_pagination_without_ticker_calls() -> None:
+def test_global_issued_history_uses_page_limit_pagination_without_ticker_calls() -> None:
     first = _issued_payload([_issued(id="one", code="BBCA")], total=501)
     second = _issued_payload([_issued(id="two", code="BBRI")], start=500, total=501)
     session = Session([Response(first), Response(second)])
@@ -302,8 +302,8 @@ def test_global_issued_history_uses_offset_pagination_without_ticker_calls() -> 
     assert {row["ticker"] for row in rows} == {"BBCA", "BBRI"}
     assert meta["api_calls"] == 2 and len(session.calls) == 2
     assert [call["params"] for call in session.calls] == [
-        {"length": ISSUED_HISTORY_LENGTH, "start": 0},
-        {"length": ISSUED_HISTORY_LENGTH, "start": ISSUED_HISTORY_LENGTH},
+        {"page": 1, "limit": ISSUED_HISTORY_LENGTH},
+        {"page": 2, "limit": ISSUED_HISTORY_LENGTH},
     ]
     assert all("code" not in call["params"] for call in session.calls)
 
@@ -614,3 +614,26 @@ def test_validation_rejects_tampered_additional_listing_span() -> None:
     assert validate_capital_action_rows(
         [bad_kind], feed="additional-listings", source_period=PERIOD, observed_on=OBSERVED
     )[1] == "CONTEXT_REJECTED"
+
+
+def test_issued_history_page_limit_envelope_fallback_is_supported() -> None:
+    first = {
+        "items": [_issued(id="one", code="BBCA")],
+        "page": 1,
+        "limit": ISSUED_HISTORY_LENGTH,
+        "total": ISSUED_HISTORY_LENGTH + 1,
+        "dataset": "issued-history",
+        "provider": "idx",
+    }
+    second = {
+        "items": [_issued(id="two", code="BBRI")],
+        "page": 2,
+        "limit": ISSUED_HISTORY_LENGTH,
+        "total": ISSUED_HISTORY_LENGTH + 1,
+        "dataset": "issued-history",
+        "provider": "idx",
+    }
+    session = Session([Response(first), Response(second)])
+    rows, meta = _producer(MemoryBackend(), session).get_issued_history(OBSERVED)
+    assert {row["ticker"] for row in rows} == {"BBCA", "BBRI"}
+    assert meta["api_calls"] == 2
