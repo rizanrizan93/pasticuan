@@ -255,10 +255,18 @@ def _feed_rows(payload: Any, *, feed: str) -> tuple[list[Mapping[str, Any]], boo
     if "hasMore" in root:
         has_more = bool(root.get("hasMore"))
     elif feed == "issued-history":
-        start = int(root.get("start") or 0)
-        length = int(root.get("length") or ISSUED_HISTORY_LENGTH)
-        total = int(root.get("total") or len(rows))
-        has_more = start + max(1, length) < total
+        if "hasMore" in root:
+            has_more = bool(root.get("hasMore"))
+        elif "page" in root or "limit" in root:
+            page = int(root.get("page") or 1)
+            limit = int(root.get("limit") or ISSUED_HISTORY_LENGTH)
+            total = int(root.get("total") or len(rows))
+            has_more = page * max(1, limit) < total
+        else:
+            start = int(root.get("start") or 0)
+            length = int(root.get("length") or ISSUED_HISTORY_LENGTH)
+            total = int(root.get("total") or len(rows))
+            has_more = start + max(1, length) < total
     else:
         page = int(root.get("page") or 1)
         length = int(root.get("length") or PAGE_LENGTH)
@@ -534,7 +542,10 @@ class SharedCapitalActionEvidence:
             bounded_complete = False
             for page_index in range(page_budget):
                 if feed == "issued-history":
-                    params = {"length": ISSUED_HISTORY_LENGTH, "start": page_index * ISSUED_HISTORY_LENGTH}
+                    # Current ZAPI contract is page/limit; start/length are
+                    # deprecated compatibility parameters. Use the canonical
+                    # contract while retaining parser support for legacy envelopes.
+                    params = {"page": page_index + 1, "limit": ISSUED_HISTORY_LENGTH}
                 else:
                     params = {
                         "year": source_period.year, "month": source_period.month,
@@ -573,14 +584,32 @@ class SharedCapitalActionEvidence:
             )
             return len(written)
 
+        def validate_rows(rows: list[Mapping[str, Any]]) -> tuple[bool, str]:
+            valid, reason = validate_capital_action_rows(
+                rows, feed=feed, source_period=source_period, observed_on=observed_on
+            )
+            meta["validation_reason"] = reason
+            if not valid:
+                counts: dict[str, int] = {}
+                valid_rows = 0
+                for row in rows:
+                    row_valid, row_reason = validate_capital_action_rows(
+                        [row], feed=feed, source_period=source_period, observed_on=observed_on
+                    )
+                    if row_valid:
+                        valid_rows += 1
+                    else:
+                        counts[row_reason] = counts.get(row_reason, 0) + 1
+                meta["validation_valid_rows"] = valid_rows
+                meta["validation_failure_counts"] = counts
+            return valid, reason
+
         result = self.coordinator.get_or_refresh(
             EvidenceKey("ZAPI", "CAPITAL_ACTIONS", FEEDS[feed]["scope"], source_period),
             read_current=read_current,
             fetch=fetch,
             persist=persist,
-            validate=lambda rows: validate_capital_action_rows(
-                rows, feed=feed, source_period=source_period, observed_on=observed_on
-            ),
+            validate=validate_rows,
             minimum_rows=1,
             lease_seconds=300,
             allow_empty_valid=True,
