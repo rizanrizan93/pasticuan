@@ -150,6 +150,7 @@ def test_issued_history_preserves_dates_and_derives_only_compatible_facts() -> N
     assert row["event_type"] == "WARRANT_EXERCISE"
     assert row["event_date"] == "2026-08-14" and row["publication_date"] == "2026-08-15"
     assert row["event_shares"] == 3_200
+    assert row["reported_post_shares"] == 22_375_261_532
     assert row["post_shares"] == 22_375_261_532
     assert row["pre_shares"] is None and row["delta_shares"] is None
     assert row["calculation_state"] == "EXPLICIT_EVENT_SHARES_POST_NO_DELTA"
@@ -725,3 +726,42 @@ def test_explicit_issued_history_action_labels_normalize_without_title_inference
     )[0]
     assert row["event_type"] == expected
     assert row["raw_action"] == action
+
+
+def test_negative_reported_post_is_preserved_but_not_promoted_to_usable_post() -> None:
+    item = _issued(
+        id="legacy-delisting-negative-post",
+        code="BBCA",
+        action="Delisting",
+        shares=-5_516_000,
+        sharesAfter=-5_516_000,
+        listingDate="2008-01-04",
+        publicationDate=None,
+    )
+    row = normalize_capital_actions(
+        [item], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    )[0]
+    assert row["event_type"] == "DELISTING"
+    assert row["event_shares"] == -5_516_000
+    assert row["reported_post_shares"] == -5_516_000
+    assert row["post_shares"] is None
+    assert row["pre_shares"] is None
+    assert row["delta_shares"] is None
+    assert row["calculation_state"] == "REPORTED_POST_NEGATIVE_EVENT_SHARES_ONLY"
+    assert validate_capital_action_rows(
+        [row], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    ) == (True, "VALID")
+
+
+def test_reported_post_must_be_finite_but_may_be_negative() -> None:
+    row = normalize_capital_actions(
+        [_issued()], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    )[0]
+    negative = dict(row, reported_post_shares=-1, post_shares=None)
+    assert validate_capital_action_rows(
+        [negative], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    ) == (True, "VALID")
+    invalid = dict(row, reported_post_shares=float("inf"))
+    assert validate_capital_action_rows(
+        [invalid], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    )[1] == "PARSE_FAILURE"
