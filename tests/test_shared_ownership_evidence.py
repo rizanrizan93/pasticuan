@@ -227,7 +227,9 @@ def test_pipeline_fetches_one_index_and_only_matching_official_file() -> None:
     assert session.calls[0]["allow_redirects"] is False
     assert session.calls[0]["timeout"] == REQUEST_TIMEOUT_SECONDS
     assert session.calls[0]["headers"]["User-Agent"] == "Shared-IDX-Evidence-Hub/ownership-index"
-    assert session.calls[1]["headers"]["User-Agent"] == "Shared-IDX-Evidence-Hub/ownership-file"
+    assert session.calls[1]["headers"]["Referer"] == "https://www.idx.co.id/"
+    assert "x-api-key" not in session.calls[1]["headers"]
+    assert session.calls[1]["allow_redirects"] is False
     assert len(backend.tables["evidence_ownership_files"]) == 1
     assert len(backend.tables["evidence_ownership_snapshots"]) == 1
     assert "test-key" not in str(meta)
