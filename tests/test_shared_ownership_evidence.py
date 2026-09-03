@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 import requests
 
-from shared_evidence_hub import EvidenceKey, SharedEvidenceCoordinator
+from shared_evidence_hub import EvidenceKey, HubConfig, SharedEvidenceCoordinator
 from shared_ownership_evidence import (
     CATEGORIES,
     INDEX_PAGE_SIZE,
@@ -412,6 +412,54 @@ def test_official_file_http_failures_are_stage_specific(status: int, reason: str
     assert not rows and meta["state"] == reason
     assert meta["failure_stage"] == "OFFICIAL_FILE"
     assert meta["api_calls"] == 1 and meta["file_calls"] == 1
+
+
+def test_official_file_403_can_use_authenticated_shared_edge_egress() -> None:
+    backend = MemoryBackend()
+    proxy_url = "https://hub-project.supabase.co/functions/v1/phase5-6-official-document-fetch"
+    session = Session([
+        Response(payload=_index()),
+        Response(status=403, url=OFFICIAL_URL),
+        Response(
+            content=FILE_BYTES,
+            status=200,
+            url=proxy_url,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"x-official-source-url": OFFICIAL_URL},
+        ),
+    ])
+    evidence = _producer(backend, session)
+    evidence.config = HubConfig(
+        url="https://hub-project.supabase.co",
+        key="service-role-test",
+        key_type="SERVICE_ROLE",
+        client_id="PASTICUAN",
+    )
+    rows, meta = evidence.get_publication("lima-persen", PUBLICATION)
+    assert len(rows) == 1 and meta["state"] == "REFRESHED"
+    assert len(session.calls) == 3
+    assert session.calls[2]["url"] == proxy_url
+    assert session.calls[2]["json"] == {"url": OFFICIAL_URL}
+    assert session.calls[2]["headers"]["Authorization"] == "Bearer service-role-test"
+    assert session.calls[2]["allow_redirects"] is False
+    assert rows[0]["source_url"] == OFFICIAL_URL
+
+
+def test_official_file_403_does_not_proxy_without_service_role() -> None:
+    session = Session([
+        Response(payload=_index()),
+        Response(status=403, url=OFFICIAL_URL),
+    ])
+    evidence = _producer(MemoryBackend(), session)
+    evidence.config = HubConfig(
+        url="https://hub-project.supabase.co",
+        key="modern-secret-test",
+        key_type="SECRET",
+        client_id="PASTICUAN",
+    )
+    rows, meta = evidence.get_publication("lima-persen", PUBLICATION)
+    assert not rows and meta["state"] == "HTTP_403"
+    assert len(session.calls) == 2
 
 
 @pytest.mark.parametrize(
