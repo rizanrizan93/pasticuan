@@ -29,6 +29,11 @@ def test_ownership_live_producer_is_auto_bounded_and_read_only() -> None:
 
     assert "MAX_INDEX_PAGES" in script
     assert "MAX_FILES_PER_PUBLICATION" in script
+    assert "UPSTREAM_ACCESS_BLOCKED" in script
+    assert 'stage == "OFFICIAL_FILE"' in script
+    assert 'state == "HTTP_403"' in script
+    assert '"authorization": "NO_OWNERSHIP_FACTS"' in script
+    assert '"scoring_eligible": False' in script
     assert 'state != "REFRESHED"' in script
     assert "PRODUCER_API_CALL_BUDGET_VIOLATION" in script
     assert "PRODUCER_FILE_CALL_BUDGET_VIOLATION" in script

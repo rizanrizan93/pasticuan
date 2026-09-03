@@ -98,7 +98,31 @@ def main() -> int:
 
     if not rows:
         stage = str(meta.get("failure_stage") or "UNRESOLVED_STAGE")
-        raise SystemExit(f"OWNERSHIP_ROWS_EMPTY:{stage}:{meta.get('state')}")
+        state = str(meta.get("state") or "")
+        # IDX Media currently rejects bounded cloud-runner downloads for the
+        # published ownership workbook.  Prove the negative capability
+        # explicitly without fabricating holder rows or turning the missing
+        # evidence into a scanner blocker.  Any other failure remains fatal.
+        if args.mode == "producer" and stage == "OFFICIAL_FILE" and state == "HTTP_403":
+            print(json.dumps({
+                "client_id": client_id,
+                "mode": args.mode,
+                "state": "UPSTREAM_ACCESS_BLOCKED",
+                "underlying_state": state,
+                "failure_stage": stage,
+                "category": args.category,
+                "publication_date": publication_date.isoformat(),
+                "rows": 0,
+                "api_calls": int(meta.get("api_calls") or 0),
+                "file_calls": int(meta.get("file_calls") or 0),
+                "request_avoided": bool(meta.get("request_avoided")),
+                "cache_hit": bool(meta.get("cache_hit")),
+                "lease_state": str(meta.get("lease_state") or ""),
+                "authorization": "NO_OWNERSHIP_FACTS",
+                "scoring_eligible": False,
+            }, sort_keys=True))
+            return 0
+        raise SystemExit(f"OWNERSHIP_ROWS_EMPTY:{stage}:{state}")
     valid, reason = validate_ownership_rows(rows, category=args.category)
     if not valid:
         raise SystemExit(f"OWNERSHIP_VALIDATION_FAILED:{reason}")
