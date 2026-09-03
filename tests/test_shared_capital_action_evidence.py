@@ -648,3 +648,6 @@ def test_failed_issued_history_reports_categorical_validation_detail() -> None:
     assert meta["validation_valid_rows"] == 0
     assert meta["validation_failure_counts"] == {"CONTEXT_REJECTED": 1}
     assert meta["validation_failure_detail_counts"] == {"PRE_SHARES_NEGATIVE": 1}
+    assert meta["validation_failure_action_counts"] == {"waran": 1}
+    assert meta["validation_failure_calculation_state_counts"] == {"EXPLICIT_DELTA_POST_DERIVED_PRE": 1}
+    assert meta["validation_failure_share_relation_counts"] == {"DELTA_GT_POST": 1}
