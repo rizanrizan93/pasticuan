@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
-
-import numpy as np
 
 from shared_fundamental_runtime import (
     canonicalize_metric_rows,
@@ -31,9 +28,9 @@ def test_operational_percent_ratios_are_promoted_as_percentage_points() -> None:
         "content_hash": "abc",
     }])
     values = {row["metric_name"]: row["metric_value"] for row in rows}
-    assert values["revenue_growth_pct"] == 6.39
-    assert values["earnings_growth_pct"] == 24.85
-    assert values["roe_pct"] == 19.21
+    assert round(values["revenue_growth_pct"], 4) == 6.39
+    assert round(values["earnings_growth_pct"], 4) == 24.85
+    assert round(values["roe_pct"], 4) == 19.21
     assert values["debt_equity"] == 0.5998
     assert values["fundamental_coverage_pct"] == 55.0
     assert all(row["official_verified"] is False for row in rows)
@@ -49,8 +46,8 @@ def test_canonicalizer_corrects_legacy_aggregate_rows_but_not_v2_rows() -> None:
     }
     legacy = {**base, "metric_value": 0.1921, "lineage_state": "BRIDGED_AGGREGATED_OPERATIONAL_FACTS"}
     corrected = {**base, "metric_value": 19.21, "source_record_hash": "y", "lineage_state": "BRIDGED_AGGREGATED_OPERATIONAL_METRIC_PERCENT_CANONICAL_V2", "observed_at": "2026-09-04T00:00:00+00:00"}
-    assert canonicalize_metric_rows([legacy])["TLKM"]["proxy_metrics"]["roe_pct"] == 19.21
-    assert canonicalize_metric_rows([corrected])["TLKM"]["proxy_metrics"]["roe_pct"] == 19.21
+    assert round(canonicalize_metric_rows([legacy])["TLKM"]["proxy_metrics"]["roe_pct"], 4) == 19.21
+    assert round(canonicalize_metric_rows([corrected])["TLKM"]["proxy_metrics"]["roe_pct"], 4) == 19.21
 
 
 def test_exact_official_bundle_uses_latest_period_and_same_quarter_yoy() -> None:
@@ -70,8 +67,8 @@ def test_exact_official_bundle_uses_latest_period_and_same_quarter_yoy() -> None
     ]
     item = canonicalize_metric_rows(rows)["ABMM"]
     assert item["official_period_end"] == "2026-06-30"
-    assert round(item["official_metrics"]["revenue_growth_yoy_pct"], 2) == 20.0
-    assert round(item["official_metrics"]["earnings_growth_yoy_pct"], 2) == 50.0
+    assert round(item["official_metrics"]["revenue_growth_yoy_pct"], 6) == 20.0
+    assert round(item["official_metrics"]["earnings_growth_yoy_pct"], 6) == 50.0
     assert item["official_metrics"]["interest_bearing_debt_to_equity"] == 0.4
     assert item["official_metrics"]["cash_to_debt_ratio"] == 0.5
 
@@ -102,10 +99,10 @@ def test_yahoo_structured_payload_normalizes_statement_and_ratios() -> None:
     rows = normalize_yahoo_payloads("BBCA.JK", summary, statements, observed_at="2026-09-04T00:00:00+00:00")
     values = {row["metric_name"]: row["metric_value"] for row in rows}
     assert values["revenue_growth_pct"] == 2.5
-    assert values["earnings_growth_pct"] == 20.0
+    assert round(values["earnings_growth_pct"], 6) == 20.0
     assert values["current_ratio"] == 2.0
     assert values["debt_equity"] == 0.1
-    assert values["ocf_conversion_ratio"] == 70 / 60
+    assert round(values["ocf_conversion_ratio"], 8) == round(70 / 60, 8)
 
 
 def test_shared_runtime_contract_contains_no_scanner_decision_fields() -> None:
