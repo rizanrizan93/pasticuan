@@ -347,3 +347,70 @@ def test_empty_payload_still_errors_without_explicit_empty_contract() -> None:
     )
     assert result.state is EvidenceState.ERROR
     assert result.reason == MissingReason.EMPTY_RESPONSE.value
+
+
+class _PagedPostgrestResponse:
+    def __init__(self, rows: list[dict[str, Any]]):
+        self.status_code = 200
+        self.content = b"json"
+        self._rows = rows
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._rows]
+
+
+class _PagedPostgrestSession:
+    def __init__(self, rows: list[dict[str, Any]]):
+        self.rows = list(rows)
+        self.calls: list[dict[str, Any]] = []
+
+    def request(self, method: str, url: str, **kwargs: Any) -> _PagedPostgrestResponse:
+        self.calls.append({"method": method, "url": url, **kwargs})
+        params = dict(kwargs.get("params") or {})
+        offset = int(params.get("offset") or 0)
+        limit = int(params.get("limit") or 1000)
+        return _PagedPostgrestResponse(self.rows[offset : offset + limit])
+
+
+def test_supabase_backend_pages_reads_beyond_server_row_cap() -> None:
+    source = [{"ticker": f"T{i:04d}", "validation_state": "VALID"} for i in range(1801)]
+    session = _PagedPostgrestSession(source)
+    backend = SupabaseEvidenceBackend(
+        HubConfig(
+            url="https://example.supabase.co",
+            key="test-key",
+            key_type="SERVICE_ROLE",
+            client_id="TEST",
+        ),
+        session=session,
+    )
+    rows = backend.read_rows(
+        "evidence_capital_actions",
+        {"source": "IDX_ISSUED_HISTORY_VIA_ZAPI"},
+        limit=50000,
+    )
+    assert len(rows) == 1801
+    assert rows[0]["ticker"] == "T0000"
+    assert rows[-1]["ticker"] == "T1800"
+    assert [call["params"]["offset"] for call in session.calls] == [0, 1000]
+    assert [call["params"]["limit"] for call in session.calls] == [1000, 1000]
+
+
+def test_supabase_backend_short_read_stops_after_first_page() -> None:
+    source = [{"ticker": f"T{i:04d}", "validation_state": "VALID"} for i in range(20)]
+    session = _PagedPostgrestSession(source)
+    backend = SupabaseEvidenceBackend(
+        HubConfig(
+            url="https://example.supabase.co",
+            key="test-key",
+            key_type="SERVICE_ROLE",
+            client_id="TEST",
+        ),
+        session=session,
+    )
+    rows = backend.read_rows("evidence_market_daily", {"provider": "ZAPI"}, limit=50000)
+    assert len(rows) == 20
+    assert len(session.calls) == 1
