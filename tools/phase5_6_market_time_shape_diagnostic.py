@@ -45,10 +45,12 @@ def main() -> int:
         print(json.dumps({"root": _shape(payload)}, sort_keys=True))
         return 0
 
+    data = payload.get("data")
     report = {
         "root": _shape(payload),
         "items": _shape(payload.get("items")),
-        "data": _shape(payload.get("data")),
+        "data": _shape(data),
+        "data_value": _shape(data.get("value")) if isinstance(data, Mapping) else {"type": "unavailable"},
         "content": _shape(payload.get("content")),
     }
     print(json.dumps(report, sort_keys=True))
