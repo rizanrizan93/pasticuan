@@ -23,6 +23,7 @@ def test_ownership_live_producer_is_auto_bounded_and_read_only() -> None:
     assert "ZAPI_KEY: ${{ secrets.ZAPI_KEY }}" in workflow
     assert "SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY" in workflow
     assert "SHARED_EVIDENCE_SUPABASE_SECRET_KEY" not in workflow
+    assert "curl-cffi>=0.16,<1" in workflow
     assert "--mode producer" in workflow
     assert "--client-id PASTICUAN" in workflow
 
