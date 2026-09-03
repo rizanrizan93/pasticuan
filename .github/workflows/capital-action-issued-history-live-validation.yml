@@ -1,15 +1,21 @@
 name: Phase 5.6 capital action issued-history live producer - Pasticuan
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/capital-action-issued-history-live-validation.yml"
+      - "tools/phase5_6_issued_history_live_validation.py"
+      - "tests/test_phase5_6_issued_history_live_gate.py"
   workflow_dispatch:
     inputs:
       selected_ref:
         description: Exact commit SHA to validate
-        required: true
+        required: false
         type: string
       observed_on:
         description: Evidence observation date (YYYY-MM-DD)
-        required: true
+        required: false
         type: string
 
 permissions:
@@ -35,7 +41,7 @@ jobs:
       - name: Checkout exact selected revision
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.selected_ref }}
+          ref: ${{ inputs.selected_ref || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-python@v6
@@ -49,11 +55,15 @@ jobs:
         run: |
           mkdir -p capital_action_issued_history_output
           set -o pipefail
+          OBSERVED_ON="${{ inputs.observed_on }}"
+          if [ -z "$OBSERVED_ON" ]; then
+            OBSERVED_ON="$(TZ=Asia/Jakarta date +%F)"
+          fi
           python tools/phase5_6_issued_history_live_validation.py \
             --mode producer \
             --client-id PASTICUAN \
             --feed issued-history \
-            --observed-on "${{ inputs.observed_on }}" \
+            --observed-on "$OBSERVED_ON" \
             | tee capital_action_issued_history_output/summary.log
 
       - name: Record selected revision
