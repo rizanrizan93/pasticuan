@@ -73,7 +73,7 @@ jobs:
         run: |
           mkdir -p financial_live_output
           set -o pipefail
-          python tools/phase5_6_financial_live_validation.py             --mode producer             --client-id PASTICUAN             --ticker "${{ inputs.ticker }}"             --year "${{ inputs.year }}"             --period "${{ inputs.period }}"             | tee financial_live_output/summary.log
+          python tools/phase5_6_financial_live_validation.py             --mode producer             --client-id PASTICUAN             --ticker "${{ inputs.ticker || 'BBCA' }}"             --year "${{ inputs.year || '2026' }}"             --period "${{ inputs.period || 'tw2' }}"             | tee financial_live_output/summary.log
 
       - name: Record selected revision
         if: always()

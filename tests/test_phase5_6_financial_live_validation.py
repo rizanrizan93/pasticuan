@@ -18,6 +18,9 @@ def test_financial_live_producer_is_auto_bounded_and_read_only() -> None:
     assert "contents: write" not in workflow
     assert "persist-credentials: false" in workflow
     assert "ref: ${{ inputs.selected_ref || github.sha }}" in workflow
+    assert "${{ inputs.ticker || 'BBCA' }}" in workflow
+    assert "${{ inputs.year || '2026' }}" in workflow
+    assert "${{ inputs.period || 'tw2' }}" in workflow
     assert "ZAPI_KEY: ${{ secrets.ZAPI_KEY }}" in workflow
     assert "SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY" in workflow
     assert "--mode producer" in workflow
