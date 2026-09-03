@@ -1,11 +1,19 @@
 name: Phase 5.6 financial live producer - Pasticuan
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/financial-live-validation.yml"
+      - "tools/phase5_6_financial_live_validation.py"
+      - "shared_financial_evidence.py"
+      - "tests/test_phase5_6_financial_live_validation.py"
+      - "tests/test_shared_financial_evidence.py"
   workflow_dispatch:
     inputs:
       selected_ref:
         description: Exact commit SHA to validate
-        required: true
+        required: false
         type: string
       ticker:
         description: IDX ticker
@@ -51,7 +59,7 @@ jobs:
       - name: Checkout exact selected revision
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.selected_ref }}
+          ref: ${{ inputs.selected_ref || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-python@v6
