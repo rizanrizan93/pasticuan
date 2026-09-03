@@ -52,6 +52,12 @@ def test_operational_bridge_keeps_source_backed_metrics_and_rejects_source_less_
     assert fundamentals.validate_structured_metrics(rows) == (True, "VALID")
 
 
+    assert fundamentals.OPERATIONAL_METRICS["fundamental_coverage"] == ("fundamental_coverage_pct", "PERCENT")
+    source = (ROOT / "shared_structured_fundamental_evidence.py").read_text(encoding="utf-8")
+    select_block = source.split("select=(", 1)[-1] if "select=(" in source else source
+    assert "fundamental_official_source_coverage_pct,fundamental_cashflow_statement_coverage_pct" not in select_block
+
+
 def test_pluang_financials_normalize_cashflow_balance_and_income_without_scanner_scores() -> None:
     f = {
         "code": "BBCA",
