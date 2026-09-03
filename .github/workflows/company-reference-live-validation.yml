@@ -1,0 +1,74 @@
+name: Phase 5.6 company/reference live producer - Pasticuan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/company-reference-live-validation.yml"
+      - "shared_company_evidence.py"
+      - "shared_evidence_hub.py"
+      - "tools/phase5_6_company_reference_live_validation.py"
+      - "tests/test_phase5_6_company_reference_live_gate.py"
+  workflow_dispatch:
+    inputs:
+      selected_ref:
+        description: Exact commit SHA to validate
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase5-6-company-reference-live-producer
+  cancel-in-progress: false
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  company-reference-producer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
+      SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+      SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.selected_ref || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install bounded validator dependencies
+        run: python -m pip install --disable-pip-version-check --no-cache-dir requests==2.34.2
+
+      - name: Run bounded company/reference producer proof
+        run: |
+          mkdir -p company_reference_output
+          set -o pipefail
+          python tools/phase5_6_company_reference_live_validation.py \
+            --mode producer \
+            --client-id PASTICUAN \
+            --observed-on 2026-09-03 \
+            | tee company_reference_output/summary.log
+
+      - name: Record selected revision
+        if: always()
+        run: |
+          mkdir -p company_reference_output
+          git rev-parse HEAD > company_reference_output/selected-commit-sha.txt
+
+      - name: Upload proof
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: phase5-6-company-reference-producer-proof
+          path: company_reference_output/
+          if-no-files-found: error
