@@ -77,3 +77,14 @@ def test_auto_proof_tracks_shared_hub_readback_changes() -> None:
         / "capital-action-issued-history-live-validation.yml"
     ).read_text(encoding="utf-8").lower()
     assert '"shared_evidence_hub.py"' in workflow
+
+
+def test_producer_reproof_can_be_cache_only_without_provider_call() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "tools"
+        / "phase5_6_issued_history_live_validation.py"
+    ).read_text(encoding="utf-8")
+    assert "PRODUCER_CACHE_NETWORK_BUDGET_VIOLATION" in source
+    assert "PRODUCER_CACHE_REQUEST_NOT_AVOIDED" in source
+    assert '"CACHE_HIT"' in source
