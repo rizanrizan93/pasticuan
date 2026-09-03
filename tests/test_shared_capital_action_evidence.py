@@ -210,7 +210,7 @@ def test_ambiguous_new_shares_and_free_text_description_are_not_inferred() -> No
     assert split_row["event_type"] == "STOCK_SPLIT" and split_row["raw_action"] is None
 
 
-def test_additional_listing_preserves_explicit_monthly_date_span_and_shares() -> None:
+def test_additional_listing_uses_explicit_additional_shares() -> None:
     item = {
         "code": "TLKM",
         "startDate": "2026-08-03",
