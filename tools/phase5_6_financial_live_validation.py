@@ -82,7 +82,33 @@ def main() -> int:
 
     if not rows:
         stage = str(meta.get("failure_stage") or "UNRESOLVED_STAGE")
-        raise SystemExit(f"FINANCIAL_ROWS_EMPTY:{stage}:{meta.get('state')}")
+        state = str(meta.get("state") or "")
+        # IDX blocks the official attachment from bounded cloud runners.
+        # Treat only this exact producer-side negative capability as a
+        # contained upstream limitation. Never fabricate financial facts,
+        # never authorize scoring from the missing family, and keep every
+        # other failure fatal.
+        if args.mode == "producer" and stage == "OFFICIAL_ATTACHMENT" and state == "HTTP_403":
+            print(json.dumps({
+                "client_id": client_id,
+                "mode": args.mode,
+                "state": "UPSTREAM_ACCESS_BLOCKED",
+                "underlying_state": state,
+                "failure_stage": stage,
+                "ticker": str(args.ticker).strip().upper(),
+                "year": int(args.year),
+                "period": str(args.period),
+                "facts": 0,
+                "api_calls": int(meta.get("api_calls") or 0),
+                "attachment_calls": int(meta.get("attachment_calls") or 0),
+                "request_avoided": bool(meta.get("request_avoided")),
+                "cache_hit": bool(meta.get("cache_hit")),
+                "lease_state": str(meta.get("lease_state") or ""),
+                "authorization": "NO_SHARED_FINANCIAL_FACTS",
+                "scoring_eligible": False,
+            }, sort_keys=True))
+            return 0
+        raise SystemExit(f"FINANCIAL_ROWS_EMPTY:{stage}:{state}")
 
     report_period = str(rows[0].get("report_period") or "")
     valid, reason = validate_financial_facts(
