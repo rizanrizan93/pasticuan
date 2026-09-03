@@ -401,6 +401,28 @@ def _pluang_metric_rows(
     return list(unique.values())
 
 
+def _upsert_metric_batches(
+    backend: SupabaseEvidenceBackend,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    batch_size: int = 500,
+) -> list[dict[str, Any]]:
+    records = [dict(row) for row in rows]
+    output: list[dict[str, Any]] = []
+    size = max(50, min(int(batch_size), 1000))
+    for start in range(0, len(records), size):
+        batch = records[start:start + size]
+        written = backend.upsert_rows(
+            TABLE,
+            batch,
+            conflict=("provider", "ticker", "metric_name", "source_record_hash"),
+        )
+        if len(written) != len(batch):
+            raise RuntimeError(MissingReason.PERSIST_FAILURE.value)
+        output.extend(dict(row) for row in written)
+    return output
+
+
 def validate_structured_metrics(rows: Iterable[Mapping[str, Any]]) -> tuple[bool, str]:
     records = [dict(row) for row in rows]
     if not records:
@@ -463,9 +485,7 @@ class SharedStructuredFundamentalEvidence:
         valid, reason = validate_structured_metrics(rows)
         if not valid:
             return [], {"state": reason, "rows": 0, "period_rows": len(periods), "fact_rows": len(facts)}
-        written = self.backend.upsert_rows(
-            TABLE, rows, conflict=("provider", "ticker", "metric_name", "source_record_hash")
-        )
+        written = _upsert_metric_batches(self.backend, rows)
         return [dict(row) for row in written], {
             "state": "BRIDGED",
             "period_rows": len(periods),
