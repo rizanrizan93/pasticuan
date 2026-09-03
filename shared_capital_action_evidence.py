@@ -673,6 +673,9 @@ class SharedCapitalActionEvidence:
             if not valid:
                 counts: dict[str, int] = {}
                 detail_counts: dict[str, int] = {}
+                action_counts: dict[str, int] = {}
+                calculation_state_counts: dict[str, int] = {}
+                share_relation_counts: dict[str, int] = {}
                 valid_rows = 0
                 for row in rows:
                     row_valid, row_reason = validate_capital_action_rows(
@@ -686,9 +689,23 @@ class SharedCapitalActionEvidence:
                             row, feed=feed, source_period=source_period, observed_on=observed_on
                         )
                         detail_counts[detail] = detail_counts.get(detail, 0) + 1
+                        action = _clean(row.get("raw_action")) or "<EMPTY>"
+                        action_counts[action] = action_counts.get(action, 0) + 1
+                        calc_state = _clean(row.get("calculation_state")) or "<EMPTY>"
+                        calculation_state_counts[calc_state] = calculation_state_counts.get(calc_state, 0) + 1
+                        post = row.get("post_shares")
+                        delta = row.get("delta_shares")
+                        if isinstance(post, (int, float)) and isinstance(delta, (int, float)):
+                            relation = "DELTA_GT_POST" if delta > post else ("DELTA_EQ_POST" if delta == post else "DELTA_LT_POST")
+                        else:
+                            relation = "RELATION_UNAVAILABLE"
+                        share_relation_counts[relation] = share_relation_counts.get(relation, 0) + 1
                 meta["validation_valid_rows"] = valid_rows
                 meta["validation_failure_counts"] = counts
                 meta["validation_failure_detail_counts"] = detail_counts
+                meta["validation_failure_action_counts"] = action_counts
+                meta["validation_failure_calculation_state_counts"] = calculation_state_counts
+                meta["validation_failure_share_relation_counts"] = share_relation_counts
             return valid, reason
 
         result = self.coordinator.get_or_refresh(
