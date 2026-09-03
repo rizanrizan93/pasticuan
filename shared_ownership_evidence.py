@@ -421,6 +421,39 @@ class SharedOwnershipEvidence:
                 raise RuntimeError(MissingReason.CONNECTION_ERROR.value) from exc
             raise
         status = int(getattr(response, "status_code", 0) or 0)
+        if not api and status == 403 and self.config.ready and self.config.key_type == "SERVICE_ROLE":
+            proxy_url = f"{self.config.url}/functions/v1/phase5-6-official-document-fetch"
+            try:
+                proxy = self.session.request(
+                    "POST",
+                    proxy_url,
+                    json={"url": url},
+                    headers={
+                        "Authorization": f"Bearer {self.config.key}",
+                        "apikey": self.config.key,
+                        "Accept": "application/octet-stream",
+                    },
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                    allow_redirects=False,
+                )
+            except requests.Timeout as exc:
+                raise RuntimeError(MissingReason.TIMEOUT.value) from exc
+            except requests.ConnectionError as exc:
+                raise RuntimeError(MissingReason.CONNECTION_ERROR.value) from exc
+            proxy_status = int(getattr(proxy, "status_code", 0) or 0)
+            if proxy_status == 200:
+                official_source = _clean(
+                    (getattr(proxy, "headers", {}) or {}).get("x-official-source-url")
+                )
+                if official_source != url or not _official_url(official_source):
+                    raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
+                proxy.url = official_source
+                response = proxy
+                status = 200
+            elif proxy_status in {401, 403, 404, 429}:
+                raise RuntimeError(f"HTTP_{proxy_status}")
+            else:
+                raise RuntimeError(MissingReason.CONNECTION_ERROR.value)
         if 300 <= status < 400:
             raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
         if status in {401, 403, 404, 429}:
