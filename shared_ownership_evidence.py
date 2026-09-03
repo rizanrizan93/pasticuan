@@ -18,6 +18,13 @@ from urllib.parse import urlparse
 import pandas as pd
 import requests
 
+try:
+    from curl_cffi import requests as curl_requests
+    from curl_cffi.requests import exceptions as curl_exceptions
+except Exception:  # pragma: no cover - fail-closed fallback if optional transport is unavailable.
+    curl_requests = None
+    curl_exceptions = None
+
 from shared_evidence_hub import (
     EvidenceKey,
     HubConfig,
@@ -330,6 +337,7 @@ class SharedOwnershipEvidence:
         backend: Any | None = None,
         coordinator: SharedEvidenceCoordinator | None = None,
         session: Any | None = None,
+        official_file_session: Any | None = None,
         api_key: str | None = None,
         workbook_reader: Callable[[bytes], Mapping[str, pd.DataFrame]] | None = None,
     ):
@@ -340,6 +348,9 @@ class SharedOwnershipEvidence:
             SharedEvidenceCoordinator(self.backend, client_id=self.client_id) if self.backend is not None else None
         )
         self.session = session or requests.Session()
+        self.official_file_session = official_file_session
+        if self.official_file_session is None and session is None and curl_requests is not None:
+            self.official_file_session = curl_requests.Session(impersonate="chrome142")
         self.api_key = _secret("ZAPI_KEY") if api_key is None else _clean(api_key)
         self.workbook_reader = workbook_reader or self._read_workbook
 
@@ -362,17 +373,28 @@ class SharedOwnershipEvidence:
         if api and not self.api_key:
             raise RuntimeError(MissingReason.ENVIRONMENT_BLOCKED.value)
         stage = _clean(stage).upper() or ("ZAPI_INDEX" if api else "OFFICIAL_FILE")
-        headers = {
-            "Accept": "application/json" if api else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "User-Agent": (
-                "Shared-IDX-Evidence-Hub/ownership-index"
-                if api else "Shared-IDX-Evidence-Hub/ownership-file"
-            ),
-        }
         if api:
-            headers["x-api-key"] = self.api_key
+            headers = {
+                "Accept": "application/json",
+                "User-Agent": "Shared-IDX-Evidence-Hub/ownership-index",
+                "x-api-key": self.api_key,
+            }
+            transport = self.session
+        else:
+            # IDX Media applies anti-bot filtering to direct workbook downloads.
+            # Use a browser-fingerprint transport while preserving the original
+            # official URL, disabling redirects, and validating the XLSX bytes.
+            headers = {
+                "Accept": (
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,"
+                    "application/octet-stream;q=0.9,*/*;q=0.8"
+                ),
+                "Referer": "https://www.idx.co.id/",
+                "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+            }
+            transport = self.official_file_session or self.session
         try:
-            response = self.session.request(
+            response = transport.request(
                 "GET",
                 url,
                 params=dict(params or {}),
@@ -384,6 +406,20 @@ class SharedOwnershipEvidence:
             raise RuntimeError(MissingReason.TIMEOUT.value) from exc
         except requests.ConnectionError as exc:
             raise RuntimeError(MissingReason.CONNECTION_ERROR.value) from exc
+        except Exception as exc:
+            if curl_exceptions is not None and isinstance(exc, curl_exceptions.Timeout):
+                raise RuntimeError(MissingReason.TIMEOUT.value) from exc
+            if curl_exceptions is not None and isinstance(
+                exc,
+                (
+                    curl_exceptions.ConnectionError,
+                    curl_exceptions.DNSError,
+                    curl_exceptions.ProxyError,
+                    curl_exceptions.SSLError,
+                ),
+            ):
+                raise RuntimeError(MissingReason.CONNECTION_ERROR.value) from exc
+            raise
         status = int(getattr(response, "status_code", 0) or 0)
         if 300 <= status < 400:
             raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
