@@ -149,10 +149,10 @@ def test_issued_history_preserves_dates_and_derives_only_compatible_facts() -> N
     )[0]
     assert row["event_type"] == "WARRANT_EXERCISE"
     assert row["event_date"] == "2026-08-14" and row["publication_date"] == "2026-08-15"
-    assert row["delta_shares"] == 3_200
+    assert row["event_shares"] == 3_200
     assert row["post_shares"] == 22_375_261_532
-    assert row["pre_shares"] == 22_375_258_332
-    assert row["calculation_state"] == "EXPLICIT_DELTA_POST_DERIVED_PRE"
+    assert row["pre_shares"] is None and row["delta_shares"] is None
+    assert row["calculation_state"] == "EXPLICIT_EVENT_SHARES_POST_NO_DELTA"
 
 
 def test_pre_and_post_are_explicit_and_delta_is_arithmetic() -> None:
@@ -163,7 +163,7 @@ def test_pre_and_post_are_explicit_and_delta_is_arithmetic() -> None:
 
 
 def test_incompatible_explicit_share_fields_fail_closed() -> None:
-    item = _issued(sharesBefore=1000, sharesAfter=1200, shares=300)
+    item = _issued(shares=None, sharesBefore=1000, sharesAfter=1200, deltaShares=300)
     with pytest.raises(RuntimeError, match="PARSE_FAILURE"):
         normalize_capital_actions([item], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED)
 
@@ -640,7 +640,7 @@ def test_issued_history_page_limit_envelope_fallback_is_supported() -> None:
 
 
 def test_failed_issued_history_reports_categorical_validation_detail() -> None:
-    bad = _issued(id="bad", code="BBCA", shares=2_000, sharesAfter=1_000)
+    bad = _issued(id="bad", code="BBCA", shares=None, deltaShares=2_000, sharesAfter=1_000)
     session = Session([Response(_issued_payload([bad]))])
     rows, meta = _producer(MemoryBackend(), session).get_issued_history(OBSERVED)
     assert rows == []
@@ -651,3 +651,47 @@ def test_failed_issued_history_reports_categorical_validation_detail() -> None:
     assert meta["validation_failure_action_counts"] == {"waran": 1}
     assert meta["validation_failure_calculation_state_counts"] == {"EXPLICIT_DELTA_POST_DERIVED_PRE": 1}
     assert meta["validation_failure_share_relation_counts"] == {"DELTA_GT_POST": 1}
+
+
+def test_issued_history_generic_shares_can_exceed_post_without_inventing_negative_pre() -> None:
+    item = _issued(
+        id="legacy",
+        code="BBCA",
+        action="Delisting",
+        shares=2_000,
+        sharesAfter=1_000,
+        listingDate="2009-01-01",
+        publicationDate=None,
+    )
+    row = normalize_capital_actions(
+        [item], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    )[0]
+    assert row["event_shares"] == 2_000
+    assert row["post_shares"] == 1_000
+    assert row["pre_shares"] is None
+    assert row["delta_shares"] is None
+    assert row["calculation_state"] == "EXPLICIT_EVENT_SHARES_POST_NO_DELTA"
+    assert validate_capital_action_rows(
+        [row], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    ) == (True, "VALID")
+
+
+def test_issued_history_signed_event_shares_are_factual_not_invalid_delta() -> None:
+    item = _issued(
+        id="partial-delisting",
+        code="BBCA",
+        action="Partial Delisting",
+        shares=-5_516_000,
+        sharesAfter=24_655_010_000,
+        listingDate="2008-01-04",
+        publicationDate=None,
+    )
+    row = normalize_capital_actions(
+        [item], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    )[0]
+    assert row["event_shares"] == -5_516_000
+    assert row["post_shares"] == 24_655_010_000
+    assert row["pre_shares"] is None and row["delta_shares"] is None
+    assert validate_capital_action_rows(
+        [row], feed="issued-history", source_period=OBSERVED, observed_on=OBSERVED
+    ) == (True, "VALID")
