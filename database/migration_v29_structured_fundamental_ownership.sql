@@ -1,6 +1,6 @@
 -- Phase 5.6 structured fundamental + issuer shareholder evidence.
 -- Additive only. These tables are scanner-neutral factual/normalized evidence;
--- no score, rank, recommendation, entry, stop, or take-profit semantics are stored.
+-- no scanner decision, execution, or ranking semantics are stored.
 
 create table if not exists public.evidence_fundamental_metrics (
     provider text not null,
@@ -27,7 +27,7 @@ create table if not exists public.evidence_fundamental_metrics (
 );
 
 comment on table public.evidence_fundamental_metrics is
-  'Scanner-neutral normalized fundamental metrics with explicit source families and observation time. No scanner score or recommendation semantics.';
+  'Scanner-neutral normalized fundamental metrics with explicit source families and observation time. No scanner decision or ranking semantics.';
 
 create table if not exists public.evidence_shareholder_profiles (
     provider text not null,
