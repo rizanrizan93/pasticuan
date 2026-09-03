@@ -276,7 +276,12 @@ def test_profile_is_on_demand_single_ticker_and_not_all_company_daily() -> None:
 
 @pytest.mark.parametrize("set_name", ["sectors", "boards", "market-time"])
 def test_reference_sets_use_one_slow_ttl_call(set_name: str) -> None:
-    session = Session([Response({"set": set_name, "count": 1, "items": ["Value"], "dataset": "reference", "provider": "idx"})])
+    payload = {"set": set_name, "count": 1, "dataset": "reference", "provider": "idx"}
+    if set_name == "market-time":
+        payload["value"] = "Value"
+    else:
+        payload["items"] = ["Value"]
+    session = Session([Response(payload)])
     rows, meta = _producer(MemoryBackend(), session).get_reference(set_name, OBSERVED)
     assert len(rows) == 1 and meta["api_calls"] == 1 and meta["ttl_days"] == 90
     assert session.calls[0]["url"] == REFERENCE_URL and session.calls[0]["params"] == {"set": set_name}
