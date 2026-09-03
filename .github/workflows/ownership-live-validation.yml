@@ -63,7 +63,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install bounded ownership validator dependencies
-        run: python -m pip install --disable-pip-version-check --no-cache-dir pandas==2.3.3 requests==2.34.2 openpyxl==3.1.5
+        run: python -m pip install --disable-pip-version-check --no-cache-dir pandas==2.3.3 requests==2.34.2 openpyxl==3.1.5 'curl-cffi>=0.16,<1'
 
       - name: Run bounded ownership producer proof
         run: |
