@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timezone
+from datetime import date
 import json
 
 from shared_company_evidence import SharedCompanyEvidence
 from shared_evidence_hub import HubConfig, SupabaseEvidenceBackend
+from shared_fundamental_runtime import SharedFundamentalRuntime
 from shared_structured_fundamental_evidence import SharedStructuredFundamentalEvidence
 from shared_structured_ownership_evidence import SharedStructuredOwnershipEvidence
 
@@ -28,12 +30,11 @@ def main() -> int:
     args = _args()
     config = HubConfig.from_environment(client_id="PASTICUAN")
     backend = SupabaseEvidenceBackend(config)
-    fundamentals = SharedStructuredFundamentalEvidence(
-        "PASTICUAN", config=config, backend=backend
-    )
+    exact_fundamentals = SharedStructuredFundamentalEvidence("PASTICUAN", config=config, backend=backend)
+    structured = SharedFundamentalRuntime("PASTICUAN", config=config, backend=backend)
 
-    _, exact_bridge_meta = fundamentals.bridge_operational_financial_facts()
-    _, bridge_meta = fundamentals.bridge_operational(limit=5000)
+    _, exact_bridge_meta = exact_fundamentals.bridge_operational_financial_facts()
+    _, bridge_meta = structured.bridge_operational_snapshots(limit=5000)
 
     source_rows = backend.read_rows(
         "latest_fundamental_snapshots",
@@ -56,29 +57,58 @@ def main() -> int:
             gap_tickers.append(code)
     gap_tickers = list(dict.fromkeys(gap_tickers))[: max(0, args.fundamental_gap_limit)]
 
-    fundamental_results = {"attempted": 0, "refreshed": 0, "failed": 0, "rows": 0}
-    for code in gap_tickers:
-        fundamental_results["attempted"] += 1
-        try:
-            rows, meta = fundamentals.refresh_pluang(code, observed_at=datetime.now(timezone.utc))
-            if rows:
-                fundamental_results["refreshed"] += 1
-                fundamental_results["rows"] += len(rows)
-            else:
-                fundamental_results["failed"] += 1
-        except Exception:
-            fundamental_results["failed"] += 1
+    fundamental_results: dict[str, object] = {
+        "attempted": 0, "refreshed": 0, "failed": 0, "rows": 0,
+        "provider_success": {}, "failure_states": {}, "failure_samples": [],
+    }
+    provider_success: Counter[str] = Counter()
+    failure_states: Counter[str] = Counter()
+
+    def one_fundamental(code: str) -> dict[str, object]:
+        rows, meta = structured.refresh_structured(code)
+        return {"ticker": code, "rows": len(rows), "meta": meta}
+
+    with ThreadPoolExecutor(max_workers=max(1, min(args.workers, 4))) as executor:
+        futures = {executor.submit(one_fundamental, code): code for code in gap_tickers}
+        for future in as_completed(futures):
+            code = futures[future]
+            fundamental_results["attempted"] = int(fundamental_results["attempted"]) + 1
+            try:
+                result = future.result()
+                rows = int(result.get("rows") or 0)
+                meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+                if rows:
+                    fundamental_results["refreshed"] = int(fundamental_results["refreshed"]) + 1
+                    fundamental_results["rows"] = int(fundamental_results["rows"]) + rows
+                    provider_success[str(meta.get("provider") or "UNKNOWN")] += 1
+                else:
+                    fundamental_results["failed"] = int(fundamental_results["failed"]) + 1
+                    attempts = meta.get("attempts") if isinstance(meta.get("attempts"), list) else []
+                    for attempt in attempts:
+                        if isinstance(attempt, dict):
+                            failure_states[f"{attempt.get('provider','UNKNOWN')}:{attempt.get('state','UNKNOWN')}"] += 1
+                    samples = fundamental_results["failure_samples"]
+                    if isinstance(samples, list) and len(samples) < 12:
+                        samples.append({"ticker": code, "attempts": attempts})
+            except Exception as exc:
+                fundamental_results["failed"] = int(fundamental_results["failed"]) + 1
+                failure_states[f"UNCAUGHT:{type(exc).__name__}"] += 1
+                samples = fundamental_results["failure_samples"]
+                if isinstance(samples, list) and len(samples) < 12:
+                    samples.append({"ticker": code, "error": f"{type(exc).__name__}: {str(exc)[:160]}"})
+    fundamental_results["provider_success"] = dict(provider_success)
+    fundamental_results["failure_states"] = dict(failure_states)
 
     ownership_tickers = tickers[: max(0, args.ownership_limit)]
     today = date.today()
 
-    def one(code: str) -> dict[str, object]:
+    def one_ownership(code: str) -> dict[str, object]:
         company = SharedCompanyEvidence("PASTICUAN")
         owner = SharedStructuredOwnershipEvidence("PASTICUAN")
         try:
             profile_rows, meta = company.get_profile(code, today)
             if profile_rows:
-                rows, own_meta = owner.persist_idx_profile(profile_rows[0])
+                rows, _ = owner.persist_idx_profile(profile_rows[0])
                 if rows:
                     return {"ticker": code, "state": "IDX_PROFILE", "rows": len(rows), "api_calls": int(meta.get("api_calls") or 0)}
             rows, own_meta = owner.refresh_pluang(code, observed_on=today)
@@ -90,7 +120,7 @@ def main() -> int:
 
     ownership_results = {"attempted": 0, "idx_profile": 0, "pluang_fallback": 0, "failed": 0, "rows": 0}
     with ThreadPoolExecutor(max_workers=max(1, min(args.workers, 8))) as executor:
-        futures = {executor.submit(one, code): code for code in ownership_tickers}
+        futures = {executor.submit(one_ownership, code): code for code in ownership_tickers}
         for future in as_completed(futures):
             result = future.result()
             ownership_results["attempted"] += 1
@@ -106,7 +136,7 @@ def main() -> int:
     summary = {
         "exact_operational_financial_bridge": exact_bridge_meta,
         "structured_fundamental_bridge": bridge_meta,
-        "pluang_fundamental_gap_fill": fundamental_results,
+        "structured_provider_gap_fill": fundamental_results,
         "structured_ownership": ownership_results,
         "universe_tickers": len(tickers),
         "ownership_limit": len(ownership_tickers),
