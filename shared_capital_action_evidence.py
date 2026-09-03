@@ -62,6 +62,7 @@ FEEDS: dict[str, dict[str, Any]] = {
 MONTHLY_FEEDS = frozenset({"additional-listings", "rights-offerings", "stock-splits"})
 EVENT_DATE_FIELDS = ("listingDate", "effectiveDate", "eventDate", "exDate", "date")
 PUBLICATION_DATE_FIELDS = ("publicationDate", "publishedAt", "publishedDate")
+EVENT_DATE_KINDS = frozenset({"POINT", "RANGE_END"})
 
 
 def _clean(value: Any) -> str:
@@ -281,11 +282,35 @@ def normalize_capital_actions(
     normalized: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for item in items:
         ticker = _ticker(_first(item, ("code", "ticker", "stockCode", "KodeEmiten")))
-        event_date = _explicit_date_group(item, EVENT_DATE_FIELDS)
-        if not ticker or event_date is None:
-            continue
-        if feed in MONTHLY_FEEDS and (event_date.year, event_date.month) != (period.year, period.month):
-            continue
+        if feed == "additional-listings":
+            # ZAPI/IDX additional-listings is a monthly aggregate row with an
+            # explicit startDate..lastDate span, not a point-in-time listingDate.
+            # Preserve the full span and use its explicit end only as the
+            # deterministic event_date identity.
+            if not ticker:
+                raise RuntimeError(MissingReason.ISSUER_IDENTITY_MISSING.value)
+            event_start_date = _explicit_date_group(item, ("startDate",))
+            event_end_date = _explicit_date_group(item, ("lastDate",))
+            if event_start_date is None or event_end_date is None:
+                raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
+            if event_start_date > event_end_date:
+                raise RuntimeError(MissingReason.CONTEXT_REJECTED.value)
+            if (
+                (event_start_date.year, event_start_date.month) != (period.year, period.month)
+                or (event_end_date.year, event_end_date.month) != (period.year, period.month)
+            ):
+                raise RuntimeError(MissingReason.WRONG_PERIOD.value)
+            event_date = event_end_date
+            event_date_kind = "RANGE_END"
+        else:
+            event_date = _explicit_date_group(item, EVENT_DATE_FIELDS)
+            if not ticker or event_date is None:
+                continue
+            if feed in MONTHLY_FEEDS and (event_date.year, event_date.month) != (period.year, period.month):
+                continue
+            event_start_date = None
+            event_end_date = None
+            event_date_kind = "POINT"
         publication_date = _explicit_date_group(item, PUBLICATION_DATE_FIELDS)
         raw_action = _clean(_first(item, ("action", "actionType", "eventType", "type")))
         event_type = _event_type(feed, raw_action)
@@ -302,6 +327,9 @@ def normalize_capital_actions(
             "ticker": ticker,
             "event_type": event_type,
             "event_date": event_date.isoformat(),
+            "event_date_kind": event_date_kind,
+            "event_start_date": event_start_date.isoformat() if event_start_date else None,
+            "event_end_date": event_end_date.isoformat() if event_end_date else None,
             "publication_date": publication_date.isoformat() if publication_date else None,
             "pre_shares": pre,
             "post_shares": post,
@@ -356,6 +384,27 @@ def validate_capital_action_rows(
         event_date = _date(row.get("event_date"))
         if event_date is None or (feed in MONTHLY_FEEDS and (event_date.year, event_date.month) != (expected_period.year, expected_period.month)):
             return False, MissingReason.WRONG_PERIOD.value
+        date_kind = _clean(row.get("event_date_kind")).upper()
+        if date_kind not in EVENT_DATE_KINDS:
+            return False, MissingReason.CONTEXT_REJECTED.value
+        event_start_date = _date(row.get("event_start_date"))
+        event_end_date = _date(row.get("event_end_date"))
+        if feed == "additional-listings":
+            if (
+                date_kind != "RANGE_END"
+                or event_start_date is None
+                or event_end_date is None
+                or event_start_date > event_end_date
+                or event_date != event_end_date
+            ):
+                return False, MissingReason.CONTEXT_REJECTED.value
+            if (
+                (event_start_date.year, event_start_date.month) != (expected_period.year, expected_period.month)
+                or (event_end_date.year, event_end_date.month) != (expected_period.year, expected_period.month)
+            ):
+                return False, MissingReason.WRONG_PERIOD.value
+        elif date_kind != "POINT" or row.get("event_start_date") is not None or row.get("event_end_date") is not None:
+            return False, MissingReason.CONTEXT_REJECTED.value
         if not _ticker(row.get("ticker")) or not row.get("source_verified") or row.get("validation_state") != "VALID":
             return False, MissingReason.CONTEXT_REJECTED.value
         publication_date = _date(row.get("publication_date"))
@@ -566,7 +615,7 @@ class SharedCapitalActionEvidence:
 
 
 __all__ = [
-    "FEEDS", "ISSUED_HISTORY_LENGTH", "MAX_PAGES_PER_RUN", "MONTHLY_FEEDS", "PAGE_LENGTH",
+    "EVENT_DATE_KINDS", "FEEDS", "ISSUED_HISTORY_LENGTH", "MAX_PAGES_PER_RUN", "MONTHLY_FEEDS", "PAGE_LENGTH",
     "REQUEST_TIMEOUT_SECONDS",
     "SharedCapitalActionEvidence", "normalize_capital_actions",
     "validate_capital_action_rows",
