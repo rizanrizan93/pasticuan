@@ -1,0 +1,99 @@
+name: Phase 5.6 fundamental collector live proof
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/fundamental-collector-live-proof.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase5-6-fundamental-collector-live-proof
+  cancel-in-progress: false
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  collector-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
+      SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+      SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install bounded dependencies
+        run: python -m pip install --disable-pip-version-check --no-cache-dir requests==2.34.2
+      - name: Run focused structured fundamental collector proof
+        run: |
+          python - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from collections import Counter
+          import json
+
+          from shared_fundamental_runtime import SharedFundamentalRuntime
+
+          tickers = [
+              "AALI", "ADRO", "AIMS", "AKSI", "ALMI", "AMMN",
+              "ANTM", "APEX", "ARTI", "BABY", "BAJA", "BBCA",
+          ]
+
+          def collect(code):
+              runtime = SharedFundamentalRuntime("PASTICUAN")
+              rows, meta = runtime.refresh_structured(code)
+              return {"ticker": code, "rows": len(rows), "meta": meta}
+
+          results = []
+          with ThreadPoolExecutor(max_workers=4) as executor:
+              futures = {executor.submit(collect, code): code for code in tickers}
+              for future in as_completed(futures):
+                  code = futures[future]
+                  try:
+                      results.append(future.result())
+                  except Exception as exc:
+                      results.append({"ticker": code, "rows": 0, "error": f"{type(exc).__name__}: {str(exc)[:180]}"})
+
+          provider_success = Counter()
+          failure_states = Counter()
+          refreshed = 0
+          persisted_rows = 0
+          for result in results:
+              rows = int(result.get("rows") or 0)
+              meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+              if rows:
+                  refreshed += 1
+                  persisted_rows += rows
+                  provider_success[str(meta.get("provider") or "UNKNOWN")] += 1
+              else:
+                  attempts = meta.get("attempts") if isinstance(meta.get("attempts"), list) else []
+                  if not attempts and result.get("error"):
+                      failure_states[str(result.get("error"))] += 1
+                  for attempt in attempts:
+                      if isinstance(attempt, dict):
+                          failure_states[f"{attempt.get('provider','UNKNOWN')}:{attempt.get('state','UNKNOWN')}"] += 1
+
+          summary = {
+              "attempted": len(tickers),
+              "refreshed": refreshed,
+              "failed": len(tickers) - refreshed,
+              "persisted_rows": persisted_rows,
+              "provider_success": dict(provider_success),
+              "failure_states": dict(failure_states),
+              "results": sorted(results, key=lambda item: item.get("ticker", "")),
+              "policy": "FACTS_ONLY_NO_SCORING_OR_GATE_CHANGE",
+          }
+          print("COLLECTOR_PROOF=" + json.dumps(summary, sort_keys=True))
+          if refreshed == 0:
+              raise SystemExit("collector proof produced zero structured fundamental successes")
+          PY
