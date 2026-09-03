@@ -7,6 +7,8 @@ on:
       - "shared_structured_fundamental_evidence.py"
       - "shared_structured_ownership_evidence.py"
       - "shared_company_evidence.py"
+      - "shared_fundamental_runtime.py"
+      - "shared_fundamental_rate_limit_patch.py"
       - "tools/phase5_6_structured_evidence_backfill.py"
       - ".github/workflows/structured-evidence-backfill.yml"
       - "database/migration_v29_structured_fundamental_ownership.sql"
@@ -18,7 +20,7 @@ on:
         default: "800"
         type: string
       fundamental_gap_limit:
-        description: Maximum structured financial gaps to refresh via Pluang
+        description: Maximum structured financial gaps to refresh
         required: false
         default: "250"
         type: string
@@ -30,7 +32,7 @@ permissions:
 
 concurrency:
   group: phase5-6-structured-evidence-backfill
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   PYTHONPATH: ${{ github.workspace }}
@@ -39,9 +41,11 @@ env:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       ZAPI_KEY: ${{ secrets.ZAPI_KEY }}
+      ZAPI_MIN_REQUEST_INTERVAL_SECONDS: "0.90"
+      ZAPI_MINUTE_COOLDOWN_SECONDS: "61"
       SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
       SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
     steps:
@@ -55,4 +59,17 @@ jobs:
         run: python -m pip install --disable-pip-version-check --no-cache-dir requests==2.34.2 pandas==2.3.3
       - name: Run structured evidence backfill
         run: |
-          python tools/phase5_6_structured_evidence_backfill.py             --ownership-limit "${{ inputs.ownership_limit || '800' }}"             --fundamental-gap-limit "${{ inputs.fundamental_gap_limit || '250' }}"             --workers 4
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # A push is a bounded live proof only: fundamentals first, no ownership
+            # fan-out, no expensive operational bridge rewrite.
+            python tools/phase5_6_structured_evidence_backfill.py \
+              --ownership-limit 0 \
+              --fundamental-gap-limit 12 \
+              --workers 1 \
+              --skip-bridges
+          else
+            python tools/phase5_6_structured_evidence_backfill.py \
+              --ownership-limit "${{ inputs.ownership_limit || '800' }}" \
+              --fundamental-gap-limit "${{ inputs.fundamental_gap_limit || '250' }}" \
+              --workers 1
+          fi

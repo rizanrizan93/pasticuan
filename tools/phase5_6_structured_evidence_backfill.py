@@ -8,6 +8,7 @@ import json
 
 from shared_company_evidence import SharedCompanyEvidence
 from shared_evidence_hub import HubConfig, SupabaseEvidenceBackend
+from shared_fundamental_rate_limit_patch import install as install_rate_limit_patch
 from shared_fundamental_runtime import SharedFundamentalRuntime
 from shared_structured_fundamental_evidence import SharedStructuredFundamentalEvidence
 from shared_structured_ownership_evidence import SharedStructuredOwnershipEvidence
@@ -17,7 +18,8 @@ def _args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--ownership-limit", type=int, default=800)
     p.add_argument("--fundamental-gap-limit", type=int, default=250)
-    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--skip-bridges", action="store_true")
     return p.parse_args()
 
 
@@ -28,13 +30,18 @@ def _ticker(value: object) -> str:
 
 def main() -> int:
     args = _args()
+    install_rate_limit_patch()
     config = HubConfig.from_environment(client_id="PASTICUAN")
     backend = SupabaseEvidenceBackend(config)
     exact_fundamentals = SharedStructuredFundamentalEvidence("PASTICUAN", config=config, backend=backend)
     structured = SharedFundamentalRuntime("PASTICUAN", config=config, backend=backend)
 
-    _, exact_bridge_meta = exact_fundamentals.bridge_operational_financial_facts()
-    _, bridge_meta = structured.bridge_operational_snapshots(limit=5000)
+    if args.skip_bridges:
+        exact_bridge_meta = {"state": "SKIPPED_FOR_FOCUSED_PROVIDER_PROOF", "rows": 0}
+        bridge_meta = {"state": "SKIPPED_FOR_FOCUSED_PROVIDER_PROOF", "rows": 0}
+    else:
+        _, exact_bridge_meta = exact_fundamentals.bridge_operational_financial_facts()
+        _, bridge_meta = structured.bridge_operational_snapshots(limit=5000)
 
     source_rows = backend.read_rows(
         "latest_fundamental_snapshots",
@@ -58,44 +65,52 @@ def main() -> int:
     gap_tickers = list(dict.fromkeys(gap_tickers))[: max(0, args.fundamental_gap_limit)]
 
     fundamental_results: dict[str, object] = {
-        "attempted": 0, "refreshed": 0, "failed": 0, "rows": 0,
-        "provider_success": {}, "failure_states": {}, "failure_samples": [],
+        "candidate_gaps": len(gap_tickers),
+        "attempted": 0,
+        "refreshed": 0,
+        "failed": 0,
+        "deferred": 0,
+        "rows": 0,
+        "provider_success": {},
+        "failure_states": {},
+        "failure_samples": [],
+        "rate_limit_state": "NONE",
     }
     provider_success: Counter[str] = Counter()
     failure_states: Counter[str] = Counter()
 
-    def one_fundamental(code: str) -> dict[str, object]:
-        rows, meta = structured.refresh_structured(code)
-        return {"ticker": code, "rows": len(rows), "meta": meta}
-
-    with ThreadPoolExecutor(max_workers=max(1, min(args.workers, 4))) as executor:
-        futures = {executor.submit(one_fundamental, code): code for code in gap_tickers}
-        for future in as_completed(futures):
-            code = futures[future]
-            fundamental_results["attempted"] = int(fundamental_results["attempted"]) + 1
-            try:
-                result = future.result()
-                rows = int(result.get("rows") or 0)
-                meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
-                if rows:
-                    fundamental_results["refreshed"] = int(fundamental_results["refreshed"]) + 1
-                    fundamental_results["rows"] = int(fundamental_results["rows"]) + rows
-                    provider_success[str(meta.get("provider") or "UNKNOWN")] += 1
-                else:
-                    fundamental_results["failed"] = int(fundamental_results["failed"]) + 1
-                    attempts = meta.get("attempts") if isinstance(meta.get("attempts"), list) else []
-                    for attempt in attempts:
-                        if isinstance(attempt, dict):
-                            failure_states[f"{attempt.get('provider','UNKNOWN')}:{attempt.get('state','UNKNOWN')}"] += 1
-                    samples = fundamental_results["failure_samples"]
-                    if isinstance(samples, list) and len(samples) < 12:
-                        samples.append({"ticker": code, "attempts": attempts})
-            except Exception as exc:
+    # Fundamental refresh is deliberately sequential. Each ticker may require
+    # three Pluang calls or four Yahoo calls, and all ZAPI endpoints share one
+    # account-level rate window. shared_fundamental_rate_limit_patch adds an
+    # additional inter-request pace and prevents same-window fallback on 429.
+    for code in gap_tickers:
+        fundamental_results["attempted"] = int(fundamental_results["attempted"]) + 1
+        try:
+            rows, meta = structured.refresh_structured(code)
+            if rows:
+                fundamental_results["refreshed"] = int(fundamental_results["refreshed"]) + 1
+                fundamental_results["rows"] = int(fundamental_results["rows"]) + len(rows)
+                provider_success[str(meta.get("provider") or "UNKNOWN")] += 1
+            else:
                 fundamental_results["failed"] = int(fundamental_results["failed"]) + 1
-                failure_states[f"UNCAUGHT:{type(exc).__name__}"] += 1
+                attempts = meta.get("attempts") if isinstance(meta.get("attempts"), list) else []
+                for attempt in attempts:
+                    if isinstance(attempt, dict):
+                        failure_states[f"{attempt.get('provider','UNKNOWN')}:{attempt.get('state','UNKNOWN')}"] += 1
                 samples = fundamental_results["failure_samples"]
                 if isinstance(samples, list) and len(samples) < 12:
-                    samples.append({"ticker": code, "error": f"{type(exc).__name__}: {str(exc)[:160]}"})
+                    samples.append({"ticker": code, "state": meta.get("state"), "attempts": attempts, "rate_limit": meta.get("rate_limit")})
+                state = str(meta.get("state") or "")
+                if state.startswith("ZAPI_RATE_LIMIT_"):
+                    fundamental_results["rate_limit_state"] = state
+                    break
+        except Exception as exc:
+            fundamental_results["failed"] = int(fundamental_results["failed"]) + 1
+            failure_states[f"UNCAUGHT:{type(exc).__name__}"] += 1
+            samples = fundamental_results["failure_samples"]
+            if isinstance(samples, list) and len(samples) < 12:
+                samples.append({"ticker": code, "error": f"{type(exc).__name__}: {str(exc)[:160]}"})
+    fundamental_results["deferred"] = max(0, len(gap_tickers) - int(fundamental_results["attempted"]))
     fundamental_results["provider_success"] = dict(provider_success)
     fundamental_results["failure_states"] = dict(failure_states)
 
@@ -119,19 +134,20 @@ def main() -> int:
             return {"ticker": code, "state": type(exc).__name__, "rows": 0, "api_calls": 0}
 
     ownership_results = {"attempted": 0, "idx_profile": 0, "pluang_fallback": 0, "failed": 0, "rows": 0}
-    with ThreadPoolExecutor(max_workers=max(1, min(args.workers, 8))) as executor:
-        futures = {executor.submit(one_ownership, code): code for code in ownership_tickers}
-        for future in as_completed(futures):
-            result = future.result()
-            ownership_results["attempted"] += 1
-            ownership_results["rows"] += int(result.get("rows") or 0)
-            state = str(result.get("state") or "")
-            if state == "IDX_PROFILE":
-                ownership_results["idx_profile"] += 1
-            elif state == "PLUANG_FALLBACK":
-                ownership_results["pluang_fallback"] += 1
-            else:
-                ownership_results["failed"] += 1
+    if ownership_tickers:
+        with ThreadPoolExecutor(max_workers=max(1, min(args.workers, 2))) as executor:
+            futures = {executor.submit(one_ownership, code): code for code in ownership_tickers}
+            for future in as_completed(futures):
+                result = future.result()
+                ownership_results["attempted"] += 1
+                ownership_results["rows"] += int(result.get("rows") or 0)
+                state = str(result.get("state") or "")
+                if state == "IDX_PROFILE":
+                    ownership_results["idx_profile"] += 1
+                elif state == "PLUANG_FALLBACK":
+                    ownership_results["pluang_fallback"] += 1
+                else:
+                    ownership_results["failed"] += 1
 
     summary = {
         "exact_operational_financial_bridge": exact_bridge_meta,
