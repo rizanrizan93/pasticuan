@@ -442,6 +442,87 @@ def validate_capital_action_rows(
     return True, "VALID"
 
 
+def _validation_detail(
+    row: Mapping[str, Any], *, feed: str, source_period: date, observed_on: date
+) -> str:
+    """Return a categorical diagnostic only; never include provider row values."""
+    expected_period = source_period.replace(day=1) if feed in MONTHLY_FEEDS else source_period
+    if (
+        row.get("source") != FEEDS.get(feed, {}).get("source")
+        or row.get("source_feed") != feed
+        or row.get("source_period") != expected_period.isoformat()
+        or row.get("observed_on") != observed_on.isoformat()
+    ):
+        return "SOURCE_PERIOD_IDENTITY"
+    event_date = _date(row.get("event_date"))
+    if event_date is None:
+        return "EVENT_DATE_INVALID"
+    if feed in MONTHLY_FEEDS and (event_date.year, event_date.month) != (expected_period.year, expected_period.month):
+        return "EVENT_DATE_WRONG_PERIOD"
+    date_kind = _clean(row.get("event_date_kind")).upper()
+    if date_kind not in EVENT_DATE_KINDS:
+        return "EVENT_DATE_KIND_INVALID"
+    event_start_date = _date(row.get("event_start_date"))
+    event_end_date = _date(row.get("event_end_date"))
+    if feed == "additional-listings":
+        if date_kind != "RANGE_END":
+            return "RANGE_KIND_INVALID"
+        if event_start_date is None or event_end_date is None:
+            return "RANGE_DATE_MISSING"
+        if event_start_date > event_end_date or event_date != event_end_date:
+            return "RANGE_DATE_INCONSISTENT"
+        if (
+            (event_start_date.year, event_start_date.month) != (expected_period.year, expected_period.month)
+            or (event_end_date.year, event_end_date.month) != (expected_period.year, expected_period.month)
+        ):
+            return "RANGE_WRONG_PERIOD"
+    elif date_kind != "POINT" or row.get("event_start_date") is not None or row.get("event_end_date") is not None:
+        return "POINT_DATE_SEMANTICS"
+    if not _ticker(row.get("ticker")):
+        return "TICKER_INVALID"
+    if not row.get("source_verified") or row.get("validation_state") != "VALID":
+        return "SOURCE_VALIDATION_STATE"
+    publication_date = _date(row.get("publication_date"))
+    if row.get("publication_date") is not None and publication_date is None:
+        return "PUBLICATION_DATE_INVALID"
+    if publication_date is not None and publication_date > observed_on:
+        return "PUBLICATION_DATE_FUTURE"
+    try:
+        _official_source_url(row.get("source_url"), fallback=FEEDS[feed]["url"])
+    except RuntimeError:
+        return "SOURCE_URL_INVALID"
+    numeric = [row.get(name) for name in ("pre_shares", "post_shares", "delta_shares", "delta_percent", "ratio_before", "ratio_after")]
+    if any(
+        value is not None
+        and (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+        )
+        for value in numeric
+    ):
+        return "NUMERIC_INVALID"
+    pre, post, delta = row.get("pre_shares"), row.get("post_shares"), row.get("delta_shares")
+    if pre is not None and pre < 0:
+        return "PRE_SHARES_NEGATIVE"
+    if post is not None and post < 0:
+        return "POST_SHARES_NEGATIVE"
+    if row.get("ratio_before") is not None and row["ratio_before"] <= 0:
+        return "RATIO_BEFORE_NONPOSITIVE"
+    if row.get("ratio_after") is not None and row["ratio_after"] <= 0:
+        return "RATIO_AFTER_NONPOSITIVE"
+    if (
+        all(value is not None for value in (pre, post, delta))
+        and not math.isclose(float(post) - float(pre), float(delta), rel_tol=1e-12, abs_tol=1e-8)
+    ):
+        return "SHARE_ARITHMETIC_INCONSISTENT"
+    if not _clean(row.get("payload_hash")):
+        return "PAYLOAD_HASH_MISSING"
+    if not _clean(row.get("calculation_state")):
+        return "CALCULATION_STATE_MISSING"
+    return "VALID"
+
+
 class SharedCapitalActionEvidence:
     def __init__(
         self,
@@ -591,6 +672,7 @@ class SharedCapitalActionEvidence:
             meta["validation_reason"] = reason
             if not valid:
                 counts: dict[str, int] = {}
+                detail_counts: dict[str, int] = {}
                 valid_rows = 0
                 for row in rows:
                     row_valid, row_reason = validate_capital_action_rows(
@@ -600,8 +682,13 @@ class SharedCapitalActionEvidence:
                         valid_rows += 1
                     else:
                         counts[row_reason] = counts.get(row_reason, 0) + 1
+                        detail = _validation_detail(
+                            row, feed=feed, source_period=source_period, observed_on=observed_on
+                        )
+                        detail_counts[detail] = detail_counts.get(detail, 0) + 1
                 meta["validation_valid_rows"] = valid_rows
                 meta["validation_failure_counts"] = counts
+                meta["validation_failure_detail_counts"] = detail_counts
             return valid, reason
 
         result = self.coordinator.get_or_refresh(
