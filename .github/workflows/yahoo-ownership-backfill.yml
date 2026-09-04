@@ -1,0 +1,46 @@
+name: Phase 5.6 Yahoo ownership backfill - Pasticuan
+
+on:
+  push:
+    branches: ["phase5.6/idx-direct-ownership-profile"]
+    paths:
+      - "shared_yahoo_ownership_evidence.py"
+      - "tools/phase5_6_yahoo_ownership_backfill.py"
+      - "tests/test_phase5_6_yahoo_ownership_evidence.py"
+      - "database/migration_v31_yahoo_ownership_concentration.sql"
+      - ".github/workflows/yahoo-ownership-backfill.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase5-6-yahoo-ownership-backfill
+  cancel-in-progress: true
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+      SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install bounded dependencies
+        run: python -m pip install --disable-pip-version-check --no-cache-dir 'yfinance>=0.2.65,<1' pandas 'requests>=2.31,<3' 'pytest>=8,<9'
+      - name: Compile ownership path
+        run: python -m py_compile shared_yahoo_ownership_evidence.py tools/phase5_6_yahoo_ownership_backfill.py
+      - name: Ownership normalization regression
+        run: pytest -q tests/test_phase5_6_yahoo_ownership_evidence.py
+      - name: Backfill full ownership universe
+        run: python tools/phase5_6_yahoo_ownership_backfill.py --limit 706 --workers 2 --pause-seconds 0.20

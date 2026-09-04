@@ -1,0 +1,64 @@
+name: Phase 5.6 direct ownership provider proof
+
+on:
+  push:
+    branches: ["phase5.6/idx-direct-ownership-profile"]
+    paths:
+      - ".github/workflows/idx-direct-ownership-proof.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install direct Yahoo client
+        run: python -m pip install --disable-pip-version-check --no-cache-dir 'yfinance>=0.2.65,<1' pandas
+      - name: Inspect Yahoo ownership semantics
+        run: |
+          python - <<'PY'
+          import json
+          import pandas as pd
+          import yfinance as yf
+
+          results=[]
+          for code in ('BBCA','MARK','OMED','ELSA','ANTM'):
+              t=yf.Ticker(f'{code}.JK')
+              item={'ticker':code}
+              for attr in ('major_holders','institutional_holders','mutualfund_holders'):
+                  try:
+                      value=getattr(t,attr)
+                      if isinstance(value,pd.DataFrame):
+                          safe=value.copy().reset_index()
+                          for col in safe.columns:
+                              safe[col]=safe[col].map(lambda x: x.isoformat() if hasattr(x,'isoformat') else x)
+                          item[attr]={'rows':int(len(value)),'columns':[str(c) for c in value.columns],'records':safe.to_dict(orient='records')[:12]}
+                      else:
+                          item[attr]={'rows':0,'records':[]}
+                  except Exception as exc:
+                      item[attr]={'error':f'{type(exc).__name__}: {str(exc)[:120]}'}
+              results.append(item)
+          print(json.dumps(results,sort_keys=True,default=str))
+          required=('insidersPercentHeld','institutionsPercentHeld','institutionsFloatPercentHeld','institutionsCount')
+          normalized=set()
+          for item in results:
+              records=item.get('major_holders',{}).get('records',[])
+              for record in records:
+                  label=str(record.get('index') or record.get('Breakdown') or '').strip()
+                  if label:
+                      normalized.add(label)
+          if not set(required).issubset(normalized):
+              raise SystemExit(f'unexpected Yahoo major_holders labels: {sorted(normalized)}')
+          PY
