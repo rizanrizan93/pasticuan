@@ -51,6 +51,7 @@ def _install_integrity_patch(expected: str) -> None:
     _try_optional_patch("shared_fundamental_runtime_patch", "install")
     _try_optional_patch("technical_persistence_semantics_patch", "install")
     _try_optional_patch("phase56_coverage_runtime_patch", "install")
+    _try_optional_patch("phase56_runtime_coverage_integrity_patch", "install")
     _try_optional_patch("pasticuan_ownership_calibration_telemetry_patch", "install")
 
 
