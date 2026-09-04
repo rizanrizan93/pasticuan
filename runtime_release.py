@@ -49,6 +49,7 @@ def _install_integrity_patch(expected: str) -> None:
     _try_optional_patch("pasticuan_shared_hub_config_patch", "install")
     _try_optional_patch("shared_fundamental_rate_limit_patch", "install")
     _try_optional_patch("shared_fundamental_runtime_patch", "install")
+    _try_optional_patch("technical_persistence_semantics_patch", "install")
 
 
 def refresh_release_runtime(
