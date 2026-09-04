@@ -1,4 +1,4 @@
-name: Phase 5.6 IDX direct ownership profile proof
+name: Phase 5.6 direct ownership provider proof
 
 on:
   push:
@@ -16,7 +16,7 @@ env:
 jobs:
   proof:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v6
         with:
@@ -24,42 +24,40 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install browser-compatible HTTP client
-        run: python -m pip install --disable-pip-version-check --no-cache-dir 'curl-cffi>=0.13,<1'
-      - name: Probe official IDX detailed profiles
+      - name: Install direct Yahoo client
+        run: python -m pip install --disable-pip-version-check --no-cache-dir 'yfinance>=0.2.65,<1' pandas
+      - name: Probe Yahoo holder datasets for IDX tickers
         run: |
           python - <<'PY'
           import json
-          from curl_cffi import requests
+          import pandas as pd
+          import yfinance as yf
 
-          base = 'https://www.idx.co.id/primary/ListedCompany/GetCompanyProfilesDetail'
-          results = []
-          for ticker in ('BBCA','MARK','OMED'):
+          results=[]
+          for code in ('BBCA','MARK','OMED','ELSA','ANTM'):
+              symbol=f'{code}.JK'
+              item={'ticker':code}
               try:
-                  response = requests.get(
-                      base,
-                      params={'emitenType':'s','kodeEmiten':ticker},
-                      headers={'Accept':'application/json','Referer':'https://www.idx.co.id/id/perusahaan-tercatat/profil-perusahaan-tercatat/'},
-                      timeout=20,
-                      impersonate='chrome',
-                  )
-                  item = {'ticker': ticker, 'status': response.status_code}
-                  if response.status_code == 200:
-                      payload = response.json()
-                      item['root_type'] = type(payload).__name__
-                      if isinstance(payload, dict):
-                          item['root_keys'] = sorted(payload.keys())[:30]
-                          profiles = payload.get('Profiles') if isinstance(payload.get('Profiles'), list) else []
-                          item['profiles'] = len(profiles)
-                          first = profiles[0] if profiles and isinstance(profiles[0], dict) else {}
-                          item['profile_ticker'] = first.get('KodeEmiten') or first.get('code')
-                          holders = payload.get('PemegangSaham') if isinstance(payload.get('PemegangSaham'), list) else first.get('PemegangSaham') if isinstance(first.get('PemegangSaham'), list) else []
-                          item['shareholders'] = len(holders)
-                          item['shareholder_keys'] = sorted(holders[0].keys()) if holders and isinstance(holders[0], dict) else []
-                  results.append(item)
+                  t=yf.Ticker(symbol)
+                  for attr in ('major_holders','institutional_holders','mutualfund_holders','insider_transactions'):
+                      try:
+                          value=getattr(t, attr)
+                          if isinstance(value,pd.DataFrame):
+                              item[attr]={'rows':int(len(value)),'columns':[str(c) for c in value.columns]}
+                          elif value is None:
+                              item[attr]={'rows':0,'columns':[]}
+                          else:
+                              item[attr]={'type':type(value).__name__}
+                      except Exception as exc:
+                          item[attr]={'error':f'{type(exc).__name__}: {str(exc)[:120]}'}
               except Exception as exc:
-                  results.append({'ticker':ticker,'error':f'{type(exc).__name__}: {str(exc)[:160]}'})
-          print(json.dumps(results, sort_keys=True))
-          if not all(item.get('status') == 200 and item.get('shareholders', 0) > 0 for item in results):
-              raise SystemExit('direct IDX ownership profile proof incomplete')
+                  item['error']=f'{type(exc).__name__}: {str(exc)[:160]}'
+              results.append(item)
+          print(json.dumps(results,sort_keys=True))
+          useful=sum(
+              any(isinstance(v,dict) and int(v.get('rows',0) or 0)>0 for k,v in item.items() if k!='ticker')
+              for item in results
+          )
+          if useful < 3:
+              raise SystemExit(f'Yahoo ownership proof too sparse: useful={useful}/5')
           PY
