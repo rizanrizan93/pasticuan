@@ -8,6 +8,7 @@ continues to derive its own project/future-fundamental model inputs.
 
 from typing import Any, Sequence
 
+import numpy as np
 import pandas as pd
 
 from official_evidence_bridge import bridge_project_events
@@ -17,7 +18,21 @@ from shared_forward_evidence import (
     read_canonical_forward_rows,
 )
 
-PATCH_VERSION = "1.0.0-shared-canonical-forward-consumer"
+PATCH_VERSION = "1.0.1-shared-canonical-forward-consumer"
+
+
+def _pasticuan_model_input(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Adapt canonical facts without importing the shared contract metric as a model score.
+
+    `shared_forward_contract_coverage_pct` describes completeness of the factual
+    contract. PASTICUAN's `project_data_coverage` is a model-specific concept and
+    must be derived independently by `official_evidence_bridge` from observed
+    fields, so the transport adapter deliberately leaves it missing.
+    """
+    frame = canonical_rows_to_pasticuan_projects(rows)
+    if not frame.empty:
+        frame["project_data_coverage"] = np.nan
+    return frame
 
 
 def _attach_profiles(frame: pd.DataFrame, rows: list[dict[str, Any]], universe: Sequence[str]) -> pd.DataFrame:
@@ -50,9 +65,10 @@ def install() -> dict[str, str]:
         canonical_rows, audit = read_canonical_forward_rows(universe, client_id="PASTICUAN")
         state = str(audit.get("state") or "")
         if state == "SHARED_CANONICAL_FORWARD":
-            raw_projects = canonical_rows_to_pasticuan_projects(canonical_rows)
+            raw_projects = _pasticuan_model_input(canonical_rows)
             # Existing PASTICUAN deterministic model conversion remains local
-            # and independent; this step does not import EMIR scores.
+            # and independent; this step does not import EMIR scores or shared
+            # contract-completeness as PASTICUAN model coverage.
             frame = bridge_project_events(raw_projects)
             frame = _attach_profiles(frame, canonical_rows, universe)
             cache = getattr(engine, "_JOB_FORWARD_CACHE", None)
@@ -73,8 +89,9 @@ def install() -> dict[str, str]:
         "patch_version": PATCH_VERSION,
         "facts": "SHARED_CANONICAL_FORWARD",
         "scoring": "PASTICUAN_INDEPENDENT_OFFICIAL_EVIDENCE_BRIDGE",
+        "shared_contract_coverage": "TELEMETRY_ONLY_NOT_MODEL_COVERAGE",
         "fallback": "LOCAL_ONLY_WHEN_SHARED_HUB_UNAVAILABLE",
     }
 
 
-__all__ = ["PATCH_VERSION", "install"]
+__all__ = ["PATCH_VERSION", "install", "_pasticuan_model_input"]
