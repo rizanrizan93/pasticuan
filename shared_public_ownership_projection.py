@@ -87,7 +87,7 @@ def canonicalize_ownership_concentration(rows: Iterable[Mapping[str, Any]]) -> d
 def refresh_public_ownership_projection(backend: Any, *, batch_size: int = 250) -> dict[str, Any]:
     rows = backend.read_rows(
         SOURCE_TABLE,
-        {"provider": f"eq.{SOURCE_PROVIDER}"},
+        {"provider": SOURCE_PROVIDER},
         select=SELECT_FIELDS,
         limit=10000,
     )
