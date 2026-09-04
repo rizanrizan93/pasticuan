@@ -6,6 +6,7 @@ on:
     paths:
       - "shared_yahoo_ownership_evidence.py"
       - "tools/phase5_6_yahoo_ownership_backfill.py"
+      - "tests/test_phase5_6_yahoo_ownership_evidence.py"
       - "database/migration_v31_yahoo_ownership_concentration.sql"
       - ".github/workflows/yahoo-ownership-backfill.yml"
   workflow_dispatch:
@@ -36,8 +37,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install bounded dependencies
-        run: python -m pip install --disable-pip-version-check --no-cache-dir 'yfinance>=0.2.65,<1' pandas 'requests>=2.31,<3'
+        run: python -m pip install --disable-pip-version-check --no-cache-dir 'yfinance>=0.2.65,<1' pandas 'requests>=2.31,<3' 'pytest>=8,<9'
       - name: Compile ownership path
         run: python -m py_compile shared_yahoo_ownership_evidence.py tools/phase5_6_yahoo_ownership_backfill.py
+      - name: Ownership normalization regression
+        run: pytest -q tests/test_phase5_6_yahoo_ownership_evidence.py
       - name: Backfill first 50 tickers
         run: python tools/phase5_6_yahoo_ownership_backfill.py --limit 50 --workers 2 --pause-seconds 0.20
