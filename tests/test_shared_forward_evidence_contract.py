@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from pasticuan_shared_forward_runtime_patch import _pasticuan_model_input
 from shared_forward_evidence import (
     canonicalize_emir_row,
     canonicalize_pasticuan_row,
@@ -115,6 +116,17 @@ def test_pasticuan_adapter_preserves_facts_but_derives_no_shared_score():
     assert record["project_source_quorum_verified"] is True or bool(record["project_source_quorum_verified"])
     assert "project_pipeline_score_observed" not in frame.columns
     assert "future_fundamental_impact_score_observed" not in frame.columns
+
+
+def test_runtime_adapter_does_not_import_shared_contract_coverage_into_pasticuan_model_coverage():
+    row = canonicalize_emir_row(_emir_tspc())
+    assert factual_completeness_pct(row) == 100.0
+    raw = canonical_rows_to_pasticuan_projects([row])
+    assert float(raw.iloc[0]["project_data_coverage"]) == 100.0
+    model_input = _pasticuan_model_input([row])
+    assert pd.isna(model_input.iloc[0]["project_data_coverage"])
+    profile = profile_rows([row], ticker="TSPC.JK", as_of="2026-09-05T00:00:00Z")
+    assert profile["shared_forward_contract_coverage_pct"] == 100.0
 
 
 def test_v36_migration_is_additive_rls_and_no_public_or_delete_grant():
