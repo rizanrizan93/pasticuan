@@ -25,7 +25,7 @@ env:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
       SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
@@ -42,5 +42,5 @@ jobs:
         run: python -m py_compile shared_yahoo_ownership_evidence.py tools/phase5_6_yahoo_ownership_backfill.py
       - name: Ownership normalization regression
         run: pytest -q tests/test_phase5_6_yahoo_ownership_evidence.py
-      - name: Backfill first 50 tickers
-        run: python tools/phase5_6_yahoo_ownership_backfill.py --limit 50 --workers 2 --pause-seconds 0.20
+      - name: Backfill full ownership universe
+        run: python tools/phase5_6_yahoo_ownership_backfill.py --limit 706 --workers 2 --pause-seconds 0.20
