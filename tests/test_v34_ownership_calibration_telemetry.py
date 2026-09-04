@@ -51,6 +51,12 @@ def test_v34_migration_is_additive_and_does_not_backfill_history():
     assert "regulatory_free_float_pct" not in lowered
 
 
+def test_v34_trigger_preserves_native_timestamptz_as_of():
+    sql = (ROOT / "database" / "migration_v34_ownership_calibration_telemetry.sql").read_text().lower()
+    assert "nullif(new.as_of" not in sql
+    assert "new.as_of," in sql
+
+
 def test_runtime_release_installs_telemetry_after_phase56_context_patch():
     runtime = (ROOT / "runtime_release.py").read_text()
     phase56 = runtime.index('"phase56_coverage_runtime_patch", "install"')
