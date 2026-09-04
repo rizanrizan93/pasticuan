@@ -76,7 +76,7 @@ begin
         v_scan_id,
         v_ticker,
         nullif(new.model_version, ''),
-        nullif(new.as_of, '')::timestamptz,
+        new.as_of,
         now(),
         now(),
         'v34',
