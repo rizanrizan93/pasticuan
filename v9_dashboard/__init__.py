@@ -26,6 +26,7 @@ _IMPL = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_IMPL)
 
 V9_DASHBOARD_VERSION = "1.5.0-research-rank-integrity"
+V9_UI_VERSION = getattr(_IMPL, "V9_UI_VERSION", "legacy")
 SCANNER_VERSION = SCANNER_RELEASE_VERSION
 select_top_candidates = _IMPL.select_top_candidates
 recommendation_meta = _IMPL.recommendation_meta
@@ -62,6 +63,7 @@ def render_dashboard_html(
 
 __all__ = [
     "V9_DASHBOARD_VERSION",
+    "V9_UI_VERSION",
     "SCANNER_VERSION",
     "select_top_candidates",
     "recommendation_meta",
