@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from shared_yahoo_ownership_evidence import (
     INSTITUTIONAL_PROVIDER,
@@ -21,10 +22,10 @@ def test_major_holders_are_concentration_facts_not_free_float() -> None:
     rows = normalize_major_holders("BBCA.JK", frame, observed_on=date(2026, 9, 4))
     assert len(rows) == 4
     metrics = {row["metric_name"]: row for row in rows}
-    assert metrics["insiders_held_pct"]["metric_value"] == 60.814
-    assert metrics["institutions_held_pct"]["metric_value"] == 19.018
-    assert metrics["institutions_float_held_pct"]["metric_value"] == 48.531
-    assert metrics["institutions_count"]["metric_value"] == 374.0
+    assert metrics["insiders_held_pct"]["metric_value"] == pytest.approx(60.814)
+    assert metrics["institutions_held_pct"]["metric_value"] == pytest.approx(19.018)
+    assert metrics["institutions_float_held_pct"]["metric_value"] == pytest.approx(48.531)
+    assert metrics["institutions_count"]["metric_value"] == pytest.approx(374.0)
     assert all(row["official_verified"] is False for row in rows)
     assert all(row["source_authority"] == "PUBLIC_PROVIDER" for row in rows)
     assert all(row["lineage_state"] == LINEAGE_STATE for row in rows)
@@ -52,8 +53,8 @@ def test_named_holder_preserves_report_date_and_percentage() -> None:
     row = rows[0]
     assert row["source_period"] == "2026-07-31"
     assert row["holder_name"] == "Example Emerging Markets Fund"
-    assert row["shares_held"] == 641453900.0
-    assert row["ownership_percentage"] == 0.53
+    assert row["shares_held"] == pytest.approx(641453900.0)
+    assert row["ownership_percentage"] == pytest.approx(0.53)
     assert row["provider"] == INSTITUTIONAL_PROVIDER
 
 
