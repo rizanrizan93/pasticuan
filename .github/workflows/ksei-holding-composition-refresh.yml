@@ -1,0 +1,63 @@
+name: Phase 5.6 official KSEI holding composition - Pasticuan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/ksei-holding-composition-refresh.yml"
+      - "tools/phase5_6_ksei_holding_refresh.py"
+      - "shared_ksei_holding_composition.py"
+      - "pasticuan_ksei_runtime_patch.py"
+      - "pasticuan_ksei_calibration_telemetry_patch.py"
+      - "database/migration_v35_ksei_ownership_calibration_telemetry.sql"
+  schedule:
+    - cron: "15 2 2,5 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase5-6-ksei-holding-composition
+  cancel-in-progress: false
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  refresh-ksei-composition:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      SHARED_EVIDENCE_SUPABASE_URL: ${{ secrets.SHARED_EVIDENCE_SUPABASE_URL }}
+      SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SHARED_EVIDENCE_SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install bounded producer dependencies
+        run: python -m pip install --disable-pip-version-check --no-cache-dir pandas==2.3.3 requests==2.34.2
+
+      - name: Refresh official KSEI holding composition
+        run: |
+          mkdir -p ksei_holding_output
+          set -o pipefail
+          python tools/phase5_6_ksei_holding_refresh.py 2>&1 | tee ksei_holding_output/summary.log
+
+      - name: Record revision
+        if: always()
+        run: git rev-parse HEAD > ksei_holding_output/selected-commit-sha.txt
+
+      - name: Upload producer proof
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: phase5-6-ksei-holding-composition-proof
+          path: ksei_holding_output/
+          if-no-files-found: error
