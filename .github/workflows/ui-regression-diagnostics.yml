@@ -24,18 +24,31 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install pytest
-      - name: UI and dashboard contracts
+      - name: Full combined suite capture
         continue-on-error: true
-        run: pytest -q tests/test_institutional_dashboard_ui.py tests/test_future_fundamental_ui_patch.py tests/test_v9_8_17_dashboard_research_rank_integrity.py tests/test_top3_csv_download.py tests/test_runtime_release.py
-      - name: Decision and execution contracts
-        continue-on-error: true
-        run: pytest -q tests/test_v9_8_8_execution_plan_integrity.py tests/test_v9_8_9_production_lane_integrity.py tests/test_v9_8_16_decision_priority_integrity.py
-      - name: Phase 5.6 contracts
-        continue-on-error: true
-        run: pytest -q tests/test_phase5_6_*.py
-      - name: Shared evidence contracts
-        continue-on-error: true
-        run: pytest -q tests/test_shared_*.py
-      - name: Remaining contracts
-        continue-on-error: true
-        run: pytest -q --ignore=tests/test_evidence_governance.py --ignore=tests/test_official_evidence_bridge.py --ignore=tests/test_institutional_dashboard_ui.py --ignore=tests/test_future_fundamental_ui_patch.py --ignore=tests/test_v9_8_17_dashboard_research_rank_integrity.py --ignore=tests/test_top3_csv_download.py --ignore=tests/test_runtime_release.py --ignore=tests/test_v9_8_8_execution_plan_integrity.py --ignore=tests/test_v9_8_9_production_lane_integrity.py --ignore=tests/test_v9_8_16_decision_priority_integrity.py --ignore-glob='tests/test_phase5_6_*.py' --ignore-glob='tests/test_shared_*.py'
+        run: |
+          pytest -q --ignore=tests/test_evidence_governance.py --ignore=tests/test_official_evidence_bridge.py --junitxml=/tmp/ui-regression.xml || true
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('/tmp/ui-regression.xml').getroot()
+          failed = []
+          for case in root.iter('testcase'):
+              child = case.find('failure') or case.find('error')
+              if child is not None:
+                  failed.append({
+                      'classname': case.get('classname'),
+                      'name': case.get('name'),
+                      'message': child.get('message'),
+                      'detail': (child.text or '')[-4000:],
+                  })
+          with open('/tmp/ui-failures.txt', 'w', encoding='utf-8') as handle:
+              handle.write(repr(failed))
+          print(failed)
+          PY
+      - name: Upload combined failure evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-regression-evidence
+          path: |
+            /tmp/ui-regression.xml
+            /tmp/ui-failures.txt
