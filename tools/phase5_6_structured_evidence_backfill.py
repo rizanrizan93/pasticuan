@@ -10,6 +10,7 @@ from shared_company_evidence import SharedCompanyEvidence
 from shared_evidence_hub import HubConfig, SupabaseEvidenceBackend
 from shared_fundamental_rate_limit_patch import install as install_rate_limit_patch
 from shared_fundamental_runtime import SharedFundamentalRuntime
+from shared_public_fundamental_projection import refresh_public_fundamental_projection
 from shared_structured_fundamental_evidence import SharedStructuredFundamentalEvidence
 from shared_structured_ownership_evidence import SharedStructuredOwnershipEvidence
 
@@ -20,6 +21,7 @@ def _args() -> argparse.Namespace:
     p.add_argument("--fundamental-gap-limit", type=int, default=250)
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--skip-bridges", action="store_true")
+    p.add_argument("--skip-public-projection-refresh", action="store_true")
     return p.parse_args()
 
 
@@ -149,11 +151,18 @@ def main() -> int:
                 else:
                     ownership_results["failed"] += 1
 
+    projection_meta = (
+        {"state": "SKIPPED", "projection_rows": 0, "persisted_rows": 0}
+        if args.skip_public_projection_refresh
+        else refresh_public_fundamental_projection(backend)
+    )
+
     summary = {
         "exact_operational_financial_bridge": exact_bridge_meta,
         "structured_fundamental_bridge": bridge_meta,
         "structured_provider_gap_fill": fundamental_results,
         "structured_ownership": ownership_results,
+        "public_fundamental_projection": projection_meta,
         "universe_tickers": len(tickers),
         "ownership_limit": len(ownership_tickers),
         "policy": "FACTS_ONLY_NO_SCORING_OR_GATE_CHANGE",
