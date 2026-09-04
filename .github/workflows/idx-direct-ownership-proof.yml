@@ -26,7 +26,7 @@ jobs:
           python-version: "3.12"
       - name: Install direct Yahoo client
         run: python -m pip install --disable-pip-version-check --no-cache-dir 'yfinance>=0.2.65,<1' pandas
-      - name: Probe Yahoo holder datasets for IDX tickers
+      - name: Inspect Yahoo ownership semantics
         run: |
           python - <<'PY'
           import json
@@ -35,29 +35,30 @@ jobs:
 
           results=[]
           for code in ('BBCA','MARK','OMED','ELSA','ANTM'):
-              symbol=f'{code}.JK'
+              t=yf.Ticker(f'{code}.JK')
               item={'ticker':code}
-              try:
-                  t=yf.Ticker(symbol)
-                  for attr in ('major_holders','institutional_holders','mutualfund_holders','insider_transactions'):
-                      try:
-                          value=getattr(t, attr)
-                          if isinstance(value,pd.DataFrame):
-                              item[attr]={'rows':int(len(value)),'columns':[str(c) for c in value.columns]}
-                          elif value is None:
-                              item[attr]={'rows':0,'columns':[]}
-                          else:
-                              item[attr]={'type':type(value).__name__}
-                      except Exception as exc:
-                          item[attr]={'error':f'{type(exc).__name__}: {str(exc)[:120]}'}
-              except Exception as exc:
-                  item['error']=f'{type(exc).__name__}: {str(exc)[:160]}'
+              for attr in ('major_holders','institutional_holders','mutualfund_holders'):
+                  try:
+                      value=getattr(t,attr)
+                      if isinstance(value,pd.DataFrame):
+                          safe=value.copy().reset_index()
+                          for col in safe.columns:
+                              safe[col]=safe[col].map(lambda x: x.isoformat() if hasattr(x,'isoformat') else x)
+                          item[attr]={'rows':int(len(value)),'columns':[str(c) for c in value.columns],'records':safe.to_dict(orient='records')[:12]}
+                      else:
+                          item[attr]={'rows':0,'records':[]}
+                  except Exception as exc:
+                      item[attr]={'error':f'{type(exc).__name__}: {str(exc)[:120]}'}
               results.append(item)
-          print(json.dumps(results,sort_keys=True))
-          useful=sum(
-              any(isinstance(v,dict) and int(v.get('rows',0) or 0)>0 for k,v in item.items() if k!='ticker')
-              for item in results
-          )
-          if useful < 3:
-              raise SystemExit(f'Yahoo ownership proof too sparse: useful={useful}/5')
+          print(json.dumps(results,sort_keys=True,default=str))
+          required=('insidersPercentHeld','institutionsPercentHeld','institutionsFloatPercentHeld','institutionsCount')
+          normalized=set()
+          for item in results:
+              records=item.get('major_holders',{}).get('records',[])
+              for record in records:
+                  label=str(record.get('index') or record.get('Breakdown') or '').strip()
+                  if label:
+                      normalized.add(label)
+          if not set(required).issubset(normalized):
+              raise SystemExit(f'unexpected Yahoo major_holders labels: {sorted(normalized)}')
           PY
