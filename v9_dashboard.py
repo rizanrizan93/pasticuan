@@ -7,11 +7,13 @@ import numpy as np
 import pandas as pd
 import v9_dashboard_legacy as _legacy
 
+from institutional_ui import PASTICUAN_DASHBOARD_CSS, UI_VERSION
 from release_contract import SCANNER_RELEASE_VERSION
 
 from v9_dashboard_legacy import *  # noqa: F401,F403
 
 V9_DASHBOARD_VERSION = "1.5.0-research-rank-integrity"
+V9_UI_VERSION = UI_VERSION
 SMART_MONEY_COST_BASIS_VERSION = "1.0.0"
 SCANNER_VERSION = SCANNER_RELEASE_VERSION
 
@@ -169,13 +171,7 @@ def render_dashboard_html(
         as_of=as_of,
         market_regime=market_regime,
     )
-    css = """
-    .v9-cost-basis{margin-top:8px;padding:8px;border:1px solid #2b6f84;border-radius:8px;background:#092433;text-align:left}
-    .v9-cost-basis span{display:block;color:#8eb8c8;font-size:8px;font-weight:800;letter-spacing:.5px}
-    .v9-cost-basis strong{display:block;color:#77f0ba;font-size:13px;margin:3px 0}
-    .v9-cost-basis small,.v9-cost-basis em{display:block;color:#a6c4d1;font-size:8px;font-style:normal;line-height:1.35}
-    """
-    html = html.replace("</style>", css + "</style>", 1)
+    html = html.replace("</style>", PASTICUAN_DASHBOARD_CSS + "</style>", 1)
     marker = "</div><p>Multi-horizon OHLCV proxy 20/60/120/252/504/756D — bukan identitas broker.</p>"
     for _, row in enriched.iterrows():
         replacement = "</div>" + _cost_block(row) + "<p>Multi-horizon OHLCV proxy 20/60/120/252/504/756D — bukan identitas broker.</p>"
@@ -187,6 +183,6 @@ def render_dashboard_html(
 
 
 __all__ = list(getattr(_legacy, "__all__", []))
-for _name in ("V9_DASHBOARD_VERSION", "SMART_MONEY_COST_BASIS_VERSION", "SCANNER_VERSION", "select_top_candidates", "render_dashboard_html"):
+for _name in ("V9_DASHBOARD_VERSION", "V9_UI_VERSION", "SMART_MONEY_COST_BASIS_VERSION", "SCANNER_VERSION", "select_top_candidates", "render_dashboard_html"):
     if _name not in __all__:
         __all__.append(_name)
