@@ -1,15 +1,11 @@
 name: Phase 5.6 Yahoo ownership backfill - Pasticuan
 
 on:
-  push:
-    branches: ["phase5.6/idx-direct-ownership-profile"]
-    paths:
-      - "shared_yahoo_ownership_evidence.py"
-      - "tools/phase5_6_yahoo_ownership_backfill.py"
-      - "tests/test_phase5_6_yahoo_ownership_evidence.py"
-      - "database/migration_v31_yahoo_ownership_concentration.sql"
-      - ".github/workflows/yahoo-ownership-backfill.yml"
   workflow_dispatch:
+  schedule:
+    # Friday 19:20 WIB. Ownership concentration is slow-moving evidence;
+    # weekly refresh avoids unnecessary provider load while keeping it current.
+    - cron: "20 12 * * 5"
 
 permissions:
   contents: read
