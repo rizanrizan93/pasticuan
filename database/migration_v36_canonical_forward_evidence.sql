@@ -1,6 +1,6 @@
 -- v36: Canonical scanner-neutral forward factual evidence.
--- One factual event identity is shared by EMIR and PASTICUAN; scanner scores,
--- rankings, gates, recommendations and Future Fundamental outputs stay private.
+-- One factual event identity is shared by EMIR and PASTICUAN; downstream
+-- analytical outputs remain scanner-private.
 
 create table if not exists public.evidence_forward_events (
     canonical_event_id text primary key,
@@ -46,11 +46,11 @@ create table if not exists public.evidence_forward_events (
 );
 
 comment on table public.evidence_forward_events is
-'Canonical scanner-neutral forward factual evidence shared by EMIR and PASTICUAN. Contains no scanner score, rank, gate, recommendation, or authorization.';
+'Canonical scanner-neutral forward factual evidence shared by EMIR and PASTICUAN. Analytical interpretation stays outside this table.';
 comment on column public.evidence_forward_events.evidence_date is
 'Primary factual event/publication date. Later corroboration publication dates belong in provenance/payload and must not replace the primary event date.';
 comment on column public.evidence_forward_events.event_category is
-'Neutral event taxonomy only; it is not bullish/bearish scoring and carries no recommendation.';
+'Neutral event taxonomy only; it carries no scanner interpretation.';
 
 create index if not exists evidence_forward_events_ticker_date_idx
   on public.evidence_forward_events (ticker, evidence_date desc, event_category);
