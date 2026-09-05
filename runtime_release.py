@@ -54,6 +54,10 @@ def _install_integrity_patch(expected: str) -> None:
     _try_optional_patch("phase56_coverage_runtime_patch", "install")
     _try_optional_patch("phase56_runtime_coverage_integrity_patch", "install")
     _try_optional_patch("pasticuan_ksei_runtime_patch", "install")
+    # Public ownership and KSEI facts use the same canonical Shared Hub backend
+    # as forward evidence. Install after their wrappers so the wrapper globals
+    # resolve these transport functions at scan time, before telemetry capture.
+    _try_optional_patch("shared_ownership_runtime_transport_patch", "install")
     _try_optional_patch("pasticuan_ownership_calibration_telemetry_patch", "install")
     _try_optional_patch("pasticuan_ksei_calibration_telemetry_patch", "install")
 
