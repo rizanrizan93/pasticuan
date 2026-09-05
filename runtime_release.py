@@ -54,17 +54,14 @@ def _install_integrity_patch(expected: str) -> None:
     _try_optional_patch("phase56_coverage_runtime_patch", "install")
     _try_optional_patch("phase56_runtime_coverage_integrity_patch", "install")
     _try_optional_patch("pasticuan_ksei_runtime_patch", "install")
-    # Public ownership and KSEI facts use the same canonical Shared Hub backend
-    # as forward evidence. Install after their wrappers so the wrapper globals
-    # resolve these transport functions at scan time, before telemetry capture.
     _try_optional_patch("shared_ownership_runtime_transport_patch", "install")
-    # Scanner frames initialize ownership telemetry with zero placeholders.
-    # Family-aware coalescing must run after transport binding and before v34/v35
-    # telemetry so canonical facts can replace an actually-missing family while
-    # preserving legitimate observed zero percentages in an already-valid one.
     _try_optional_patch("ownership_family_coalescing_patch", "install")
     _try_optional_patch("pasticuan_ownership_calibration_telemetry_patch", "install")
     _try_optional_patch("pasticuan_ksei_calibration_telemetry_patch", "install")
+    # Final factual-only recovery at the persistence boundary.  Production proof
+    # showed that valid Shared Hub facts could still be lost by the focus-wrapper
+    # chain; this layer cannot affect scoring or authorization.
+    _try_optional_patch("shared_ownership_payload_recovery_patch", "install")
 
 
 def refresh_release_runtime(
